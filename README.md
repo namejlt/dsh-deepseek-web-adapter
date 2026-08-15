@@ -2,12 +2,27 @@
 
 > **English**: [README.en.md](README.en.md)
 
+> ⚠️ **Developer Preview（开发者预览）**：本插件由个人开发者发布，**未经大规模真实环境测试**。
+> 已验证：登录、基本问答、专家模式切换、单次工具调用、网关自动拉起/回收。
+> 未充分验证：多轮工具循环、长对话迁移、子 agent 并发、无头模式、识图模式、断线恢复。
+> 使用前请阅读下方[已知限制](#已知限制)。遇到问题欢迎提交 [Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues)。
+
 把 **DeepSeek 网页版（chat.deepseek.com）** 变成 DSH 的免 API Key 模型提供方。
 插件加载后自动拉起本地网关（`resources/dsweb-gateway.js` + `driver.js`，单一常驻浏览器），
 提供 OpenAI 兼容 API。支持：连续对话、工具调用、模型校准、子 agent 并发。
 
 - 无需 API Key、无需登录第三方平台（只需登录你自己的 DeepSeek 账号）
 - `dsh plugin add` 一条命令，网关自动启动/停止
+
+## 已知限制
+
+| 限制 | 说明 |
+|---|---|
+| 开发中（Beta） | 未经大规模真实环境验证，可能有不稳定行为 |
+| 无 client 卡片 UI | 本包只有 host（自动拉起网关）。**没有登录按钮/校准/无头开关等卡片控件**——登录请手动打开 `http://127.0.0.1:5688/login`，配置用 `curl` 调 `/config`（见手动控制）。卡片 UI 在开发仓库（`dsweb-plugin/client-llm.js`），欢迎贡献 |
+| 依赖真实浏览器 | 需要本机安装 Chrome；登录态是内存 cookie，关闭窗口需重新登录 |
+| 依赖 DeepSeek 网页版 UI | 网页版改版可能导致选择器失效（校准/发送/提取），届时需更新 `driver.js` |
+| 解析器有兜底但非万能 | 54 场景回归覆盖常见格式；模型输出极端怪异格式时工具调用仍可能失败 |
 
 ## 安装
 
@@ -89,6 +104,30 @@ DeepSeek 网页版没有原生 function calling——网关用提示工程让模
 再经多层容错解析（嵌套/别名/单反斜杠路径/尾逗号/缺引号/安全网重试）转换为标准 `tool_calls`
 交给 DSH 执行。工具结果回传网页版继续。回归测试 54 场景（`tests/` 见开发仓库）。
 
+## 开发 / 接手
+
+**本仓库采用 MIT License——任何人可以自由 fork、修改、继续开发、再发布，无需授权。**
+
+如果你要接手或贡献：
+
+```bash
+# 1. fork 或 clone
+git clone https://github.com/huermi/dsh-deepseek-web-adapter.git
+# 2. 安装依赖（无第三方运行时依赖，仅 Node 18+ 与 Chrome）
+# 3. 本地启动网关调试
+node resources/dsweb-gateway.js --port 5688 --base resources/runtime
+# 4. 跑解析器回归测试（改动 driver.js 后必须跑）
+node tests/test-parser-all.js    # 期望 54/54 通过
+```
+
+**开发仓库**（含卡片 UI、host 自动拉起、完整回归套件）：见 `dsweb-plugin/` 目录说明或
+[Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues) 讨论。
+
+主要维护点：
+- `resources/driver.js` —— 浏览器引擎 + 工具调用解析器（DeepSeek 网页版 UI 变化时改这里）
+- `resources/dsweb-gateway.js` —— 网关（OpenAI API / 登录 / 校准 / 并发 / 迁移）
+- `lib/index.js` —— 插件 host（加载时拉起网关，卸载时回收）
+
 ## License
 
-MIT
+MIT —— 保留版权声明即可自由使用/修改/再分发。详细条款见 [LICENSE](LICENSE)。

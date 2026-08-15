@@ -2,6 +2,12 @@
 
 > **中文**: [README.md](README.md)
 
+> ⚠️ **Developer Preview**: published by an individual developer, **not extensively tested in the wild**.
+> Verified: login, basic Q&A, Expert-mode switch, single tool call, gateway auto-start/stop.
+> Not fully verified: multi-round tool loops, long-chat migration, sub-agent concurrency, headless mode,
+> vision mode, disconnect recovery. Read [Known limitations](#known-limitations) before use.
+> Please report issues at [Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues).
+
 Turn **DeepSeek Web (chat.deepseek.com)** into a free, API-key-free LLM provider for DeepSeek Harness (DSH).
 On plugin load, a local gateway (`resources/dsweb-gateway.js` + `driver.js`, one persistent browser) is
 spawned automatically and serves an OpenAI-compatible API. Supports: continuous chat, tool calling,
@@ -9,6 +15,16 @@ model calibration, and concurrent sub-agents.
 
 - No API key, no third-party login (just your own DeepSeek account)
 - `dsh plugin add` — one command; the gateway auto-starts/stops
+
+## Known limitations
+
+| Limitation | Notes |
+|---|---|
+| Beta quality | Not extensively tested in real environments; behavior may be unstable |
+| No client card UI | This package ships host only (auto-launch gateway). **No login/calibration/headless card controls** — open `http://127.0.0.1:5688/login` manually to log in, configure via `curl` to `/config` (see Manual control). Card UI lives in the dev repo (`dsweb-plugin/client-llm.js`); contributions welcome |
+| Requires a real browser | Needs Chrome installed locally; login session is an in-memory cookie — closing the window requires re-login |
+| Depends on DeepSeek web UI | UI changes may break selectors (calibration/send/extract); `driver.js` then needs updating |
+| Parser is tolerant, not infallible | 54-case regression covers common formats; exotic malformed model output may still fail |
 
 ## Install
 
@@ -93,6 +109,30 @@ DeepSeek Web has no native function calling — the gateway uses prompt engineer
 retry safety net) for DSH to execute. Tool results feed back into the web page and the model continues.
 Regression suite: 54 scenarios (see `tests/` in the dev repo).
 
+## Development / maintenance
+
+**MIT License — anyone may fork, modify, continue development, and re-publish without permission.**
+
+To take over or contribute:
+
+```bash
+# 1. Fork or clone
+git clone https://github.com/huermi/dsh-deepseek-web-adapter.git
+# 2. No third-party runtime deps (Node 18+ and Chrome only)
+# 3. Run the gateway locally for debugging
+node resources/dsweb-gateway.js --port 5688 --base resources/runtime
+# 4. Run the parser regression suite (mandatory after touching driver.js)
+node tests/test-parser-all.js    # expect 54/54 pass
+```
+
+**Dev repo** (card UI, auto-launch host, full regression suite): see the `dsweb-plugin/` directory or
+discuss in [Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues).
+
+Key maintenance points:
+- `resources/driver.js` — browser engine + tool-call parser (update when DeepSeek web UI changes)
+- `resources/dsweb-gateway.js` — gateway (OpenAI API / login / calibration / concurrency / migration)
+- `lib/index.js` — plugin host (launches gateway on load, recycles on unload)
+
 ## License
 
-MIT
+MIT — free to use/modify/redistribute with the copyright notice retained. See [LICENSE](LICENSE).
