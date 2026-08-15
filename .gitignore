@@ -1,0 +1,19 @@
+# Runtime / local data — never commit
+resources/runtime/profiles/
+resources/runtime/*.log
+resources/runtime/tools.log
+resources/mock-api/
+**/profiles/
+
+# Node
+node_modules/
+*.tgz
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

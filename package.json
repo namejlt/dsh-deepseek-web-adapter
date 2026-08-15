@@ -1,0 +1,28 @@
+{
+  "name": "dsh-deepseek-web-adapter",
+  "version": "1.0.0",
+  "description": "Use DeepSeek web (chat.deepseek.com) as a free LLM provider in DSH — no API key needed. Plugin auto-launches a local gateway that drives a persistent browser; continuous chat, tool calls, model calibration, sub-agent concurrency.",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib/",
+    "resources/",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek",
+    "llm",
+    "provider",
+    "web",
+    "free"
+  ],
+  "license": "MIT"
+}

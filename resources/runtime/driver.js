@@ -1,0 +1,2486 @@
+#!/usr/bin/env node
+'use strict';
+/* deepseek-web-driver.js — dependency-free DeepSeek Web agent driver.
+ * Talks to a real Chrome/Edge via raw CDP over a hand-rolled WebSocket.
+ * Controlled by the DSH host plugin through JSON-lines RPC on stdio.
+ * Implements: model modes (quick/expert/vision), deep-think & web-search
+ * toggles, multi-window concurrent tasks, tool-call agent loop, and an
+ * anti-limit engine (context compression, chat migration, profile rotation).
+ */
+const http = require('http');
+const https = require('https');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn, execSync } = require('child_process');
+
+const VERSION = '1.1.0';
+const DS_URL = 'https://chat.deepseek.com/';
+
+/* ------------------------------------------------------------------ */
+/* logging                                                             */
+/* ------------------------------------------------------------------ */
+function log(...a) { console.error('[dsweb]', ...a); }
+function logErr(...a) { console.error('[dsweb][err]', ...a); }
+
+/* ------------------------------------------------------------------ */
+/* config                                                              */
+/* ------------------------------------------------------------------ */
+const DEFAULTS = {
+  headless: true,
+  maxConcurrent: 3,
+  maxTurnsPerChat: 30,
+  compactThresholdChars: 60000,
+  maxOutputLength: 8000,
+  responseTimeoutMs: 240000,
+  stableDelayMs: 2500,
+  sendDelayMs: 400,
+  maxIterations: 40,
+  maxMigrations: 24,
+  maxQuotaBackoffRetries: 3,
+  profiles: [{ name: 'default', headless: true }],
+  chromePath: process.env.DS_WEB_CHROME || '',
+  baseDir: process.env.DS_WEB_BASE || path.join(os.homedir(), '.dsweb'),
+};
+let CFG = JSON.parse(JSON.stringify(DEFAULTS));
+
+function profileDir(name) { return path.join(CFG.baseDir, 'profiles', String(name || 'default')); }
+function effectiveHeadless(profile) { return profile && profile.headless !== undefined ? profile.headless : CFG.headless; }
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+/* ------------------------------------------------------------------ */
+/* stdio JSON-lines RPC                                                */
+/* ------------------------------------------------------------------ */
+const pending = new Map();
+let rpcSeq = 0;
+
+function send(obj) {
+  try { process.stdout.write(JSON.stringify(obj) + '\n'); }
+  catch (e) { logErr('stdout write failed', e.message); }
+}
+function respond(id, ok, result, error) {
+  if (ok) send({ id, ok: true, result });
+  else send({ id, ok: false, error: String(error && error.message || error) });
+}
+function emitEvent(name, payload) { send({ event: name, ...(payload || {}) }); }
+
+const handlers = {};
+
+function readLine(buf) {
+  const i = buf.indexOf('\n');
+  if (i < 0) return null;
+  const line = buf.slice(0, i).toString('utf8').trim();
+  const rest = buf.slice(i + 1);
+  return { line, rest };
+}
+
+const RUN_ONCE = process.argv[2] === '--run';
+
+let stdinBuf = Buffer.alloc(0);
+if (!RUN_ONCE) {
+  process.stdin.on('data', (chunk) => {
+    stdinBuf = Buffer.concat([stdinBuf, chunk]);
+    for (;;) {
+      const r = readLine(stdinBuf);
+      if (!r) break;
+      stdinBuf = r.rest;
+      if (!r.line) continue;
+      let msg;
+      try { msg = JSON.parse(r.line); } catch (e) { logErr('bad rpc line', e.message); continue; }
+      if (msg && msg.id !== undefined && msg.method) {
+        const h = handlers[msg.method];
+        if (!h) { respond(msg.id, false, null, new Error('unknown method: ' + msg.method)); continue; }
+        Promise.resolve()
+          .then(() => h(msg.params || {}, msg))
+          .then((res) => respond(msg.id, true, res === undefined ? null : res))
+          .catch((err) => respond(msg.id, false, null, err));
+      }
+    }
+  });
+  process.stdin.on('end', () => { shutdown(0); });
+}
+process.on('SIGTERM', () => shutdown(0));
+process.on('SIGINT', () => shutdown(0));
+process.on('uncaughtException', (e) => { logErr('uncaught', e.stack || e.message); });
+
+async function shutdown(code) {
+  try { if (browser.proc) browser.proc.kill(); } catch (e) { /* ignore */ }
+  try {
+    if (dwindow.proc && dwindow.proc.pid) {
+      if (process.platform === 'win32') execSync('taskkill /pid ' + dwindow.proc.pid + ' /T /F', { stdio: 'ignore', timeout: 10000 });
+      else dwindow.proc.kill('SIGKILL');
+    }
+  } catch (e) { /* ignore */ }
+  process.exit(code);
+}
+
+/* ------------------------------------------------------------------ */
+/* minimal WebSocket client (RFC6455) over a raw socket               */
+/* ------------------------------------------------------------------ */
+function wsConnect(wsUrl, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(wsUrl); } catch (e) { return reject(new Error('bad ws url: ' + wsUrl)); }
+    const key = crypto.randomBytes(16).toString('base64');
+    const req = http.request({
+      host: u.hostname,
+      port: u.port || 80,
+      path: (u.pathname || '/') + (u.search || ''),
+      headers: {
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Key': key,
+        'Sec-WebSocket-Version': '13',
+      },
+    });
+    const timer = setTimeout(() => { req.destroy(); reject(new Error('ws connect timeout')); }, timeoutMs);
+    req.on('upgrade', (res, socket) => {
+      clearTimeout(timer);
+      const client = makeWsClient(socket);
+      resolve(client);
+    });
+    req.on('error', (e) => { clearTimeout(timer); reject(e); });
+    req.end();
+  });
+}
+
+function makeWsClient(socket) {
+  const client = {
+    socket,
+    buffer: Buffer.alloc(0),
+    listeners: [],
+    onMessage(fn) { client.listeners.push(fn); return () => { client.listeners = client.listeners.filter((x) => x !== fn); }; },
+    sendText(text) {
+      const payload = Buffer.from(text, 'utf8');
+      const mask = crypto.randomBytes(4);
+      let header;
+      if (payload.length < 126) {
+        header = Buffer.from([0x81, 0x80 | payload.length]);
+      } else if (payload.length < 65536) {
+        header = Buffer.alloc(4);
+        header[0] = 0x81; header[1] = 0x80 | 126;
+        header.writeUInt16BE(payload.length, 2);
+      } else {
+        header = Buffer.alloc(10);
+        header[0] = 0x81; header[1] = 0x80 | 127;
+        header.writeBigUInt64BE(BigInt(payload.length), 2);
+      }
+      const masked = Buffer.alloc(payload.length);
+      for (let i = 0; i < payload.length; i++) masked[i] = payload[i] ^ mask[i & 3];
+      socket.write(Buffer.concat([header, mask, masked]));
+    },
+    close() { try { socket.end(); } catch (e) { /* ignore */ } },
+  };
+  socket.on('data', (chunk) => {
+    client.buffer = Buffer.concat([client.buffer, chunk]);
+    try { client._parse(); } catch (e) { logErr('ws parse error', e.message); }
+  });
+  socket.on('error', (e) => { logErr('ws socket error', e.message); });
+  socket.on('close', () => { for (const l of [...client.listeners]) { try { l({ method: '_closed', params: {} }); } catch (e) { /* ignore */ } } });
+  client._parse = () => {
+    for (;;) {
+      const buf = client.buffer;
+      if (buf.length < 2) return;
+      const fin = (buf[0] & 0x80) !== 0;
+      const opcode = buf[0] & 0x0f;
+      const masked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let offset = 2;
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); offset = 4; }
+      else if (len === 127) { if (buf.length < 10) return; const big = buf.readBigUInt64BE(2); if (big > BigInt(2147483647)) throw new Error('frame too large'); len = Number(big); offset = 10; }
+      const maskLen = masked ? 4 : 0;
+      if (buf.length < offset + maskLen + len) return;
+      const maskKey = masked ? buf.slice(offset, offset + 4) : null;
+      offset += maskLen;
+      let payload = buf.slice(offset, offset + len);
+      if (maskKey) { payload = Buffer.from(payload); for (let i = 0; i < payload.length; i++) payload[i] = payload[i] ^ maskKey[i & 3]; }
+      client.buffer = buf.slice(offset + len);
+      if (opcode === 1 || (opcode === 0 && client._frag)) {
+        client._frag = client._frag || { text: '' };
+        client._frag.text += payload.toString('utf8');
+        if (fin) {
+          const text = client._frag.text;
+          client._frag = null;
+          let m;
+          try { m = JSON.parse(text); } catch (e) { logErr('bad cdp json', e.message); continue; }
+          for (const l of [...client.listeners]) { try { l(m); } catch (e) { logErr('listener error', e.message); } }
+        }
+      } else if (opcode === 9) { /* ping -> pong (empty payload, masked) */
+        socket.write(Buffer.from([0x8a, 0x80, 0, 0, 0, 0]));
+      } else if (opcode === 8) { try { socket.end(); } catch (e) { /* ignore */ } }
+    }
+  };
+  return client;
+}
+
+/* ------------------------------------------------------------------ */
+/* CDP client                                                          */
+/* ------------------------------------------------------------------ */
+class CdpClient {
+  constructor(ws) {
+    this.ws = ws;
+    this.seq = 0;
+    this.pending = new Map();
+    this.listeners = [];
+    ws.onMessage((m) => this._onMessage(m));
+  }
+  _onMessage(m) {
+    if (m.id !== undefined) {
+      const p = this.pending.get(m.id);
+      if (p) {
+        this.pending.delete(m.id);
+        if (m.error) p.reject(new Error(m.error.message || 'cdp error'));
+        else p.resolve(m.result || {});
+      }
+    } else {
+      for (const l of [...this.listeners]) { try { l(m); } catch (e) { logErr('cdp listener error', e.message); } }
+    }
+  }
+  call(method, params = {}, sessionId) {
+    const id = ++this.seq;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      const msg = { id, method, params };
+      if (sessionId) msg.sessionId = sessionId;
+      try { this.ws.sendText(JSON.stringify(msg)); }
+      catch (e) { this.pending.delete(id); reject(e); }
+    });
+  }
+  on(listener) { this.listeners.push(listener); return () => { this.listeners = this.listeners.filter((l) => l !== listener); }; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Chrome discovery & browser lifecycle                                */
+/* ------------------------------------------------------------------ */
+function findChrome() {
+  if (CFG.chromePath) return CFG.chromePath;
+  const candidates = [];
+  if (process.platform === 'win32') {
+    const pf = process.env['ProgramFiles'] || 'C:\\Program Files';
+    const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+    const la = process.env['LOCALAPPDATA'] || '';
+    candidates.push(
+      path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(la, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(la, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    );
+  } else if (process.platform === 'darwin') {
+    candidates.push(
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    );
+  } else {
+    candidates.push('/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/microsoft-edge');
+  }
+  for (const c of candidates) { try { if (fs.existsSync(c)) return c; } catch (e) { /* ignore */ } }
+  return null;
+}
+
+async function waitForFile(file, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try { if (fs.existsSync(file)) return fs.readFileSync(file, 'utf8'); } catch (e) { /* ignore */ }
+    await sleep(200);
+  }
+  return null;
+}
+
+const browser = {
+  proc: null,
+  profile: null,
+  cdp: null,
+  ws: null,
+  pages: new Map(), // pageId -> { targetId, sessionId, url }
+  pageSeq: 0,
+  launching: null,
+};
+
+async function launchBrowser(profile) {
+  /* 单一常驻浏览器原则：只要 profile 相同就复用同一 Chrome 实例，
+   * 绝不因 headless 参数差异重建（重建会导致 DeepSeek 会话 cookie 丢失）。
+   * 首次启动的 headless 状态决定窗口可见性；登录/推理/校准共用该实例。 */
+  if (browser.proc && browser.profile && browser.profile.name === profile.name && browser.cdp) return;
+  if (browser.launching) await browser.launching.catch(() => {});
+  const launch = (async () => {
+    await closeBrowser();
+    const chrome = findChrome();
+    if (!chrome) throw new Error('Chrome/Edge not found. Set DS_WEB_CHROME or install Chrome/Edge.');
+    const dir = profileDir(profile.name);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* ignore */ }
+    const headless = effectiveHeadless(profile);
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      /* clear stale state from previous runs (crash leftovers, profile locks) */
+      for (const f of ['DevToolsActivePort', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+        try {
+          const fp = path.join(dir, f);
+          if (fs.existsSync(fp)) fs.unlinkSync(fp);
+        } catch (e) { /* ignore */ }
+      }
+      const args = [
+        chrome,
+        '--user-data-dir=' + dir,
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-background-networking',
+        '--disable-component-update',
+        '--disable-sync',
+        '--disable-extensions',
+        '--disable-features=Translate,OptimizationHints,msEdgeSidebarV2',
+        '--window-size=1280,900',
+        'about:blank',
+      ];
+      if (headless) args.splice(1, 0, '--headless=new');
+      log('launching', chrome, 'headless=' + headless, 'profile=' + profile.name, 'attempt=' + attempt);
+      const proc = spawn(args[0], args.slice(1), { stdio: 'ignore' });
+      browser.proc = proc;
+      proc.on('error', (e) => { logErr('browser spawn error', e.message); });
+      proc.on('exit', (code) => {
+        log('browser exited', code);
+        if (browser.proc === proc) {
+          browser.proc = null;
+          browser.cdp = null;
+          browser.ws = null;
+          browser.pages.clear();
+        }
+        browser.launching = null;
+      });
+      const portFile = path.join(dir, 'DevToolsActivePort');
+      const content = await waitForFile(portFile, 25000);
+      if (!content) {
+        lastErr = new Error('browser did not expose DevTools port (profile: ' + profile.name + ')');
+        await closeBrowser();
+        await sleep(1200);
+        continue;
+      }
+      const lines = content.split(/\r?\n/).filter((x) => x.trim().length > 0);
+      const port = parseInt(lines[0], 10);
+      const wsPath = lines[1] || '/devtools/browser/' + crypto.randomUUID();
+      const wsUrl = 'ws://127.0.0.1:' + port + wsPath;
+      try {
+        const ws = await wsConnect(wsUrl, 15000);
+        const cdp = new CdpClient(ws);
+        browser.cdp = cdp;
+        browser.ws = ws;
+        browser.profile = profile;
+        log('cdp connected', wsUrl);
+        return;
+      } catch (e) {
+        lastErr = e;
+        await closeBrowser();
+        await sleep(1200);
+      }
+    }
+    throw lastErr || new Error('browser launch failed');
+  })();
+  browser.launching = launch;
+  try { await launch; } finally { browser.launching = null; }
+}
+
+async function closeBrowser() {
+  const proc = browser.proc;
+  browser.proc = null;
+  browser.cdp = null;
+  browser.ws = null;
+  browser.pages.clear();
+  browser.pageSeq = 0;
+  if (proc && proc.pid) {
+    try {
+      if (process.platform === 'win32') {
+        execSync('taskkill /pid ' + proc.pid + ' /T /F', { stdio: 'ignore', timeout: 10000 });
+      } else {
+        proc.kill('SIGKILL');
+      }
+    } catch (e) {
+      try { proc.kill(); } catch (e2) { /* ignore */ }
+    }
+  }
+  await sleep(600);
+}
+
+async function ensureBrowser(profile) {
+  const p = profile || CFG.profiles[0] || { name: 'default', headless: CFG.headless };
+  await launchBrowser(p);
+  return browser;
+}
+
+/* ------------------------------------------------------------------ */
+/* page management                                                     */
+/* ------------------------------------------------------------------ */
+async function newPage(opts) {
+  const cdp = browser.cdp;
+  if (!cdp) throw new Error('browser not running');
+  const params = { url: 'about:blank' };
+  if (opts && opts.newWindow) params.newWindow = true;
+  const t = await cdp.call('Target.createTarget', params);
+  const targetId = t.targetId;
+  const att = await cdp.call('Target.attachToTarget', { targetId, flatten: true });
+  const sessionId = att.sessionId;
+  const pageId = 'p' + (++browser.pageSeq);
+  browser.pages.set(pageId, { targetId, sessionId, url: 'about:blank' });
+  await cdp.call('Runtime.enable', {}, sessionId);
+  await cdp.call('Page.enable', {}, sessionId);
+  await cdp.call('DOM.enable', {}, sessionId);
+  return pageId;
+}
+
+function pageInfo(pageId) { return browser.pages.get(pageId); }
+
+async function closePage(pageId) {
+  const p = pageInfo(pageId);
+  if (!p) return;
+  browser.pages.delete(pageId);
+  try { await browser.cdp.call('Target.closeTarget', { targetId: p.targetId }); } catch (e) { /* ignore */ }
+  /* 保活：若没有任何页面了，补一个 about:blank 标签，避免 Chrome 窗口关闭导致进程退出、会话丢失 */
+  if (browser.pages.size === 0 && browser.proc) {
+    try { await newPage(); } catch (e) { /* ignore */ }
+  }
+}
+
+async function evalJs(pageId, expression, opts) {
+  const p = pageInfo(pageId);
+  if (!p) throw new Error('page gone');
+  const params = { expression, returnByValue: true, awaitPromise: true };
+  if (opts && opts.userGesture) params.userGesture = true;
+  const r = await browser.cdp.call('Runtime.evaluate', params, p.sessionId);
+  if (r.exceptionDetails) {
+    const ex = r.exceptionDetails.exception;
+    throw new Error('page eval: ' + (ex ? (ex.description || ex.value) : r.exceptionDetails.text));
+  }
+  return r.result && r.result.value;
+}
+
+async function navigate(pageId, url) {
+  const p = pageInfo(pageId);
+  if (!p) throw new Error('page gone');
+  await browser.cdp.call('Page.navigate', { url }, p.sessionId);
+  await waitReady(pageId, 30000);
+}
+
+async function waitReady(pageId, timeoutMs) {
+  const start = Date.now();
+  for (;;) {
+    if (Date.now() - start > timeoutMs) return false;
+    try {
+      const st = await evalJs(pageId, '(() => { return { ready: document.readyState, hasBody: !!document.body, title: (document.title||"").slice(0,80) }; })()');
+      if (st && st.hasBody) return true;
+    } catch (e) { /* page mid-nav */ }
+    await sleep(300);
+  }
+}
+
+async function waitFor(pageId, expression, timeoutMs, intervalMs) {
+  const start = Date.now();
+  for (;;) {
+    if (Date.now() - start > timeoutMs) return null;
+    try {
+      const v = await evalJs(pageId, expression);
+      if (v) return v;
+    } catch (e) { /* keep polling */ }
+    await sleep(intervalMs || 300);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* DOM expressions (ported from deepseek-browser-agent)                */
+/* ------------------------------------------------------------------ */
+const EXPR = {
+  messageCount: `(() => {
+    const cands = ['.ds-message','.ds-assistant-message-main-content','[class*="assistant"][class*="message"]','[data-role="assistant"]','[class*="markdown-content"]','[class*="chat-message"]','[class*="message-bubble"]'];
+    for (const s of cands) { const els = document.querySelectorAll(s); if (els.length) return els.length; }
+    return document.querySelectorAll('[class*="message"]').length;
+  })()`,
+
+  extractLast: `(() => {
+    function walk(node, out) {
+      if (!node) return;
+      if (node.nodeType === 3) { out.push(node.textContent); return; }
+      if (node.nodeType !== 1) return;
+      const tag = node.tagName.toLowerCase();
+      if (tag === 'pre') {
+        const codeEl = node.querySelector('code');
+        if (codeEl) {
+          const cls = codeEl.className || '';
+          const lang = (cls.match(/language-(\\S+)/) || [])[1] || '';
+          out.push('\\n\`\`\`' + lang + '\\n' + (codeEl.textContent || '') + '\\n\`\`\`\\n');
+        } else out.push('\\n\`\`\`\\n' + (node.textContent || '') + '\\n\`\`\`\\n');
+        return;
+      }
+      if (tag === 'code') {
+        const pt = node.parentElement ? node.parentElement.tagName.toLowerCase() : '';
+        if (pt !== 'pre') out.push('\`' + (node.textContent || '') + '\`');
+        return;
+      }
+      for (const ch of node.childNodes) walk(ch, out);
+      if (['p','div','li','br','h1','h2','h3','h4','h5','h6'].includes(tag)) out.push('\\n');
+    }
+    function fullText(el) { const out = []; walk(el, out); return out.join('').trim(); }
+    const direct = ['.ds-assistant-message-main-content','[class*="assistant-message-main"]','.ds-markdown','[class*="assistant"] [class*="markdown"]','[class*="assistant"] [class*="content"]','[data-role="assistant"] [class*="content"]','[class*="ai-message"] [class*="content"]','[class*="bot-message"] [class*="content"]','[class*="response-content"]'];
+    for (const s of direct) { const els = document.querySelectorAll(s); if (els.length) { const t = fullText(els[els.length - 1]); if (t.length > 10) return t; } }
+    const md = document.querySelectorAll('[class*="markdown"], [class*="prose"], [class*="rendered"]');
+    if (md.length) { const t = fullText(md[md.length - 1]); if (t.length > 10) return t; }
+    const blocks = Array.from(document.querySelectorAll('[class*="message"], [class*="chat-item"], [class*="turn"]'));
+    const cands = blocks.filter((el) => {
+      const cls = String(el.className || '').toLowerCase();
+      return !cls.includes('input') && !cls.includes('user') && !el.querySelector('textarea, input[type="text"]') && ((el.innerText || '').length > 20);
+    });
+    if (cands.length) return fullText(cands[cands.length - 1]);
+    return '';
+  })()`,
+
+  generating: `(() => {
+    const stopSels = ['button[aria-label*="Stop" i]','[class*="stop-gen"]','[class*="stopGen"]','[class*="generating"]'];
+    for (const s of stopSels) { const el = document.querySelector(s); if (el) { const cs = window.getComputedStyle(el); if (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') return true; } }
+    const loaderSels = ['[class*="typing"]','[class*="loading"]','[class*="spinner"]','[class*="blink"]','[class*="cursor"]','[class*="pulsing"]','svg[class*="loading"]','svg[class*="spinner"]'];
+    for (const s of loaderSels) { const el = document.querySelector(s); if (el) { const cs = window.getComputedStyle(el); if (cs.display !== 'none' && cs.visibility !== 'hidden') return true; } }
+    return false;
+  })()`,
+
+  findInput: `(() => {
+    const sels = ['#chat-input','textarea[placeholder]','textarea','[contenteditable="true"][role="textbox"]','[contenteditable="true"]'];
+    for (const s of sels) {
+      const el = document.querySelector(s);
+      if (el) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return { found: true, tag: el.tagName.toLowerCase(), editable: el.isContentEditable === true };
+      }
+    }
+    return { found: false };
+  })()`,
+
+  clickSend: `(() => {
+    const sels = ['button[aria-label*="Send" i]','button[aria-label*="send" i]','[data-testid="send-button"]','button[type="submit"]','[class*="send-btn"]','[class*="sendBtn"]','[class*="send-button"]'];
+    for (const s of sels) { const el = document.querySelector(s); if (el) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && !el.disabled) { el.click(); return true; } } }
+    return false;
+  })()`,
+
+  clickNewChat: `(() => {
+    const sels = ['button[aria-label*="New chat" i]','button[aria-label*="New conversation" i]','a[href="/"][aria-label]','[data-testid="new-chat"]','[class*="new-chat"]','[class*="newChat"]','button[aria-label*="新对话"]','button[aria-label*="新建对话"]','[class*="newChatButton"]'];
+    for (const s of sels) { const el = document.querySelector(s); if (el) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { el.click(); return true; } } }
+    return false;
+  })()`,
+
+  loginState: `(() => {
+    const url = window.location.href;
+    const body = (document.body && document.body.innerText) || '';
+    return {
+      needsLogin: url.includes('/auth') || url.includes('/login') || url.includes('/sign') || body.includes('Sign in') || body.includes('Log in') || body.includes('登录') || body.includes('登 录') || !!document.querySelector('input[type="password"]'),
+      url: url,
+      hasChatInput: !!document.querySelector('#chat-input, textarea[placeholder], textarea, [contenteditable="true"]'),
+      bodySnippet: body.slice(0, 300),
+    };
+  })()`,
+
+  buttons: `(() => {
+    const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], label'));
+    const seen = [];
+    const out = [];
+    for (const el of els) {
+      const txt = (el.innerText || el.textContent || '').trim();
+      if (!txt) continue;
+      const key = txt.slice(0, 40);
+      if (seen.includes(key)) continue;
+      seen.push(key);
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) continue;
+      out.push({ text: txt.slice(0, 80), aria: el.getAttribute('aria-pressed'), cls: String(el.className || '').slice(0, 60), tag: el.tagName.toLowerCase() });
+    }
+    return out;
+  })()`,
+
+  clickText: (labels) => `(() => {
+    const labels = ${JSON.stringify(labels)};
+    const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], [class*="option"], [class*="menu-item"], div[class*="model"], span[class*="model"]'));
+    for (const lab of labels) {
+      const needle = String(lab).toLowerCase();
+      for (const el of els) {
+        const txt = ((el.innerText || el.textContent || '').trim() || '').toLowerCase();
+        if (txt && (txt === needle || txt.includes(needle))) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) { el.click(); return { clicked: true, matched: lab, text: txt.slice(0, 60) }; }
+        }
+      }
+    }
+    return { clicked: false };
+  })()`,
+
+  bodyTail: `(() => { const t = (document.body && document.body.innerText) || ''; return t.slice(-2500); })()`,
+
+  domDebug: `(() => {
+    const classFreq = {};
+    document.querySelectorAll('*').forEach((el) => { el.classList.forEach((c) => { if (/message|chat|input|send|stop|markdown|content|assistant|user|bot|model|toggle|think/i.test(c)) classFreq[c] = (classFreq[c] || 0) + 1; }); });
+    const inputs = Array.from(document.querySelectorAll('textarea, [contenteditable]')).map((e) => ({ tag: e.tagName, id: e.id || null, cls: String(e.className || '').slice(0, 80), ph: e.placeholder || null, editable: e.isContentEditable, visible: e.offsetParent !== null }));
+    return { url: window.location.href, title: document.title, classes: Object.entries(classFreq).sort((a, b) => b[1] - a[1]).slice(0, 50), inputs };
+  })()`,
+
+  modelBadge: `(() => {
+    const sels = ['[class*="model-name"]','[class*="modelName"]','[class*="model-name-display"]','[class*="model-select"]','[class*="modelSelect"]','[class*="model"] button','button[class*="model"]'];
+    for (const s of sels) { const el = document.querySelector(s); if (el) { const t = (el.innerText || el.textContent || '').trim(); if (t) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return { text: t.slice(0, 60), tag: el.tagName.toLowerCase() }; } } }
+    const all = Array.from(document.querySelectorAll('button, [role="button"]'));
+    for (const el of all) { const t = (el.innerText || el.textContent || '').trim(); if (t && /deepseek|r1|v3|ocr|模型/i.test(t)) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return { text: t.slice(0, 60), tag: el.tagName.toLowerCase() }; } }
+    return { text: '', tag: '' };
+  })()`,
+
+  setFileInput: (sel) => `(() => { const el = document.querySelector(${JSON.stringify(sel)}); return !!el; })()`,
+};
+
+/* ------------------------------------------------------------------ */
+/* chat operations                                                     */
+/* ------------------------------------------------------------------ */
+async function ensureLoggedIn(pageId) {
+  await waitReady(pageId, 30000);
+  const st = await evalJs(pageId, EXPR.loginState);
+  return st;
+}
+
+async function waitForChatInput(pageId, timeoutMs) {
+  const start = Date.now();
+  for (;;) {
+    let st = null;
+    try { st = await evalJs(pageId, EXPR.loginState); } catch (e) { /* page mid-nav */ }
+    if (st && st.needsLogin) throw new Error('login required: run dsweb_login (or the dashboard 登录 button) to log into chat.deepseek.com. url=' + st.url);
+    try {
+      const inp = await evalJs(pageId, EXPR.findInput);
+      if (inp && inp.found) return st;
+    } catch (e) { /* keep waiting */ }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error('chat input not found - login may be needed (run dsweb_login). url=' + (st ? st.url : '?'));
+    }
+    await sleep(1000);
+  }
+}
+
+async function applyConfig(pageId, opts) {
+  /* opts: { mode, deepThink, search } — best-effort UI toggling */
+  const report = { toggles: [], warnings: [] };
+  const wantThink = opts.mode === 'expert' || opts.deepThink === true;
+  const wantSearch = opts.search === true;
+  try {
+    /* 1) model badge: expert wants R1/deep-think; quick wants base model */
+    if (opts.mode === 'expert') {
+      const r1 = await evalJs(pageId, EXPR.clickText(['DeepSeek-R1', '深度思考', 'DeepThink', 'R1']));
+      if (r1.clicked) report.toggles.push('model:expert(' + r1.matched + ')');
+      else report.warnings.push('expert mode: R1/deep-think control not found');
+    } else {
+      const r = await evalJs(pageId, EXPR.clickText(['DeepSeek', 'V3', '快速', '通用']));
+      if (r.clicked) report.toggles.push('model:quick(' + r.matched + ')');
+    }
+    await sleep(600);
+    /* 2) deep-think pill (often a toggle next to the composer) */
+    const thinkLabels = ['深度思考', 'DeepThink', 'Deep Think', '深度推理'];
+    const t = await evalJs(pageId, EXPR.clickText(thinkLabels));
+    if (t.clicked) report.toggles.push('think:toggled(' + t.matched + ')');
+    await sleep(300);
+    /* 3) web search pill */
+    if (wantSearch) {
+      const s = await evalJs(pageId, EXPR.clickText(['联网搜索', '联网', 'Search', '搜索']));
+      if (s.clicked) report.toggles.push('search:on(' + s.matched + ')');
+      else report.warnings.push('web search toggle not found');
+    }
+    await sleep(500);
+  } catch (e) {
+    report.warnings.push('applyConfig error: ' + e.message);
+  }
+  return report;
+}
+
+async function uploadImage(pageId, absPath) {
+  const cdp = browser.cdp;
+  const p = pageInfo(pageId);
+  if (!p) throw new Error('page gone');
+  if (!fs.existsSync(absPath)) throw new Error('image not found: ' + absPath);
+  /* open the attachment picker if a hidden file input is not present yet */
+  const has = await evalJs(pageId, EXPR.setFileInput('input[type="file"]'));
+  if (!has) {
+    const r = await evalJs(pageId, EXPR.clickText(['上传', '附件', 'Attach', 'attach', '＋', '+', '添加']));
+    await sleep(600);
+  }
+  const doc = await cdp.call('DOM.getDocument', { depth: -1 }, p.sessionId);
+  const q = await cdp.call('DOM.querySelector', { nodeId: doc.root.nodeId, selector: 'input[type="file"]' }, p.sessionId);
+  if (!q || !q.nodeId) throw new Error('no file input found for image upload');
+  await cdp.call('DOM.setFileInputFiles', { nodeId: q.nodeId, files: [absPath] }, p.sessionId);
+  await sleep(1500);
+}
+
+async function sendMessage(pageId, text, opts) {
+  const cdp = browser.cdp;
+  const p = pageInfo(pageId);
+  if (!p) throw new Error('page gone');
+  const inp = await evalJs(pageId, EXPR.findInput);
+  if (!inp || !inp.found) throw new Error('chat input not found (logged in?)');
+  /* focus + 清空 + 输入（参考 deepseek-browser-agent：execCommand + 手动 InputEvent 触发 React，
+   * 否则发送按钮保持 disabled 导致无法发送） */
+  if (inp.editable) {
+    await evalJs(pageId, `(() => {
+      const el = document.querySelector('[contenteditable="true"]');
+      if (!el) return false;
+      el.focus();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+      document.execCommand('insertText', false, ${JSON.stringify(text)});
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ${JSON.stringify(text)} }));
+      return true;
+    })()`);
+  } else {
+    await evalJs(pageId, `(() => {
+      const el = document.querySelector('textarea');
+      if (!el) return false;
+      el.focus();
+      const proto = window.HTMLTextAreaElement ? HTMLTextAreaElement.prototype : Object.getPrototypeOf(el);
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (setter && setter.set) setter.set.call(el, ${JSON.stringify(text)});
+      else { el.value = ${JSON.stringify(text)}; }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+  }
+  await sleep(350);
+  /* 点击发送按钮（输入后等 React 更新按钮状态） */
+  const clicked = await evalJs(pageId, EXPR.clickSend);
+  if (!clicked) {
+    /* 完整 Enter 序列（keyDown + char + keyUp，对照 Playwright keyboard.press） */
+    const enterKeys = [
+      { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+      { type: 'char', text: '\r', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+      { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+    ];
+    for (const k of enterKeys) { await cdp.call('Input.dispatchKeyEvent', k, p.sessionId); }
+  }
+  await sleep(500);
+}
+
+async function newChat(pageId) {
+  const clicked = await evalJs(pageId, EXPR.clickNewChat);
+  if (clicked) { await sleep(1200); return; }
+  try { await navigate(pageId, DS_URL); } catch (e) { log('newChat navigate fallback failed', e.message); }
+  await sleep(1500);
+}
+
+async function waitForResponse(state, timeoutMs, stableDelayMs) {
+  const pageId = state.pageId;
+  const start = Date.now();
+  const initial = await evalJs(pageId, EXPR.messageCount);
+  let appeared = false;
+  while (Date.now() - start < 15000) {
+    if (state.stopped) throw new Error('stopped');
+    try {
+      const c = await evalJs(pageId, EXPR.messageCount);
+      if (c > initial) { appeared = true; break; }
+    } catch (e) { /* keep waiting */ }
+    await sleep(400);
+  }
+  let lastText = '';
+  let stableStart = null;
+  while (Date.now() - start < timeoutMs) {
+    if (state.stopped) throw new Error('stopped');
+    let text = '';
+    try { text = await evalJs(pageId, EXPR.extractLast); } catch (e) { /* keep polling */ }
+    if (text !== lastText) { lastText = text; stableStart = null; }
+    else if (text.length > 0) {
+      if (stableStart === null) stableStart = Date.now();
+      else if (Date.now() - stableStart >= stableDelayMs) {
+        let gen = true;
+        try { gen = await evalJs(pageId, EXPR.generating); } catch (e) { /* assume generating */ }
+        if (!gen) break;
+        stableStart = null;
+      }
+    }
+    await sleep(500);
+  }
+  let final = '';
+  try { final = await evalJs(pageId, EXPR.extractLast); } catch (e) { /* ignore */ }
+  return cleanText(final);
+}
+
+function cleanText(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/<think>[\s\S]*?<\/think>\n?/gi, '')
+    .replace(/^Thinking\.{0,3}\n[\s\S]*?\n\n/m, '')
+    .replace(/^\d+(?:Copy|Run|Insert|Edit)\b.*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/* limit signal detection from the page body */
+const LIMIT_PATTERNS = {
+  length: [
+    /对话.{0,8}(过长|超|限制|已满|已满员|无法继续)/i,
+    /(上下文|内容).{0,8}(过长|超出|超限|限制)/i,
+    /too (long|large|many)|context (length|limit)|exceeds? (the )?(limit|maximum)|limit reached/i,
+  ],
+  quota: [
+    /(今日|当天|当前).{0,10}(对话|提问|消息|次数).{0,10}(用完|耗尽|达到上限|已达上限|已用完|受限)/i,
+    /次数.{0,10}(用完|耗尽|上限|受限|限制)/i,
+    /(发送|请求|操作).{0,6}(太频繁|过于频繁|请稍后|稍后再试)/i,
+    /rate limit|too many requests|quota|limit reached|try again later|please slow down/i,
+  ],
+  captcha: [
+    /验证码|人机验证|安全验证|captcha|cloudflare|challenge/i,
+  ],
+};
+
+function detectLimit(bodyText) {
+  const t = String(bodyText || '');
+  for (const kind of ['length', 'quota', 'captcha']) {
+    for (const re of LIMIT_PATTERNS[kind]) {
+      if (re.test(t)) return { kind, matched: String(re).slice(0, 60) };
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* tool-call parser (ported from deepseek-browser-agent)               */
+/* ------------------------------------------------------------------ */
+function stripThinkingBlocks(text) {
+  return String(text)
+    .replace(/<think>[\s\S]*?<\/think>\n?/gi, '')
+    .replace(/^Thinking\.{0,3}\n[\s\S]*?\n\n/m, '')
+    .trim();
+}
+
+function attemptJsonFix(str) {
+  try {
+    const fixed = String(str)
+      .replace(/,\s*([}\]])/g, '$1')
+      .replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":');
+    return JSON.parse(fixed);
+  } catch (e) { return null; }
+}
+
+function extractLargestJsonObject(text) {
+  let best = null;
+  let bestLen = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '{') continue;
+    let depth = 0, inStr = false, escape = false;
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inStr) { escape = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          const candidate = text.slice(i, j + 1);
+          if (candidate.length > bestLen) {
+            try { const parsed = JSON.parse(candidate); best = parsed; bestLen = candidate.length; }
+            catch (e) { const fixed = attemptJsonFix(candidate); if (fixed && candidate.length > bestLen) { best = fixed; bestLen = candidate.length; } }
+          }
+          break;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+function parseResponse(rawText) {
+  const text = stripThinkingBlocks(rawText).trim();
+  const mk = (name, args) => ({ type: 'tool_call', name, args, raw: rawText });
+  const bare = text.match(/^tool_call\s*\n([\s\S]+)$/i);
+  if (bare) {
+    try {
+      const parsed = JSON.parse(bare[1].trim());
+      const name = parsed.name || parsed.tool || parsed.function;
+      const args = parsed.args || parsed.arguments || parsed.parameters || parsed.input || {};
+      if (name && typeof name === 'string') return mk(name, args);
+    } catch (e) {
+      const fixed = attemptJsonFix(bare[1]);
+      if (fixed && (fixed.name || fixed.tool || fixed.function)) return mk(fixed.name || fixed.tool || fixed.function, fixed.args || fixed.arguments || fixed.parameters || fixed.input || {});
+    }
+  }
+  const fenced = text.match(/```tool_call\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try {
+      const parsed = JSON.parse(fenced[1].trim());
+      const name = parsed.name || parsed.tool || parsed.function;
+      const args = parsed.args || parsed.arguments || parsed.parameters || parsed.input || {};
+      if (name && typeof name === 'string') return mk(name, args);
+    } catch (e) {
+      const fixed = attemptJsonFix(fenced[1]);
+      if (fixed && (fixed.name || fixed.tool || fixed.function)) return mk(fixed.name || fixed.tool || fixed.function, fixed.args || fixed.arguments || fixed.parameters || fixed.input || {});
+      return { type: 'error', message: 'tool_call invalid JSON: ' + e.message, raw: rawText };
+    }
+  }
+  const jsonFence = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+  if (jsonFence) {
+    try {
+      const parsed = JSON.parse(jsonFence[1]);
+      const name = parsed.name || parsed.tool || parsed.function;
+      const args = parsed.args || parsed.arguments || parsed.parameters || parsed.input || {};
+      if (name && typeof name === 'string') return mk(name, args);
+    } catch (e) { /* fall through */ }
+  }
+  const xml = text.match(/<tool_call[^>]*>\s*(?:<name>([\s\S]*?)<\/name>\s*)?(?:<input>([\s\S]*?)<\/input>|<args>([\s\S]*?)<\/args>)\s*<\/tool_call>/i);
+  if (xml) {
+    const name = (xml[1] || '').trim();
+    const inputRaw = stripCodeFences((xml[2] || xml[3] || '').trim());
+    if (name) {
+      try { return mk(name, JSON.parse(inputRaw)); }
+      catch (e) { const fixed = attemptJsonFix(inputRaw); if (fixed) return mk(name, fixed); }
+    }
+  }
+  if (/["'](?:name|tool|function)["']\s*:\s*["'][\w_]+["']/.test(text)) {
+    const obj = extractLargestJsonObject(text);
+    if (obj) {
+      const name = obj.name || obj.tool || obj.function;
+      const args = obj.args || obj.arguments || obj.parameters || obj.input || {};
+      if (name && typeof name === 'string') return mk(name, args);
+    }
+  }
+  return { type: 'final', content: text, raw: rawText };
+}
+
+function stripCodeFences(str) {
+  return String(str).replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+}
+
+/* ------------------------------------------------------------------ */
+/* tools (cross-platform port of deepseek-browser-agent tools)         */
+/* ------------------------------------------------------------------ */
+function truncate(str, max) {
+  if (!str) return '';
+  const s = String(str);
+  const m = max || CFG.maxOutputLength;
+  if (s.length <= m) return s;
+  const half = Math.floor(m / 2);
+  return s.slice(0, half) + '\n\n\u26a0 [OUTPUT TRUNCATED - ' + s.length.toLocaleString() + ' chars total, showing first & last ' + half + ' chars]\n\n' + s.slice(-half);
+}
+
+function resolvePath(p, base) {
+  if (path.isAbsolute(p)) return p;
+  return path.resolve(base || '.', p);
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i];
+}
+
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'build', '.dsh', '.dsweb']);
+function walkDir(dir, depth, maxEntries, showHidden, cb) {
+  let count = 0;
+  function walk(d, dep) {
+    if (count >= maxEntries) return;
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { return; }
+    for (const ent of entries) {
+      if (count >= maxEntries) return;
+      if (!showHidden && ent.name.startsWith('.')) continue;
+      const full = path.join(d, ent.name);
+      if (ent.isDirectory()) {
+        if (SKIP_DIRS.has(ent.name)) continue;
+        cb(full, true);
+        count++;
+        if (dep < depth) walk(full, dep + 1);
+      } else {
+        cb(full, false);
+        count++;
+      }
+    }
+  }
+  walk(dir, 0);
+  return count;
+}
+
+const TOOLS = {
+  read_file: {
+    description: 'Read the full contents of a file. Optionally read specific line ranges.',
+    parameters: { path: 'string (REQUIRED): path to the file', start_line: 'number (optional): first line (1-indexed)', end_line: 'number (optional): last line (inclusive)' },
+    async execute(args, base) {
+      const abs = resolvePath(args.path, base);
+      if (!fs.existsSync(abs)) throw new Error('File not found: ' + args.path);
+      if (fs.statSync(abs).isDirectory()) throw new Error(args.path + ' is a directory');
+      let content = fs.readFileSync(abs, 'utf8');
+      if (args.start_line != null || args.end_line != null) {
+        const lines = content.split('\n');
+        const s = Math.max(0, (args.start_line || 1) - 1);
+        const e = args.end_line != null ? args.end_line : lines.length;
+        return '[' + args.path + ' | lines ' + (s + 1) + '-' + e + ']\n' + truncate(lines.slice(s, e).map((l, i) => (s + i + 1) + ': ' + l).join('\n'));
+      }
+      const lineCount = content.split('\n').length;
+      if (lineCount <= 300) return '[' + args.path + ' | ' + lineCount + ' lines]\n' + content.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n');
+      return '[' + args.path + ' | ' + lineCount + ' lines - use start_line/end_line to read sections]\n' + truncate(content);
+    },
+  },
+  write_file: {
+    description: 'Write (create or overwrite) a file with given content. Creates parent directories automatically.',
+    parameters: { path: 'string (REQUIRED): destination file path', content: 'string (REQUIRED): full file content' },
+    async execute(args, base) {
+      const abs = resolvePath(args.path, base);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, args.content, 'utf8');
+      return '\u2713 Wrote ' + formatBytes(Buffer.byteLength(args.content, 'utf8')) + ' (' + args.content.split('\n').length + ' lines) -> ' + args.path;
+    },
+  },
+  append_to_file: {
+    description: 'Append text to the end of an existing file (or create it if missing).',
+    parameters: { path: 'string (REQUIRED): file path', content: 'string (REQUIRED): text to append' },
+    async execute(args, base) {
+      const abs = resolvePath(args.path, base);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.appendFileSync(abs, args.content, 'utf8');
+      return '\u2713 Appended ' + formatBytes(Buffer.byteLength(args.content, 'utf8')) + ' to ' + args.path;
+    },
+  },
+  replace_in_file: {
+    description: 'Find and replace text in a file. Supports regex patterns.',
+    parameters: { path: 'string (REQUIRED): file path', find: 'string (REQUIRED): text to find', replace: 'string (REQUIRED): replacement text', use_regex: 'boolean (optional): treat find as regex (default false)', all_occurrences: 'boolean (optional): replace all (default true)' },
+    async execute(args, base) {
+      const abs = resolvePath(args.path, base);
+      const original = fs.readFileSync(abs, 'utf8');
+      let content = original;
+      const all = args.all_occurrences !== false;
+      if (args.use_regex) content = content.replace(new RegExp(args.find, all ? 'g' : ''), args.replace);
+      else if (all) content = content.split(args.find).join(args.replace);
+      else content = content.replace(args.find, args.replace);
+      if (content === original) return '\u26a0 No matches found for "' + args.find + '" in ' + args.path;
+      const re = new RegExp(args.use_regex ? args.find : args.find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+      const count = (original.match(re) || []).length;
+      fs.writeFileSync(abs, content, 'utf8');
+      return '\u2713 Replaced ' + count + ' occurrence(s) of "' + args.find + '" in ' + args.path;
+    },
+  },
+  delete_file: {
+    description: 'Permanently delete a file.',
+    parameters: { path: 'string (REQUIRED): file to delete' },
+    async execute(args, base) {
+      const abs = resolvePath(args.path, base);
+      if (!fs.existsSync(abs)) throw new Error('File not found: ' + args.path);
+      fs.unlinkSync(abs);
+      return '\u2713 Deleted ' + args.path;
+    },
+  },
+  list_directory: {
+    description: 'List files and folders in a directory, optionally recursive.',
+    parameters: { path: 'string (optional): directory (default working dir)', recursive: 'boolean (optional)', show_hidden: 'boolean (optional)' },
+    async execute(args, base) {
+      const abs = resolvePath(args.path || '.', base);
+      if (!fs.existsSync(abs)) throw new Error('Directory not found: ' + args.path);
+      if (!fs.statSync(abs).isDirectory()) throw new Error(args.path + ' is not a directory');
+      if (args.recursive) {
+        const out = [];
+        walkDir(abs, 4, 300, !!args.show_hidden, (f, isDir) => out.push((isDir ? '[d] ' : '    ') + path.relative(base || '.', f)));
+        return out.join('\n') || '(empty)';
+      }
+      const entries = fs.readdirSync(abs, { withFileTypes: true }).filter((e) => args.show_hidden || !e.name.startsWith('.'));
+      entries.sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1));
+      if (!entries.length) return '(empty directory: ' + args.path + ')';
+      const lines = entries.map((e) => {
+        if (e.isDirectory()) return '\ud83d\udcc1  ' + e.name + '/';
+        try { return '\ud83d\udcc4  ' + e.name + '  ' + formatBytes(fs.statSync(path.join(abs, e.name)).size); }
+        catch (err) { return '\ud83d\udcc4  ' + e.name; }
+      });
+      return '[' + args.path + '] - ' + entries.length + ' items\n' + lines.join('\n');
+    },
+  },
+  create_directory: {
+    description: 'Create a directory (and all necessary parent directories).',
+    parameters: { path: 'string (REQUIRED): directory path to create' },
+    async execute(args, base) {
+      fs.mkdirSync(resolvePath(args.path, base), { recursive: true });
+      return '\u2713 Created directory: ' + args.path;
+    },
+  },
+  move_file: {
+    description: 'Move or rename a file or directory.',
+    parameters: { source: 'string (REQUIRED): source path', destination: 'string (REQUIRED): destination path' },
+    async execute(args, base) {
+      const src = resolvePath(args.source, base);
+      const dest = resolvePath(args.destination, base);
+      if (!fs.existsSync(src)) throw new Error('Source not found: ' + args.source);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.renameSync(src, dest);
+      return '\u2713 Moved: ' + args.source + ' -> ' + args.destination;
+    },
+  },
+  copy_file: {
+    description: 'Copy a file to a new location.',
+    parameters: { source: 'string (REQUIRED): source file path', destination: 'string (REQUIRED): destination file path' },
+    async execute(args, base) {
+      const src = resolvePath(args.source, base);
+      const dest = resolvePath(args.destination, base);
+      if (!fs.existsSync(src)) throw new Error('Source not found: ' + args.source);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(src, dest);
+      return '\u2713 Copied: ' + args.source + ' -> ' + args.destination;
+    },
+  },
+  get_file_info: {
+    description: 'Get metadata about a file or directory (size, modified date, line count, etc.).',
+    parameters: { path: 'string (REQUIRED): file or directory path' },
+    async execute(args, base) {
+      const abs = resolvePath(args.path, base);
+      if (!fs.existsSync(abs)) throw new Error('Not found: ' + args.path);
+      const stat = fs.statSync(abs);
+      const info = { path: abs, type: stat.isDirectory() ? 'directory' : 'file', size: stat.size, size_human: formatBytes(stat.size), modified: stat.mtime.toISOString(), created: stat.birthtime.toISOString() };
+      if (stat.isFile()) { info.lines = fs.readFileSync(abs, 'utf8').split('\n').length; info.encoding = 'utf-8'; }
+      return JSON.stringify(info, null, 2);
+    },
+  },
+  run_command: {
+    description: 'Execute a shell command and return its output. Runs in the working directory by default. On Windows, cmd-compatible commands are expected (use powershell -Command "..." for PowerShell).',
+    parameters: { command: 'string (REQUIRED): shell command to run', cwd: 'string (optional): working directory', timeout: 'number (optional): timeout ms (default 60000)', env: 'object (optional): extra env vars' },
+    async execute(args, base) {
+      const workDir = args.cwd ? resolvePath(args.cwd, base) : base;
+      try {
+        const output = execSync(args.command, {
+          cwd: workDir, encoding: 'utf8', timeout: args.timeout || 60000,
+          maxBuffer: 20 * 1024 * 1024,
+          env: Object.assign({}, process.env, args.env || {}),
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        return truncate((output || '').trim() || '(command completed with no output)');
+      } catch (err) {
+        const stdout = (err.stdout || '').trim();
+        const stderr = (err.stderr || '').trim();
+        const combined = [stdout && 'STDOUT:\n' + stdout, stderr && 'STDERR:\n' + stderr].filter(Boolean).join('\n\n');
+        throw new Error('Command failed (exit code ' + err.status + '):\n' + truncate(combined || err.message));
+      }
+    },
+  },
+  find_files: {
+    description: 'Search for files by name pattern (glob-style, e.g. "*.js", "test_*").',
+    parameters: { pattern: 'string (REQUIRED): filename pattern (e.g. "*.ts")', directory: 'string (optional): directory to search', exclude: 'string (optional): substring to exclude from paths' },
+    async execute(args, base) {
+      const dir = resolvePath(args.directory || '.', base);
+      const pat = String(args.pattern || '');
+      const re = new RegExp('^' + pat.split('*').map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', 'i');
+      const out = [];
+      walkDir(dir, 6, 300, true, (f) => {
+        if (args.exclude && f.includes(args.exclude)) return;
+        if (re.test(path.basename(f))) out.push(f);
+      });
+      return out.slice(0, 100).join('\n') || 'No files matching "' + args.pattern + '" in ' + args.directory;
+    },
+  },
+  search_in_files: {
+    description: 'Search for text patterns inside files (like grep -r). Returns matching lines with filenames.',
+    parameters: { pattern: 'string (REQUIRED): text or regex to search for', directory: 'string (optional): directory to search', file_pattern: 'string (optional): only search files matching this', case_sensitive: 'boolean (optional)', context_lines: 'number (optional): context lines around matches' },
+    async execute(args, base) {
+      const dir = resolvePath(args.directory || '.', base);
+      let re;
+      try { re = new RegExp(args.pattern, args.case_sensitive ? '' : 'i'); }
+      catch (e) { throw new Error('invalid search pattern: ' + e.message); }
+      const ctx = Math.max(0, args.context_lines || 2);
+      const hits = [];
+      walkDir(dir, 6, 400, true, (f, isDir) => {
+        if (isDir) return;
+        if (args.file_pattern && !f.endsWith(String(args.file_pattern).replace(/^\*/, ''))) return;
+        if (hits.length >= 150) return;
+        try {
+          const lines = fs.readFileSync(f, 'utf8').split('\n');
+          for (let i = 0; i < lines.length; i++) {
+            if (re.test(lines[i])) {
+              for (let k = Math.max(0, i - ctx); k <= Math.min(lines.length - 1, i + ctx); k++) {
+                hits.push(f + ':' + (k + 1) + ': ' + lines[k]);
+              }
+              hits.push('---');
+              break;
+            }
+          }
+        } catch (e) { /* skip unreadable */ }
+      });
+      if (!hits.length) return 'No matches found for: ' + args.pattern;
+      return truncate(hits.join('\n'), 8000);
+    },
+  },
+  read_url: {
+    description: 'Fetch the text content of a URL (useful for reading documentation, APIs, etc.).',
+    parameters: { url: 'string (REQUIRED): full URL (http or https)' },
+    async execute(args) {
+      return new Promise((resolve, reject) => {
+        const u = String(args.url || '');
+        const client = u.startsWith('https') ? https : http;
+        const req = client.get(u, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DeepSeekWebAgent/1.0)', Accept: 'text/html,text/plain,application/json' } }, (res) => {
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            TOOLS.read_url.execute({ url: res.headers.location }).then(resolve).catch(reject);
+            return;
+          }
+          let data = '';
+          res.on('data', (c) => { data += c; });
+          res.on('end', () => {
+            const text = data.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s{3,}/g, '\n\n').trim();
+            resolve(truncate(text));
+          });
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => { req.destroy(); reject(new Error('URL fetch timed out')); });
+      });
+    },
+  },
+  write_files: {
+    description: 'Write multiple files at once - useful for scaffolding projects.',
+    parameters: { files: 'array (REQUIRED): array of {path, content} objects' },
+    async execute(args, base) {
+      if (!Array.isArray(args.files)) throw new Error('"files" must be an array of {path, content}');
+      const results = [];
+      for (const f of args.files) {
+        const abs = resolvePath(f.path, base);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, String(f.content == null ? '' : f.content), 'utf8');
+        results.push('\u2713 ' + f.path);
+      }
+      return 'Wrote ' + results.length + ' files:\n' + results.join('\n');
+    },
+  },
+};
+
+function getToolDescriptions() {
+  return Object.keys(TOOLS).map((name) => {
+    const t = TOOLS[name];
+    const params = Object.keys(t.parameters).map((p) => '    - ' + p + ': ' + t.parameters[p]).join('\n');
+    return '### ' + name + '\n  ' + t.description + '\n  Parameters:\n' + params;
+  }).join('\n\n');
+}
+
+async function executeTool(name, args, base, policy) {
+  const tool = TOOLS[name];
+  if (!tool) throw new Error('Unknown tool: "' + name + '". Available: ' + Object.keys(TOOLS).join(', '));
+  if (policy) {
+    if (policy.allowed && !policy.allowed.includes(name)) throw new Error('Tool "' + name + '" is disabled for this task.');
+    if (policy.denied && policy.denied.includes(name)) throw new Error('Tool "' + name + '" is disabled by task policy.');
+  }
+  return await tool.execute(args || {}, base);
+}
+
+/* ------------------------------------------------------------------ */
+/* system prompt + working-dir snapshot                               */
+/* ------------------------------------------------------------------ */
+function buildSystemPrompt(task) {
+  const now = new Date().toISOString();
+  return [
+    'You are DeepSeek Web Agent - an autonomous AI coding agent running through the DeepSeek web chat.',
+    'You have direct access to the filesystem and can execute shell commands.',
+    '',
+    'ENVIRONMENT',
+    'Platform        : ' + process.platform + ' ' + os.release(),
+    'Node.js         : ' + process.version,
+    'Date/Time       : ' + now,
+    'Working Directory: ' + task.workingDir,
+    '',
+    'HOW TO CALL TOOLS',
+    'Your ENTIRE response must be ONLY a fenced code block tagged "tool_call" with NO text before or after:',
+    '```tool_call',
+    '{ "name": "TOOL_NAME", "args": { "param": "value" } }',
+    '```',
+    '',
+    'CRITICAL RULES:',
+    '- Output ONLY the tool_call block - no prose, no greeting.',
+    '- ONE tool call per response. Never multiple.',
+    '- Content must be valid JSON with exactly "name" and "args" keys.',
+    '- After receiving a tool result, call another tool OR give your final prose response.',
+    '- Write plain prose (no code block) only when the task is 100% complete.',
+    '',
+    'WHEN TO STOP',
+    'When fully done, respond with a clear natural-language summary. Do NOT wrap it in tags or code blocks.',
+    '',
+    'CODING GUIDELINES',
+    '- Always read existing files before modifying them.',
+    '- Always check the directory structure before creating files.',
+    '- Write complete, production-quality code - no TODOs, no placeholders.',
+    '- After writing code, run it (if applicable) to verify it works.',
+    '- Keep tool results and file content as small as possible to conserve context.',
+    '',
+    'CONTEXT MIGRATION (IMPORTANT)',
+    '- The web chat limits message count and context length. The harness automatically compacts history',
+    '  and migrates to a new chat when limits approach. If you see a "[CONTEXT DIGEST]" message, it',
+    '  contains compressed prior history - continue working normally on the original task.',
+    '- Do not repeat the whole task in every message. Only state what is new.',
+    '',
+    'AVAILABLE TOOLS',
+    getToolDescriptions(),
+    '',
+    'Remember: you are running autonomously. Be thorough, be precise, and complete the task fully.',
+  ].join('\n');
+}
+
+function buildAskPrompt(task) {
+  return [
+    'You are answering a single question through the DeepSeek web chat.',
+    'Answer directly, concisely, and completely. Reply in the same language as the question.',
+    'Do NOT use any special formatting or code-block protocols.',
+    'If the question needs a file or web resource you cannot access, say so clearly.',
+    'Question: ' + String(task.task),
+  ].join('\n');
+}
+
+function dirListing(base) {
+  const out = [];
+  walkDir(base, 3, 80, false, (f, isDir) => out.push((isDir ? '[d] ' : '    ') + path.relative(base, f)));
+  return out.join('\n') || '(empty directory)';
+}
+
+/* ------------------------------------------------------------------ */
+/* context digest (free, deterministic compression for migration)      */
+/* ------------------------------------------------------------------ */
+function compactStr(s, max) {
+  const str = String(s || '');
+  if (str.length <= max) return str;
+  const half = Math.floor(max / 2);
+  return str.slice(0, half) + ' ...[' + str.length + ' chars]... ' + str.slice(-half);
+}
+
+function buildDigest(history, keepRecent, maxPerMsg) {
+  const recentCount = Math.max(2, keepRecent * 2);
+  const old = history.slice(0, Math.max(0, history.length - recentCount));
+  const recent = history.slice(Math.max(0, history.length - recentCount));
+  const lines = [];
+  for (const m of old) {
+    const c = String(m.content || '');
+    if (m.kind === 'tool-result') {
+      const head = c.split('\n')[0] || '';
+      lines.push('[TOOL RESULT ' + m.tool + '] ' + head + ' (' + c.length + ' chars)');
+    } else {
+      lines.push('[' + (m.kind === 'user' ? 'USER' : 'ASSISTANT') + '] ' + compactStr(c, maxPerMsg));
+    }
+  }
+  const recentLines = [];
+  for (const m of recent) {
+    recentLines.push('[' + (m.kind === 'user' ? 'USER' : 'ASSISTANT') + ']\n' + compactStr(m.content, maxPerMsg * 2));
+  }
+  return {
+    digestText: lines.join('\n'),
+    recentText: recentLines.join('\n\n'),
+    oldCount: old.length,
+    recentCount: recent.length,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* task manager                                                        */
+/* ------------------------------------------------------------------ */
+const tasks = new Map(); // taskId -> taskState
+let taskSeq = 0;
+const activeCount = () => [...tasks.values()].filter((t) => t.status === 'running' || t.status === 'starting' || t.status === 'migrating' || t.status === 'rotating').length;
+
+function taskSummary(t) {
+  return {
+    id: t.id,
+    status: t.status,
+    detail: t.detail || '',
+    kind: t.kind,
+    mode: t.mode,
+    deepThink: t.deepThink,
+    search: t.search,
+    step: t.step,
+    turns: t.turns,
+    migrations: t.migrations,
+    profile: t.profile,
+    taskPreview: String(t.task || '').slice(0, 80),
+    startedAt: t.startedAt,
+    finishedAt: t.finishedAt,
+    hasResult: !!t.result,
+  };
+}
+
+function setStatus(t, status, detail) {
+  t.status = status;
+  t.detail = detail || '';
+  emitEvent('progress', { taskId: t.id, status, detail: t.detail, step: t.step, turns: t.turns, migrations: t.migrations });
+  log('task', t.id, status, detail);
+}
+
+function schedule() {
+  const queued = [...tasks.values()].filter((t) => t.status === 'queued');
+  for (const t of queued) {
+    if (activeCount() >= CFG.maxConcurrent) break;
+    setStatus(t, 'starting', 'launching');
+    runTask(t).catch((err) => {
+      t.error = err.message;
+      t.finishedAt = Date.now();
+      setStatus(t, 'error', 'error: ' + err.message);
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* per-task loop                                                       */
+/* ------------------------------------------------------------------ */
+async function runTask(t) {
+  try {
+    const started = Date.now();
+    const timeoutMs = t.timeoutMs || (t.kind === 'ask' ? 300000 : 1800000);
+    t.pageId = null;
+    t.history = [];
+    t.turns = 0;
+    t.migrations = 0;
+    t.charsInChat = 0;
+    t.stopped = false;
+    t.profile = t.profile || 'default';
+
+    await ensurePageFor(t);
+    await waitForChatInput(t.pageId, 25000);
+    await newChat(t.pageId);
+    const cfgReport = await applyConfig(t.pageId, t);
+    for (const w of cfgReport.warnings) { t.warnings.push(w); log('task', t.id, 'warn', w); }
+    if (t.images && t.images.length) {
+      for (const img of t.images) {
+        try { await uploadImage(t.pageId, img); t.warnings.push('image uploaded: ' + img); }
+        catch (e) { t.warnings.push('image upload failed: ' + img + ' -> ' + e.message); }
+      }
+    }
+
+    let first;
+    if (t.kind === 'ask') {
+      first = buildAskPrompt(t);
+    } else {
+      first = buildSystemPrompt(t) + '\n\n\u2550'.repeat(60) + '\n\nWORKING DIRECTORY CONTENTS:\n' + dirListing(t.workingDir) + '\n\nUSER TASK:\n' + String(t.task);
+    }
+    t.history.push({ kind: 'user', content: first });
+    t.charsInChat += first.length;
+
+    await ensurePageFor(t);
+    setStatus(t, 'running', 'task started');
+    await sendMessage(t.pageId, first, t);
+
+    const maxIter = t.maxIterations || CFG.maxIterations;
+    let finalText = null;
+
+    for (let iter = 1; iter <= maxIter; iter++) {
+      if (t.stopped) { setStatus(t, 'stopped', 'stopped by user'); return; }
+      if (Date.now() - started > timeoutMs) { t.error = 'timeout after ' + Math.round((Date.now() - started) / 1000) + 's'; setStatus(t, 'timeout', t.error); return; }
+
+      /* anti-limit: proactive compaction & migration before sending */
+      const needsCompact = t.turns >= (t.maxTurnsPerChat || CFG.maxTurnsPerChat) || t.charsInChat >= (t.compactThresholdChars || CFG.compactThresholdChars);
+      if (needsCompact && t.migrations < CFG.maxMigrations) {
+        t.migrations++;
+        setStatus(t, 'migrating', 'compacting context and migrating chat #' + (t.migrations + 1));
+        const digest = buildDigest(t.history, 4, 500);
+        await ensurePageFor(t, true);
+        await newChat(t.pageId);
+        const reseed = '[CONTEXT DIGEST]\n' + digest.digestText + '\n\n[RECENT EXCHANGES]\n' + digest.recentText +
+          '\n\n[SYSTEM] The chat was migrated to bypass web-side limits. Continue the ORIGINAL TASK (' + String(t.task).slice(0, 200) + ') using this compressed context. Keep the same tool-call protocol.';
+        t.history.push({ kind: 'user', content: reseed });
+        t.charsInChat = reseed.length;
+        t.turns = 0;
+        await sendMessage(t.pageId, reseed, t);
+        continue;
+      }
+
+      const rawResponse = await waitForResponse(t, CFG.responseTimeoutMs, CFG.stableDelayMs);
+      if (t.stopped) { setStatus(t, 'stopped', 'stopped by user'); return; }
+
+      if (!rawResponse || rawResponse.trim().length === 0) {
+        await sendMessage(t.pageId, 'Please continue. If you are waiting for input, proceed with your best judgement.', t);
+        continue;
+      }
+
+      /* post-response limit check (hard limits surfaced by the site) */
+      let bodyTail = '';
+      try { bodyTail = await evalJs(t.pageId, EXPR.bodyTail); } catch (e) { /* ignore */ }
+      const limit = detectLimit(bodyTail);
+      if (limit) {
+        log('task', t.id, 'limit signal', limit.kind, limit.matched);
+        t.warnings.push('limit signal: ' + limit.kind + ' (' + limit.matched + ')');
+        if (limit.kind === 'captcha') {
+          t.error = 'captcha/verification detected on chat.deepseek.com - manual intervention required (open the browser window and solve it).';
+          setStatus(t, 'error', t.error);
+          return;
+        }
+        if (limit.kind === 'length') {
+          if (t.migrations < CFG.maxMigrations) {
+            t.migrations++;
+            setStatus(t, 'migrating', 'length limit hit - compacting and migrating');
+            const digest = buildDigest(t.history.concat([{ kind: 'assistant', content: rawResponse }]), 4, 500);
+            await ensurePageFor(t, true);
+            await newChat(t.pageId);
+            const reseed = '[CONTEXT DIGEST]\n' + digest.digestText + '\n\n[RECENT EXCHANGES]\n' + digest.recentText +
+              '\n\n[SYSTEM] The chat hit the length limit and was migrated. Continue the ORIGINAL TASK (' + String(t.task).slice(0, 200) + '). Keep the tool-call protocol.';
+            t.history.push({ kind: 'user', content: reseed });
+            t.charsInChat = reseed.length;
+            t.turns = 0;
+            await sendMessage(t.pageId, reseed, t);
+            continue;
+          }
+          t.error = 'length limit hit and max migrations reached - task cannot continue in one session.';
+          setStatus(t, 'error', t.error);
+          return;
+        }
+        if (limit.kind === 'quota') {
+          const handled = await handleQuota(t, rawResponse);
+          if (!handled) return; /* task ended (error/stopped) */
+          continue;
+        }
+      }
+
+      t.history.push({ kind: 'assistant', content: rawResponse });
+      t.turns++;
+      t.charsInChat += rawResponse.length;
+      t.step = iter;
+
+      const parsed = parseResponse(rawResponse);
+
+      if (parsed.type === 'tool_call') {
+        if (t.kind === 'ask') {
+          const correction = '[SYSTEM] Tools are disabled for this question. Please answer directly in plain text with no code-block markup.';
+          t.history.push({ kind: 'tool-result', tool: 'SYSTEM', content: correction });
+          await sendMessage(t.pageId, correction, t);
+          continue;
+        }
+        emitEvent('log', { taskId: t.id, level: 'tool', tool: parsed.name, args: parsed.args, step: iter });
+        setStatus(t, 'running', 'tool: ' + parsed.name);
+        let result, isError = false;
+        try {
+          result = await executeTool(parsed.name, parsed.args, t.workingDir, t.policy);
+          log('task', t.id, 'tool ok', parsed.name);
+        } catch (err) {
+          result = 'Error: ' + err.message;
+          isError = true;
+          log('task', t.id, 'tool error', parsed.name, err.message);
+        }
+        const feedback = '[TOOL RESULT: ' + parsed.name + ' | ' + (isError ? 'ERROR' : 'SUCCESS') + ']\n' + String(result) + '\n[END TOOL RESULT]\n\nContinue with the next step, or provide your final response if the task is complete.';
+        t.history.push({ kind: 'tool-result', tool: parsed.name, content: feedback });
+        t.charsInChat += feedback.length;
+        await sendMessage(t.pageId, feedback, t);
+        continue;
+      }
+
+      if (parsed.type === 'error') {
+        const recovery = '[TOOL RESULT: SYSTEM | ERROR]\nParse error: ' + parsed.message + '\n\nPlease respond with ONLY a valid ```tool_call code block (valid JSON with "name" and "args") or your final prose answer.\n[END TOOL RESULT]';
+        t.history.push({ kind: 'tool-result', tool: 'SYSTEM', content: recovery });
+        await sendMessage(t.pageId, recovery, t);
+        continue;
+      }
+
+      /* final */
+      finalText = parsed.content;
+      t.result = finalText;
+      t.finishedAt = Date.now();
+      setStatus(t, 'done', 'completed in ' + t.turns + ' turns, ' + t.migrations + ' migrations');
+      return;
+    }
+
+    if (finalText === null) {
+      t.error = 'reached max iterations (' + maxIter + ') without a final answer';
+      t.result = 'Task may be incomplete: ' + t.error;
+      t.finishedAt = Date.now();
+      setStatus(t, 'done', t.error);
+    }
+  } finally {
+    try { if (t.pageId) await closePage(t.pageId); } catch (e) { /* ignore */ }
+    t.pageId = null;
+    schedule();
+  }
+}
+
+async function ensurePageFor(t, forceNew) {
+  if (!forceNew && t.pageId && pageInfo(t.pageId)) return;
+  if (t.pageId) { try { await closePage(t.pageId); } catch (e) { /* ignore */ } }
+  await ensureBrowser({ name: t.profile, headless: t.headless });
+  /* visible sessions: when not headless, each task gets its own independent window */
+  const vis = !effectiveHeadless({ name: t.profile, headless: t.headless });
+  t.pageId = await newPage({ newWindow: vis });
+  try { await navigate(t.pageId, DS_URL); } catch (e) { log('navigate failed', e.message); }
+}
+
+async function handleQuota(t, lastRaw) {
+  /* account-level daily/frequency cap: rotate to another profile, else backoff-retry */
+  const profiles = CFG.profiles && CFG.profiles.length ? CFG.profiles : [{ name: 'default', headless: CFG.headless }];
+  const idx = profiles.findIndex((p) => p.name === t.profile);
+  const next = profiles[(idx + 1) % profiles.length];
+  if (profiles.length > 1 && next.name !== t.profile) {
+    t.profileRotations = (t.profileRotations || 0) + 1;
+    setStatus(t, 'rotating', 'quota hit - rotating to profile "' + next.name + '"');
+    await closeBrowser();
+    t.profile = next.name;
+    t.headless = effectiveHeadless(next);
+    t.migrations++;
+    await ensurePageFor(t, true);
+    const login = await ensureLoggedIn(t.pageId);
+    if (login.needsLogin) {
+      t.error = 'profile "' + next.name + '" requires login - run dsweb_login profile=' + next.name;
+      setStatus(t, 'error', t.error);
+      return false;
+    }
+    await newChat(t.pageId);
+    const digest = buildDigest(t.history.concat([{ kind: 'assistant', content: lastRaw }]), 4, 500);
+    const reseed = '[CONTEXT DIGEST]\n' + digest.digestText + '\n\n[RECENT EXCHANGES]\n' + digest.recentText +
+      '\n\n[SYSTEM] Quota limit hit; session migrated to another account/profile. Continue the ORIGINAL TASK (' + String(t.task).slice(0, 200) + '). Keep the tool-call protocol.';
+    t.history.push({ kind: 'user', content: reseed });
+    t.charsInChat = reseed.length;
+    t.turns = 0;
+    await sendMessage(t.pageId, reseed, t);
+    return true;
+  }
+  /* single profile: backoff retry */
+  const retries = t.quotaRetries || 0;
+  if (retries < CFG.maxQuotaBackoffRetries) {
+    t.quotaRetries = retries + 1;
+    setStatus(t, 'migrating', 'rate limited - backing off 60s (retry ' + t.quotaRetries + '/' + CFG.maxQuotaBackoffRetries + ')');
+    await sleep(60000);
+    await ensurePageFor(t, true);
+    await newChat(t.pageId);
+    const digest = buildDigest(t.history.concat([{ kind: 'assistant', content: lastRaw }]), 4, 500);
+    const reseed = '[CONTEXT DIGEST]\n' + digest.digestText + '\n\n[RECENT EXCHANGES]\n' + digest.recentText +
+      '\n\n[SYSTEM] Rate limit hit; continue the ORIGINAL TASK (' + String(t.task).slice(0, 200) + '). Keep the tool-call protocol.';
+    t.history.push({ kind: 'user', content: reseed });
+    t.charsInChat = reseed.length;
+    t.turns = 0;
+    await sendMessage(t.pageId, reseed, t);
+    return true;
+  }
+  t.error = 'daily quota exhausted on all profiles. The free web tier caps message counts; add more profiles (multi-account rotation) or wait for reset.';
+  setStatus(t, 'error', t.error);
+  return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* standalone window (always-visible browser for the dashboard page)  */
+/* ------------------------------------------------------------------ */
+const dwindow = { proc: null, cdp: null, ws: null, launching: null };
+
+async function closeDashWindow() {
+  const proc = dwindow.proc;
+  dwindow.proc = null;
+  dwindow.cdp = null;
+  dwindow.ws = null;
+  dwindow.launching = null;
+  if (proc && proc.pid) {
+    try {
+      if (process.platform === 'win32') {
+        execSync('taskkill /pid ' + proc.pid + ' /T /F', { stdio: 'ignore', timeout: 10000 });
+      } else {
+        proc.kill('SIGKILL');
+      }
+    } catch (e) {
+      try { proc.kill(); } catch (e2) { /* ignore */ }
+    }
+  }
+  await sleep(500);
+}
+
+async function openWindowSafe(url) {
+  if (dwindow.launching) await dwindow.launching.catch(() => {});
+  /* reuse an already-open dashboard window instead of killing + relaunching */
+  const proc = dwindow.proc;
+  if (proc && proc.exitCode === null && !proc.killed) {
+    log('reusing standalone window', String(url));
+    return { ok: true, reused: true };
+  }
+  const launch = (async () => {
+    await closeDashWindow();
+    const chrome = findChrome();
+    if (!chrome) throw new Error('Chrome/Edge not found. Set DS_WEB_CHROME or install Chrome/Edge.');
+    const dir = path.join(CFG.baseDir, 'profiles', 'dashboard');
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* ignore */ }
+    for (const f of ['DevToolsActivePort', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      try {
+        const fp = path.join(dir, f);
+        if (fs.existsSync(fp)) fs.unlinkSync(fp);
+      } catch (e) { /* ignore */ }
+    }
+    const args = [
+      chrome,
+      '--user-data-dir=' + dir,
+      '--remote-debugging-port=0',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-background-networking',
+      '--disable-component-update',
+      '--disable-sync',
+      '--disable-extensions',
+      '--disable-features=Translate,OptimizationHints,msEdgeSidebarV2',
+      '--window-size=1200,900',
+      String(url),
+    ];
+    log('launching standalone window', String(url));
+    const proc = spawn(args[0], args.slice(1), { stdio: 'ignore' });
+    dwindow.proc = proc;
+    proc.on('error', (e) => { logErr('standalone spawn error', e.message); });
+    proc.on('exit', () => {
+      dwindow.proc = null;
+      dwindow.cdp = null;
+      dwindow.ws = null;
+      dwindow.launching = null;
+    });
+    const portFile = path.join(dir, 'DevToolsActivePort');
+    const content = await waitForFile(portFile, 25000);
+    const lines = content ? content.split(/\r?\n/).filter((x) => x.trim().length > 0) : [];
+    const port = parseInt(lines[0], 10);
+    if (!content || !port) throw new Error('standalone window did not expose DevTools port');
+    const wsPath = lines[1] || '/devtools/browser/' + crypto.randomUUID();
+    const ws = await wsConnect('ws://127.0.0.1:' + port + wsPath, 15000);
+    dwindow.cdp = new CdpClient(ws);
+    dwindow.ws = ws;
+  })();
+  dwindow.launching = launch;
+  try { await launch; } finally { dwindow.launching = null; }
+  return { ok: true };
+}
+
+/* RPC handlers                                                        */
+/* ------------------------------------------------------------------ */
+handlers.ping = async () => ({ pong: true, version: VERSION, ts: Date.now() });
+
+handlers.health = async () => ({
+  version: VERSION,
+  browser: { running: !!browser.proc, profile: browser.profile ? browser.profile.name : null, pages: browser.pages.size },
+  tasks: [...tasks.values()].map(taskSummary),
+  config: { headless: CFG.headless, maxConcurrent: CFG.maxConcurrent, maxTurnsPerChat: CFG.maxTurnsPerChat, compactThresholdChars: CFG.compactThresholdChars, profiles: CFG.profiles },
+});
+
+handlers.config = async (params) => {
+  if (params && params.config) {
+    const c = params.config;
+    if (c.headless !== undefined) CFG.headless = !!c.headless;
+    if (c.maxConcurrent !== undefined) CFG.maxConcurrent = Math.max(1, Math.min(10, parseInt(c.maxConcurrent, 10) || 1));
+    if (c.maxTurnsPerChat !== undefined) CFG.maxTurnsPerChat = Math.max(2, parseInt(c.maxTurnsPerChat, 10) || 30);
+    if (c.compactThresholdChars !== undefined) CFG.compactThresholdChars = Math.max(1000, parseInt(c.compactThresholdChars, 10) || 60000);
+    if (c.maxOutputLength !== undefined) CFG.maxOutputLength = parseInt(c.maxOutputLength, 10) || 8000;
+    if (c.responseTimeoutMs !== undefined) CFG.responseTimeoutMs = parseInt(c.responseTimeoutMs, 10) || 240000;
+    if (c.stableDelayMs !== undefined) CFG.stableDelayMs = parseInt(c.stableDelayMs, 10) || 2500;
+    if (c.sendDelayMs !== undefined) CFG.sendDelayMs = parseInt(c.sendDelayMs, 10) || 400;
+    if (c.maxIterations !== undefined) CFG.maxIterations = parseInt(c.maxIterations, 10) || 40;
+    if (c.maxMigrations !== undefined) CFG.maxMigrations = parseInt(c.maxMigrations, 10) || 24;
+    if (c.maxQuotaBackoffRetries !== undefined) CFG.maxQuotaBackoffRetries = parseInt(c.maxQuotaBackoffRetries, 10) || 3;
+    if (c.chromePath !== undefined) CFG.chromePath = String(c.chromePath || '');
+    if (Array.isArray(c.profiles) && c.profiles.length) {
+      CFG.profiles = c.profiles.map((p, i) => ({ name: String(p.name || 'profile' + (i + 1)), headless: p.headless !== undefined ? !!p.headless : CFG.headless }));
+    }
+  }
+  return { config: { headless: CFG.headless, maxConcurrent: CFG.maxConcurrent, maxTurnsPerChat: CFG.maxTurnsPerChat, compactThresholdChars: CFG.compactThresholdChars, maxOutputLength: CFG.maxOutputLength, responseTimeoutMs: CFG.responseTimeoutMs, stableDelayMs: CFG.stableDelayMs, sendDelayMs: CFG.sendDelayMs, maxIterations: CFG.maxIterations, maxMigrations: CFG.maxMigrations, maxQuotaBackoffRetries: CFG.maxQuotaBackoffRetries, chromePath: CFG.chromePath, profiles: CFG.profiles, baseDir: CFG.baseDir } };
+};
+
+const WRITE_TOOLS = ['write_file', 'append_to_file', 'replace_in_file', 'delete_file', 'move_file', 'copy_file', 'create_directory', 'write_files'];
+
+function makeTask(params) {
+  const task = params || {};
+  const id = 't' + (++taskSeq);
+  const denied = [];
+  if (task.allowShell === false) denied.push('run_command');
+  if (task.allowFileWrite === false) denied.push(...WRITE_TOOLS);
+  return {
+    id,
+    task: String(task.task || ''),
+    kind: task.kind === 'ask' ? 'ask' : 'run',
+    mode: ['quick', 'expert', 'vision'].includes(task.mode) ? task.mode : 'quick',
+    deepThink: !!task.deepThink,
+    search: !!task.search,
+    images: Array.isArray(task.images) ? task.images : [],
+    workingDir: task.workingDir || CFG.baseDir,
+    maxIterations: task.maxIterations ? parseInt(task.maxIterations, 10) : (task.kind === 'ask' ? 2 : CFG.maxIterations),
+    maxTurnsPerChat: task.maxTurnsPerChat ? parseInt(task.maxTurnsPerChat, 10) : CFG.maxTurnsPerChat,
+    compactThresholdChars: task.compactThresholdChars ? parseInt(task.compactThresholdChars, 10) : CFG.compactThresholdChars,
+    timeoutMs: task.timeoutMs ? parseInt(task.timeoutMs, 10) : null,
+    profile: task.profile || 'default',
+    headless: task.headless !== undefined ? !!task.headless : CFG.headless,
+    policy: { allowed: task.allowTools === false || task.kind === 'ask' ? [] : null, denied },
+    status: 'queued',
+    detail: 'queued',
+    step: 0,
+    turns: 0,
+    migrations: 0,
+    warnings: [],
+    startedAt: Date.now(),
+    finishedAt: null,
+    result: null,
+    error: null,
+    stopped: false,
+  };
+}
+
+handlers.start = async (params) => {
+  const task = params || {};
+  if (!task.task || !String(task.task).trim()) throw new Error('task text is required');
+  const t = makeTask(task);
+  tasks.set(t.id, t);
+  emitEvent('progress', { taskId: t.id, status: 'queued', detail: 'queued', step: 0 });
+  schedule();
+  return { taskId: t.id, status: t.status };
+};
+
+handlers.status = async () => {
+  const list = [...tasks.values()].map(taskSummary).sort((a, b) => a.startedAt - b.startedAt);
+  return {
+    version: VERSION,
+    browser: { running: !!browser.proc, profile: browser.profile ? browser.profile.name : null, pages: browser.pages.size, headless: browser.profile ? effectiveHeadless(browser.profile) : CFG.headless },
+    tasks: list,
+    config: { maxConcurrent: CFG.maxConcurrent, profiles: CFG.profiles },
+  };
+};
+
+handlers.result = async (params) => {
+  const t = tasks.get(params.taskId);
+  if (!t) throw new Error('unknown task: ' + params.taskId);
+  return {
+    taskId: t.id,
+    status: t.status,
+    detail: t.detail,
+    result: t.result,
+    error: t.error,
+    turns: t.turns,
+    migrations: t.migrations,
+    profileRotations: t.profileRotations || 0,
+    warnings: t.warnings,
+    step: t.step,
+  };
+};
+
+handlers.wait = async (params) => {
+  const t = tasks.get(params.taskId);
+  if (!t) throw new Error('unknown task: ' + params.taskId);
+  const timeoutMs = Math.max(1000, parseInt(params.timeoutMs, 10) || 300000);
+  const terminal = ['done', 'error', 'stopped', 'timeout'];
+  const start = Date.now();
+  for (;;) {
+    if (terminal.includes(t.status)) return await handlers.result({ taskId: t.id });
+    if (Date.now() - start > timeoutMs) {
+      return Object.assign(await handlers.result({ taskId: t.id }), { waitTimedOut: true });
+    }
+    if (t.stopped) return await handlers.result({ taskId: t.id });
+    await sleep(1000);
+  }
+};
+
+handlers.openWindow = async (params) => {
+  const url = params && params.url;
+  if (!url) return { ok: false, message: 'url required' };
+  if (params && params.profile === 'task') {
+    /* open a new window inside the task browser (shares login cookies) */
+    await ensureBrowser(browser.profile || CFG.profiles[0]);
+    const t = await browser.cdp.call('Target.createTarget', { url: String(url), newWindow: true });
+    return { ok: true, window: 'task', targetId: t && t.targetId };
+  }
+  return openWindowSafe(String(url));
+};
+
+handlers.stop = async (params) => {
+  const t = tasks.get(params.taskId);
+  if (!t) return { stopped: false, message: 'unknown task' };
+  t.stopped = true;
+  setStatus(t, 'stopped', 'stop requested');
+  return { stopped: true, taskId: t.id };
+};
+
+handlers.login = async (params) => {
+  const profileName = (params && params.profile) || 'default';
+  const timeoutMs = (params && params.timeoutMs) || 300000;
+  /* 单页常驻：登录与发消息用同一页面（对照 deepseek-browser-agent 的 _ensureLoggedIn：
+   * 打开页面 → 检测未登录 → 用户在同一窗口手动登录 → 自动轮询直到登录成功）。 */
+  const pageId = await ensurePage({ name: profileName, headless: false });
+  try { await navigate(pageId, DS_URL); } catch (e) { log('login navigate failed', e.message); }
+  const start = Date.now();
+  for (;;) {
+    const st = await ensureLoggedIn(pageId);
+    if (!st.needsLogin && st.hasChatInput) {
+      return { ok: true, loggedIn: true, url: st.url, message: 'logged in on profile "' + profileName + '"' };
+    }
+    if (Date.now() - start > timeoutMs) {
+      return { ok: false, loggedIn: false, url: st.url, message: 'still not logged in after ' + Math.round(timeoutMs / 1000) + 's - complete login in the opened browser window' };
+    }
+    emitEvent('login-progress', { profile: profileName, url: st.url, needsLogin: st.needsLogin, elapsedMs: Date.now() - start });
+    await sleep(2000);
+  }
+};
+
+handlers.inspect = async (params) => {
+  const pageId = params && params.taskId ? (tasks.get(params.taskId) || {}).pageId : null;
+  const pid = pageId || ([...browser.pages.keys()][0]);
+  if (!pid) throw new Error('no page available - start a task or login first');
+  const info = await evalJs(pid, EXPR.domDebug);
+  const buttons = await evalJs(pid, EXPR.buttons);
+  const login = await evalJs(pid, EXPR.loginState);
+  const badge = await evalJs(pid, EXPR.modelBadge);
+  return { dom: info, buttons: buttons.slice(0, 60), login, modelBadge: badge };
+};
+
+/* ------------------------------------------------------------------ */
+/* streaming ask (LLM adapter feed): send one question, stream deltas  */
+/* ------------------------------------------------------------------ */
+const streamSeqs = { n: 0 };
+const streamStates = new Map(); // streamId -> { pageId, stopped }
+
+/* 单页常驻（对照 deepseek-browser-agent）：主 agent 用 thePage（连续对话、网页版历史保持）。
+ * 子 agent 并发：当有请求正在处理时，新请求用独立页面（多窗口并行，会话隔离）。 */
+let thePage = null;
+const subPages = []; // 子 agent 独立页面池（用完归还复用）
+let streamActive = 0;
+
+async function ensurePage(profile) {
+  if (thePage && pageInfo(thePage)) {
+    /* 复用：确保页面就绪（可能被导航/加载中） */
+    try { await waitReady(thePage, 15000); } catch (e) { /* ignore */ }
+    return thePage;
+  }
+  await ensureBrowser(profile || { name: 'default', headless: false });
+  thePage = await newPage();
+  try { await navigate(thePage, DS_URL); } catch (e) { log('ensurePage navigate warn', e.message); }
+  /* 等待页面完全加载（chat 界面或登录页），避免首次请求误判未登录 */
+  await sleep(3000);
+  try { await waitReady(thePage, 30000); } catch (e) { /* ignore */ }
+  await sleep(1500);
+  log('single page ready: ' + thePage);
+  return thePage;
+}
+
+/* 在指定页面回放校准点击（打开模型面板 → 点击目标模型选项）。
+ * 必须在 newChat（新会话）之后调用——DeepSeek 模型选择是会话级的，新会话会重置为默认。 */
+/* 模型联动：校准数据回放（14:44 确认正常的版本）。
+ * 打开模型面板 → 回放用户录制的点击序列。不依赖"直接点击"（UI 变化时不可靠）。 */
+async function applyCalibration(pageId, key) {
+  if (!key) return 0;
+  let store = {};
+  try { store = JSON.parse(fs.readFileSync(CALIB_FILE(), 'utf8')); } catch (e) { return 0; }
+  const clicks = store[key];
+  if (!clicks || !clicks.length) return 0;
+  /* 校准数据就是用户录的完整操作（如点击"专家模式"），直接回放，不额外打开面板 */
+  await sleep(400);
+  let applied = 0;
+  for (const step of clicks) {
+    const found = await evalJs(pageId, `(() => {
+      const text = ${JSON.stringify(step.text || '')};
+      const aria = ${JSON.stringify(step.aria || '')};
+      const cls = ${JSON.stringify(step.cls || '')};
+      const all = Array.from(document.querySelectorAll('*')).filter((e) => e.childElementCount < 3 && (e.textContent || '').length < 150);
+      const cands = [];
+      const tKey = text.slice(0, 25);
+      if (tKey) cands.push(...all.filter((e) => {
+        const t = (e.textContent || '').trim().replace(/\\s+/g, ' ');
+        return t.indexOf(tKey) >= 0 && t.length <= 60;
+      }));
+      if (aria) cands.push(...all.filter((e) => (e.getAttribute('aria-label') || '') === aria));
+      if (cls) { const c = cls.split(' ')[0]; if (c) cands.push(...Array.from(document.querySelectorAll('.' + CSS.escape(c)))); }
+      const rank = (el) => {
+        const r = el.getAttribute('role') || '';
+        const tag = el.tagName.toLowerCase();
+        if (r === 'radio' || r === 'option' || r === 'menuitem' || r === 'button') return 3;
+        if (tag === 'label' || tag === 'li' || tag === 'a') return 2;
+        return 1;
+      };
+      cands.sort((a, b) => rank(b) - rank(a));
+      for (const el of cands) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { el.click(); return true; } }
+      return false;
+    })()`);
+    if (found) applied++;
+    await sleep(700);
+  }
+  return applied;
+}
+
+/* 从网页版回复中解析 tool_call（提示工程输出的 JSON）。
+ * DeepSeek 网页版没有原生 function calling——它只输出参数 JSON（无 name 字段），
+ * 所以除了识别带 name/function 的格式，还要按工具 schema（parameters.properties 的 key）
+ * 推断工具名。 */
+function parseToolCalls(text, tools) {
+  const calls = [];
+  const t = String(text || '');
+  if (!t) return calls;
+  /* 宽容 JSON 解析（参考 deepseek-browser-agent parser.js）：
+   * 1) 网页版渲染 markdown 把 \\ 显示为 \（Windows 路径 \U \h 非法转义）→ 修复单反斜杠
+   * 2) attemptJsonFix：修尾逗号 + 补未加引号的 key */
+  function jsonParseTolerant(s) {
+    try { return JSON.parse(s); } catch (e) {
+      const fixed1 = String(s).replace(/\\(?![\\"/bfnrtu])/g, '\\\\');
+      try { return JSON.parse(fixed1); } catch (e2) {
+        const fixed2 = fixed1.replace(/,\s*([}\]])/g, '$1').replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":');
+        try { return JSON.parse(fixed2); } catch (e3) { return null; }
+      }
+    }
+  }
+  /* 参数别名：模型可能用 path/file/text/cmd 而非 schema 参数名（file_path/content/command） */
+  const PARAM_ALIAS = {
+    path: 'file_path', file: 'file_path', filepath: 'file_path', filename: 'file_path',
+    cmd: 'command', code: 'command', script: 'command',
+    text: 'content', data: 'content', body: 'content',
+  };
+  /* 按参数 schema 推断工具名：{"file_path": "...", "content": "..."} → write_file */
+  function matchToolByParams(j) {
+    if (!tools || !Array.isArray(tools) || !j || typeof j !== 'object') return null;
+    const keys = Object.keys(j).filter((k) => k !== 'name' && k !== 'arguments' && k !== 'function' && k !== 'tool');
+    if (!keys.length) return null;
+    let best = null, bestScore = 0;
+    for (const t of tools) {
+      const fn = t.function || t;
+      if (!fn || !fn.name) continue;
+      const props = (fn.parameters && fn.parameters.properties) || {};
+      const propKeys = Object.keys(props);
+      if (!propKeys.length) continue;
+      let score = 0;
+      let hit = 0;
+      for (const k of keys) {
+        if (propKeys.includes(k)) { score += 2; hit++; }                    /* 原样命中 */
+        else if (propKeys.includes(PARAM_ALIAS[k] || '')) { score += 2; hit++; }  /* 别名命中 */
+        else score -= 1.5; /* 未知 key 惩罚，防误判 */
+      }
+      /* 命中率加成：参数更"专一"的工具优先（file_path 单参数 → read_image/read
+       * 而非 edit/write——edit 需 old_string+new_string，write 需 content） */
+      score += (hit / propKeys.length) * 2;
+      if (hit > 0 && score > bestScore) { bestScore = score; best = fn.name; }
+    }
+    /* 至少 1 个参数命中才算工具调用（避免把闲聊里的 JSON 误判为工具） */
+    return bestScore >= 2 ? best : null;
+  }
+  const pushCall = (raw) => {
+    /* 展开 tool_call 嵌套包装：{"tool_call": {"name": ..., "arguments": {...}}} */
+    let j = raw;
+    if (j && j.tool_call && typeof j.tool_call === 'object') j = j.tool_call;
+    if (!j || typeof j !== 'object') return calls.length > 0;
+    /* name/args 容器宽容（参考实现）：name||tool||function、args||arguments||parameters||input */
+    const name = String(j.name || j.tool || (j.function && j.function.name) || '');
+    const rawArgs = j.arguments !== undefined ? j.arguments
+      : (j.args !== undefined ? j.args
+        : (j.parameters !== undefined ? j.parameters
+          : (j.input !== undefined ? j.input : undefined)));
+    /* 参数对象：容器可能是字符串（JSON）或对象；纯参数形态（无 name/容器）用 j 本身 */
+    let argsObj = null;
+    if (typeof rawArgs === 'string') {
+      try { argsObj = jsonParseTolerant(rawArgs); } catch (e) { argsObj = null; }
+    } else if (rawArgs && typeof rawArgs === 'object') {
+      argsObj = rawArgs;
+    } else if (!name) {
+      argsObj = j;
+    }
+    /* 工具名优先级：
+     * 1) 模型给的 name 在工具列表里 → 直接用（可信）
+     * 2) 否则用 schema 参数匹配推断（模型可能编造 name，如 write vs write_file；
+     *    或纯参数形态无 name）
+     * 3) 兜底：模型给的 name */
+    const nameKnown = name && Array.isArray(tools) && tools.some((t) => {
+      const fn = t.function || t;
+      return fn && fn.name === name;
+    });
+    const finalName = nameKnown ? name : (matchToolByParams(argsObj) || name);
+    if (finalName) {
+      calls.push({
+        name: finalName,
+        arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(argsObj || {}),
+      });
+    }
+    return calls.length > 0;
+  };
+  const patterns = [
+    { re: /tool_call\s*\n?\s*(\{[\s\S]*\})/gi, g: 1 },
+    { re: /```(?:tool_call|json)\s*\n([\s\S]*?)```/gi, g: 1 },
+    /* 无语言标注代码块（模型可能只输出 ``` 不写 json） */
+    { re: /```\s*\n([\s\S]*?)```/gi, g: 1 },
+    /* 贪婪匹配到最后一个 }：arguments 是嵌套对象时非贪婪会在内层 } 截断 */
+    { re: /<tool_call>\s*(\{[\s\S]*\})(?:\s*<\/tool_call>|\s*$)/gi, g: 1 },
+  ];
+  outer:
+  for (const { re, g } of patterns) {
+    let m;
+    while ((m = re.exec(t)) !== null) {
+      try {
+        const j = jsonParseTolerant(String(m[g] || m[0]).trim());
+        if (j && typeof j === 'object' && !Array.isArray(j)) {
+          if (pushCall(j)) break outer;
+        }
+      } catch (e) { /* keep scanning */ }
+    }
+  }
+  if (!calls.length) {
+    /* scavenger: 平衡括号提取所有完整 JSON 对象（正确处理嵌套——正则非贪婪会在内层 } 截断），
+     * 从后往前扫描——有 name 的直接用，只有参数的按 schema 推断工具名 */
+    const objs = extractBalancedObjects(t);
+    for (let i = objs.length - 1; i >= 0; i--) {
+      try {
+        const j = jsonParseTolerant(objs[i]);
+        if (j && typeof j === 'object' && !Array.isArray(j)) {
+          if (pushCall(j)) break;
+        }
+      } catch (e) { /* ignore */ }
+    }
+  }
+  if (!calls.length) {
+    /* 兜底：Python 风格函数调用（参考实现 Strategy 6）：```write_file(path="a.txt", content="hi")``` */
+    const funcMatch = t.match(/```\w*\s*([\w_]+)\(([^)]*)\)\s*```/);
+    if (funcMatch) {
+      const fname = funcMatch[1];
+      const argsRaw = funcMatch[2];
+      const args = {};
+      const argRe = /(\w+)\s*=\s*(?:"([^"]*?)"|'([^']*?)'|(\d+(?:\.\d+)?)|(\btrue\b|\bfalse\b))/g;
+      let m;
+      while ((m = argRe.exec(argsRaw)) !== null) {
+        const key = m[1];
+        if (m[2] !== undefined) args[key] = m[2];
+        else if (m[3] !== undefined) args[key] = m[3];
+        else if (m[4] !== undefined) args[key] = parseFloat(m[4]);
+        else if (m[5] !== undefined) args[key] = m[5] === 'true';
+      }
+      if (fname && Object.keys(args).length) calls.push({ name: fname, arguments: JSON.stringify(args) });
+    }
+  }
+  return calls;
+}
+
+/* 提取文本中所有平衡的 JSON 对象（{...}），正确处理字符串内的 { } 与转义 */
+function extractBalancedObjects(t) {
+  const out = [];
+  const s = String(t || '');
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '{') continue;
+    let depth = 0, inStr = false, esc = false;
+    for (let j = i; j < s.length; j++) {
+      const c = s[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === '\\') esc = true;
+        else if (c === '"') inStr = false;
+      } else {
+        if (c === '"') inStr = true;
+        else if (c === '{') depth++;
+        else if (c === '}') {
+          depth--;
+          if (depth === 0) { out.push(s.slice(i, j + 1)); break; }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/* 检测文本"看起来像工具调用但没被解析"（参考 deepseek-browser-agent agent.js 安全网）：
+ * 文本含 tool_call 标记 / "name"/"tool" 键 / 代码块函数调用 / 已知工具名 → 应触发解析重试 */
+function looksLikeToolCall(text) {
+  const t = String(text || '').slice(0, 1500);
+  if (/tool_call|<tool_call>/i.test(t)) return true;
+  if (/["'](?:name|tool|function)["']\s*:\s*["'][\w_]+["']/.test(t)) return true;
+  if (/```\w*\s*[\w_]+\s*\(/.test(t)) return true;
+  if (/(?:write_file|read_file|run_command|list_directory|pwsh|subagent|web_search)\b/.test(t)) return true;
+  return false;
+}
+
+handlers.streamAsk = async (params) => {
+  const question = params && params.question;
+  if (!question || !String(question).trim()) throw new Error('question required');
+  const profile = { name: (params && params.profile) || 'default', headless: params && params.headless !== undefined ? !!params.headless : false };
+  const streamId = 's' + (++streamSeqs.n);
+  /* 页面分配：无并发请求 → thePage（主 agent 连续对话）；有并发 → 独立页面（子 agent 并行） */
+  streamActive++;
+  const isConcurrent = streamActive > 1;
+  let pageId = null;
+  try {
+    if (!isConcurrent) {
+      pageId = await ensurePage(profile);
+    } else {
+      pageId = subPages.pop() || await newPage();
+      try { await ensureLoggedIn(pageId); } catch (e) { /* 子页面登录态与主共享 */ }
+    }
+  } catch (e) {
+    streamActive--;
+    emitEvent('stream-end', { streamId, ok: false, error: String(e.message || e) });
+    return { streamId };
+  }
+  const st = { pageId, stopped: false };
+  streamStates.set(streamId, st);
+  (async () => {
+    try {
+      let login = await ensureLoggedIn(pageId);
+      /* 页面可能还在加载（重建后）→ 等待重试，避免误判未登录 */
+      for (let i = 0; i < 3 && (login.needsLogin || !login.hasChatInput); i++) {
+        await sleep(2000);
+        login = await ensureLoggedIn(pageId);
+      }
+      if (login.needsLogin || !login.hasChatInput) {
+        emitEvent('stream-end', { streamId, ok: false, error: 'login required: 页面已关闭或未登录。请打开 http://127.0.0.1:5688/login 重新登录（建议勾选保持登录），登录后页面会保持常驻。' });
+        return;
+      }
+      /* 模型切换由校准回放（applyCalibration）负责——不调用 applyConfig
+       * （它会对 expert 模式点击两次"深度思考"，与校准冲突产生多余操作） */
+      /* 组装问题：工具提示词（让网页版知道可用工具）+ 用户消息 */
+      let payload = String(question);
+      const toolsText = params && params.toolsText;
+      if (toolsText && String(toolsText).trim()) payload = String(toolsText).trim() + '\n\n' + payload;
+      /* 会话管理（绕限）：
+       * reset=true  → 强制新会话（清历史）后应用校准
+       * reset='auto' → 连续对话（网页版历史保持）；网页版会话超限（消息数 > 25）时
+       *                 自动迁移：提取当前会话摘要 → newChat → 注入摘要 → 继续
+       * reset 其他/无 → 连续（不 newChat，网页版记住历史） */
+      let migrated = false;
+      if (params && params.reset === true) {
+        await newChat(pageId);
+        migrated = true;
+      } else if (params && params.reset === 'auto') {
+        let count = 0;
+        try { count = await evalJs(pageId, EXPR.messageCount); } catch (e) { /* ignore */ }
+        /* 对话长度限制（可配置 maxTurnsPerChat，默认 50）——超限迁移+摘要 */
+        const limit = (params && params.maxTurnsPerChat) || 50;
+        if (count > limit) {
+          /* 超限迁移：提取网页版会话历史 → 压缩摘要 → 新会话注入 */
+          let digest = '';
+          try {
+            const texts = await evalJs(pageId, `(() => {
+              const out = [];
+              const els = document.querySelectorAll('.ds-message, [class*="message"], .ds-markdown');
+              for (const el of els) {
+                const t = (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 150);
+                if (t && t.length > 5) out.push(t);
+              }
+              return out;
+            })()`);
+            digest = (texts || []).slice(-15).join('\n');
+          } catch (e) { /* ignore */ }
+          await newChat(pageId);
+          migrated = true;
+          if (digest) payload = '【之前的对话摘要，请基于此继续】\n' + digest + '\n\n' + payload;
+        }
+      }
+      /* 模型联动：每次请求都应用校准（连续对话中也要切到目标模型）。
+       * 幂等：若已是目标模型，点击无变化。迁移（新会话）后需等待页面就绪。 */
+      if (params && params.calibKey) {
+        if (migrated) {
+          try { await waitReady(pageId, 15000); } catch (e) { /* ignore */ }
+          await sleep(1500);
+        }
+        try { await applyCalibration(pageId, params.calibKey); } catch (e) { log('applyCalibration warn', e.message); }
+      }
+      await sendMessage(pageId, payload, {});
+      const timeoutMs = (params && params.timeoutMs) || 240000;
+      /* 参考 deepseek-browser-agent agent.js 的容错循环：
+       * 解析失败/像工具调用但没解析 → 发纠正消息重试（最多 2 次），而非直接把文本返回 */
+      const RETRY_PROMPT = '你的上一条回复看起来包含工具调用，但格式无法解析。请重新输出：整个回复必须 ONLY 一个 ```tool_call 代码块（含 "name" 和 "args" 两个键），前后不要有任何文字、解释或标点。';
+      let finalText = '';
+      let toolCalls = [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+          log('streamAsk 安全网: 像工具调用但解析失败，发纠正消息重试 ' + attempt + '/2');
+          await sendMessage(pageId, RETRY_PROMPT, {});
+        }
+        const start = Date.now();
+        /* 发送前旧文本（用于检测新回复出现） */
+        const beforeText = await evalJs(pageId, EXPR.extractLast).catch(() => '');
+        let lastText = beforeText || '';
+        let lastChange = Date.now();
+        let genSeen = false; /* 是否见过生成中（文本相同的新回复靠 generating 完成判定） */
+        while (Date.now() - start < timeoutMs) {
+          if (st.stopped) throw new Error('stopped');
+          let text = '';
+          try { text = await evalJs(pageId, EXPR.extractLast); } catch (e) { /* keep polling */ }
+          let gen = true;
+          try { gen = await evalJs(pageId, EXPR.generating); } catch (e) { /* assume generating */ }
+          if (gen) genSeen = true;
+          if (text && text !== lastText) {
+            lastText = text;
+            lastChange = Date.now();
+          }
+          /* 完成：非生成中 + 文本已出现 + （文本变化过或生成开始过）+ 稳定 800ms；
+           * 5 秒未变兜底防卡 */
+          if (lastText.length > 10 && !gen && (lastChange !== start || genSeen) && Date.now() - lastChange >= 800) break;
+          if (Date.now() - lastChange >= 5000) break;
+          await sleep(350);
+        }
+        finalText = cleanText(lastText);
+        toolCalls = parseToolCalls(finalText, params.tools);
+        /* 解析成功 或 文本不像工具调用（正常回答）→ 停止重试 */
+        if (toolCalls.length || !looksLikeToolCall(finalText)) break;
+      }
+      /* 诊断日志：工具调用解析失败时打印实际输出与工具列表，方便定位 */
+      if (toolCalls.length) {
+        log('streamAsk toolCalls: ' + JSON.stringify(toolCalls).slice(0, 400));
+      } else {
+        const names = (params.tools || []).map((t) => ((t.function || t).name || '?')).join(',');
+        log('streamAsk NO-toolCalls | 输出[:1500]: ' + String(finalText).slice(0, 1500).replace(/\n/g, '\\n') + ' | tools: ' + names.slice(0, 400));
+      }
+      if (toolCalls.length) emitEvent('stream-end', { streamId, ok: true, result: finalText, toolCalls });
+      else emitEvent('stream-end', { streamId, ok: true, result: finalText });
+    } catch (e) {
+      emitEvent('stream-end', { streamId, ok: false, error: e.message });
+    } finally {
+      streamStates.delete(streamId);
+      streamActive--;
+      /* 子 agent 独立页面归还池（不关闭，复用）；主 agent 页面常驻 */
+      if (isConcurrent && pageId && pageInfo(pageId)) {
+        try { await newChat(pageId); } catch (e) { /* ignore */ }
+        subPages.push(pageId);
+      }
+    }
+  })();
+  return { streamId };
+};
+
+handlers.streamStop = async (params) => {
+  const st = streamStates.get(params && params.streamId);
+  if (st) st.stopped = true;
+  return { stopped: !!st };
+};
+
+/* ------------------------------------------------------------------ */
+/* calibration: record user's manual model-switch, then replay it      */
+/* ------------------------------------------------------------------ */
+const CALIB_FILE = () => path.join(CFG.baseDir, 'calibration.json');
+
+handlers.calibrateList = async () => {
+  try {
+    const raw = fs.readFileSync(CALIB_FILE(), 'utf8');
+    return JSON.parse(raw);
+  } catch (e) { return {}; }
+};
+
+handlers.calibrateRecord = async (params) => {
+  const profile = { name: (params && params.profile) || 'default', headless: false };
+  await ensureBrowser(profile);
+  const pageId = await newPage();
+  try { await navigate(pageId, DS_URL); } catch (e) { /* ignore */ }
+  await waitReady(pageId, 30000);
+  await evalJs(pageId, `(() => {
+    if (!window.__calibRec) {
+      window.__calibRec = [];
+      document.addEventListener('click', (e) => {
+        let el = document.elementFromPoint(e.clientX, e.clientY) || e.target;
+        if (el && el.nodeType !== 1) el = el.parentElement;
+        if (!el || !el.tagName) return;
+        let best = el;
+        let bt = (el.textContent || '').trim().replace(/\\s+/g, ' ');
+        let walk = el.parentElement;
+        while (walk && walk !== document.body && walk !== document.documentElement) {
+          const t = (walk.textContent || '').trim().replace(/\\s+/g, ' ');
+          if (t && t.length >= 2 && t.length <= 40) { best = walk; bt = t; break; }
+          walk = walk.parentElement;
+        }
+        window.__calibRec.push({
+          tag: best.tagName.toLowerCase(),
+          cls: String(best.className || '').slice(0, 150),
+          text: bt.slice(0, 80),
+          aria: best.getAttribute('aria-label') || '',
+          role: best.getAttribute('role') || '',
+        });
+      }, true);
+    }
+    return window.__calibRec.length;
+  })()`);
+  /* 非阻塞：立即返回，录制在后台继续，用户操作完成后调 calibrateCollect */
+  return { ok: true, pageId, message: 'recording started — 请在窗口内手动切换模型，完成后调用 calibrateCollect' };
+};
+
+handlers.calibrateCollect = async (params) => {
+  const pageId = params && params.pageId;
+  if (!pageId || !pageInfo(pageId)) {
+    return { ok: false, message: '校准窗口已关闭（可能是浏览器重建或窗口被手动关闭）。请重新点"开始校准"。', code: 'page-gone' };
+  }
+  const rec = await evalJs(pageId, `(() => window.__calibRec || [])()`).catch(() => []);
+  return { ok: true, clicks: rec };
+};
+
+handlers.calibrateClose = async (params) => {
+  const pageId = params && params.pageId;
+  if (pageId && pageInfo(pageId)) { try { await closePage(pageId); } catch (e) { /* ignore */ } }
+  return { ok: true };
+};
+
+handlers.calibrateSave = async (params) => {
+  const clicks = params && params.clicks;
+  if (!Array.isArray(clicks)) throw new Error('clicks array required');
+  const key = (params && params.key) || 'default';
+  let store = {};
+  try { store = JSON.parse(fs.readFileSync(CALIB_FILE(), 'utf8')); } catch (e) { store = {}; }
+  store[key] = clicks;
+  fs.writeFileSync(CALIB_FILE(), JSON.stringify(store, null, 2));
+  return { ok: true, key, clicks: clicks.length };
+};
+
+handlers.calibrateApply = async (params) => {
+  const key = (params && params.key) || 'default';
+  let store = {};
+  try { store = JSON.parse(fs.readFileSync(CALIB_FILE(), 'utf8')); } catch (e) { /* none */ }
+  const clicks = store[key];
+  if (!clicks || !clicks.length) return { ok: false, message: 'no calibration for ' + key };
+  /* 用实际使用页面（thePage）回放——模型切换必须作用在真实页面上才生效 */
+  const pageId = await ensurePage({ name: 'default', headless: false });
+  const login = await ensureLoggedIn(pageId);
+  if (login.needsLogin || !login.hasChatInput) return { ok: false, message: 'login required' };
+  /* 打开模型选择器（点当前模型按钮），确保面板可见 */
+  try {
+    await evalJs(pageId, `(() => {
+      const btn = Array.from(document.querySelectorAll('button, [role="button"]')).find((e) => {
+        const t = (e.textContent || '').trim().replace(/\\s+/g, ' ');
+        return t.length > 0 && t.length < 30 && /快速|专家|识图|deepseek|r1|v3|模型/i.test(t);
+      });
+      if (btn) btn.click();
+      return !!btn;
+    })()`);
+  } catch (e) { /* ignore */ }
+  await sleep(600);
+  let applied = 0;
+  for (const step of clicks) {
+    const found = await evalJs(pageId, `(() => {
+      const text = ${JSON.stringify(step.text || '')};
+      const aria = ${JSON.stringify(step.aria || '')};
+      const cls = ${JSON.stringify(step.cls || '')};
+      const all = Array.from(document.querySelectorAll('*')).filter((e) => e.childElementCount < 3 && (e.textContent || '').length < 150);
+      const cands = [];
+      const tKey = text.slice(0, 25);
+      if (tKey) cands.push(...all.filter((e) => {
+        const t = (e.textContent || '').trim().replace(/\\s+/g, ' ');
+        return t.indexOf(tKey) >= 0 && t.length <= 60;
+      }));
+      if (aria) cands.push(...all.filter((e) => (e.getAttribute('aria-label') || '') === aria));
+      if (cls) { const c = cls.split(' ')[0]; if (c) cands.push(...Array.from(document.querySelectorAll('.' + CSS.escape(c)))); }
+      const rank = (el) => {
+        const r = el.getAttribute('role') || '';
+        const tag = el.tagName.toLowerCase();
+        if (r === 'radio' || r === 'option' || r === 'menuitem' || r === 'button') return 3;
+        if (tag === 'label' || tag === 'li' || tag === 'a') return 2;
+        return 1;
+      };
+      cands.sort((a, b) => rank(b) - rank(a));
+      for (const el of cands) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { el.click(); return true; } }
+      return false;
+    })()`);
+    if (found) applied++;
+    await sleep(700);
+  }
+  /* 验证回放后模型状态 + 新会话是否保持（诊断模型选择是会话级还是账号级） */
+  let badge1 = null;
+  try { badge1 = await evalJs(pageId, EXPR.modelBadge); } catch (e) { /* ignore */ }
+  let afterNewChat = null;
+  try {
+    await newChat(pageId);
+    await sleep(1500);
+    afterNewChat = await evalJs(pageId, EXPR.modelBadge);
+  } catch (e) { /* ignore */ }
+  return { ok: true, applied, total: clicks.length, modelBadge: badge1, afterNewChat };
+};
+
+handlers.shutdown = async () => { shutdown(0); return { ok: true }; };
+
+/* ------------------------------------------------------------------ */
+/* boot                                                                */
+/* ------------------------------------------------------------------ */
+
+function readJsonFile(p) {
+  let raw = fs.readFileSync(p, 'utf8');
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+  return JSON.parse(raw);
+}
+
+/* standalone single-run mode: node driver.js --run <task.json> */
+if (RUN_ONCE) {
+  (async () => {
+    try {
+      const taskFile = process.argv[3];
+      if (!taskFile) throw new Error('usage: node driver.js --run <task.json>');
+      const task = readJsonFile(taskFile);
+      const t = makeTask(task);
+      t.runOnce = true;
+      tasks.set(t.id, t);
+      await runTask(t);
+      process.stdout.write(JSON.stringify(await handlers.result({ taskId: t.id })) + '\n');
+    } catch (e) {
+      process.stdout.write(JSON.stringify({ fatal: e.message, stack: e.stack }) + '\n');
+    }
+    await shutdown(0);
+  })();
+  return;
+}
+
+if (CFG.chromePath) log('using chrome path', CFG.chromePath);
+log('driver ready', VERSION, 'base=' + CFG.baseDir, 'profiles=' + JSON.stringify(CFG.profiles));
+emitEvent('ready', { version: VERSION, baseDir: CFG.baseDir, pid: process.pid });

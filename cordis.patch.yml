@@ -1,0 +1,5 @@
+# dsh-deepseek-web-adapter — Cordis bundle patch
+# 把插件挂进配置树：id 唯一，name 指向 npm 包名（Loader 按包名 import main）
+- insert:
+  - id: dsweb-adapter
+    name: dsh-deepseek-web-adapter
