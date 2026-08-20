@@ -522,23 +522,34 @@ const EXPR = {
       if (['p','div','li','br','h1','h2','h3','h4','h5','h6'].includes(tag)) out.push('\\n');
     }
     function fullText(el) { const out = []; walk(el, out); return out.join('').trim(); }
-    const direct = ['.ds-assistant-message-main-content','[class*="assistant-message-main"]','.ds-markdown','[class*="assistant"] [class*="markdown"]','[class*="assistant"] [class*="content"]','[data-role="assistant"] [class*="content"]','[class*="ai-message"] [class*="content"]','[class*="bot-message"] [class*="content"]','[class*="response-content"]'];
+    const direct = ['.ds-assistant-message-main-content','[class*="assistant-message-main"]','.ds-markdown','[class*="assistant"] [class*="markdown"]','[class*="assistant"] [class*="content"]','[data-role="assistant"] [class*="content"]','[class*="ai-message"] [class*="content"]','[class*="bot-message"] [class*="content"]','[class*="response-content"]','[class*="answer-content"]','[class*="reply-content"]','[class*="message-body"]','[class*="message-content"]','[class*="chat-message"] [class*="text"]','[class*="conversation"] [class*="item"]:last-child'];
     for (const s of direct) { const els = document.querySelectorAll(s); if (els.length) { const t = fullText(els[els.length - 1]); if (t.length > 10) return t; } }
-    const md = document.querySelectorAll('[class*="markdown"], [class*="prose"], [class*="rendered"]');
+    const md = document.querySelectorAll('[class*="markdown"], [class*="prose"], [class*="rendered"], [class*="text-content"], [class*="answer"]');
     if (md.length) { const t = fullText(md[md.length - 1]); if (t.length > 10) return t; }
-    const blocks = Array.from(document.querySelectorAll('[class*="message"], [class*="chat-item"], [class*="turn"]'));
+    const blocks = Array.from(document.querySelectorAll('[class*="message"], [class*="chat-item"], [class*="turn"], [class*="chat-row"], [class*="conversation-item"]'));
     const cands = blocks.filter((el) => {
       const cls = String(el.className || '').toLowerCase();
-      return !cls.includes('input') && !cls.includes('user') && !el.querySelector('textarea, input[type="text"]') && ((el.innerText || '').length > 20);
+      return !cls.includes('input') && !cls.includes('user') && !cls.includes('question') && !el.querySelector('textarea, input[type="text"]') && ((el.innerText || '').length > 20);
     });
     if (cands.length) return fullText(cands[cands.length - 1]);
+    /* V4 最后兜底：限定在对话区域内搜索，避免匹配到用户输入或其他 UI 文本 */
+    const conv = document.querySelector('[class*="conversation"], [class*="chat-list"], [class*="message-list"], [class*="chat-history"], [class*="chat-content"], main, [role="main"]');
+    const scope = conv || document.body;
+    const items = scope.querySelectorAll('[class*="message"], [class*="chat-item"], [class*="turn"], [class*="chat-row"], [class*="conversation-item"], [class*="answer"], [class*="reply"]');
+    const assistantItems = Array.from(items).filter((el) => {
+      const cls = String(el.className || '').toLowerCase();
+      return !cls.includes('input') && !cls.includes('user') && !cls.includes('question') &&
+             !el.querySelector('textarea, input[type="text"]') &&
+             (el.innerText || '').length > 20;
+    });
+    if (assistantItems.length) return fullText(assistantItems[assistantItems.length - 1]);
     return '';
   })()`,
 
   generating: `(() => {
-    const stopSels = ['button[aria-label*="Stop" i]','[class*="stop-gen"]','[class*="stopGen"]','[class*="generating"]'];
+    const stopSels = ['button[aria-label*="Stop" i]','[class*="stop-gen"]','[class*="stopGen"]','[class*="generating"]','[class*="is-generating"]','[class*="streaming"]','[class*="in-progress"]','[data-status="generating"]','[data-status="streaming"]'];
     for (const s of stopSels) { const el = document.querySelector(s); if (el) { const cs = window.getComputedStyle(el); if (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') return true; } }
-    const loaderSels = ['[class*="typing"]','[class*="loading"]','[class*="spinner"]','[class*="blink"]','[class*="cursor"]','[class*="pulsing"]','svg[class*="loading"]','svg[class*="spinner"]'];
+    const loaderSels = ['[class*="typing"]','[class*="loading"]','[class*="spinner"]','[class*="blink"]','[class*="cursor"]','[class*="pulsing"]','svg[class*="loading"]','svg[class*="spinner"]','[class*="dot-pulse"]','[class*="dot-flashing"]','[class*="thinking-indicator"]'];
     for (const s of loaderSels) { const el = document.querySelector(s); if (el) { const cs = window.getComputedStyle(el); if (cs.display !== 'none' && cs.visibility !== 'hidden') return true; } }
     return false;
   })()`,
@@ -556,22 +567,33 @@ const EXPR = {
   })()`,
 
   clickSend: `(() => {
-    const sels = ['button[aria-label*="Send" i]','button[aria-label*="send" i]','[data-testid="send-button"]','button[type="submit"]','[class*="send-btn"]','[class*="sendBtn"]','[class*="send-button"]'];
+    const sels = ['button[aria-label*="Send" i]','button[aria-label*="send" i]','[data-testid="send-button"]','button[type="submit"]','[class*="send-btn"]','[class*="sendBtn"]','[class*="send-button"]','[class*="send-icon"]','button[class*="send"]','button[aria-label*="提交"]','button[aria-label*="发送"]','button[aria-label*="enter"]','[class*="submit-btn"]','[class*="submitBtn"]'];
     for (const s of sels) { const el = document.querySelector(s); if (el) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0 && !el.disabled) { el.click(); return true; } } }
     return false;
   })()`,
 
   clickNewChat: `(() => {
-    const sels = ['button[aria-label*="New chat" i]','button[aria-label*="New conversation" i]','a[href="/"][aria-label]','[data-testid="new-chat"]','[class*="new-chat"]','[class*="newChat"]','button[aria-label*="新对话"]','button[aria-label*="新建对话"]','[class*="newChatButton"]'];
+    const sels = ['button[aria-label*="New chat" i]','button[aria-label*="New conversation" i]','a[href="/"][aria-label]','[data-testid="new-chat"]','[class*="new-chat"]','[class*="newChat"]','button[aria-label*="新对话"]','button[aria-label*="新建对话"]','[class*="newChatButton"]','[class*="sidebar"] [class*="new"]','[class*="sidebar"] button','[class*="nav"] [class*="new"]','[class*="side"] button:first-child','[class*="list"] > button:first-child','button svg[class*="plus"]','button svg[class*="add"]','[class*="create-btn"]','[class*="createBtn"]'];
     for (const s of sels) { const el = document.querySelector(s); if (el) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) { el.click(); return true; } } }
+    /* V4 兜底：找侧边栏中文本短且含"新"、"New"、"+"的按钮 */
+    const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+    for (const b of btns) {
+      const t = (b.textContent || '').trim();
+      if (t.length > 0 && t.length < 15 && (t.includes('新') || t.includes('New') || t.includes('new') || t === '+' || t === '＋')) {
+        const r = b.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) { b.click(); return true; }
+      }
+    }
     return false;
   })()`,
 
   loginState: `(() => {
     const url = window.location.href;
     const body = (document.body && document.body.innerText) || '';
+    const hasPasswordInput = !!document.querySelector('input[type="password"]');
+    const hasLoginButton = !!document.querySelector('button[type="submit"]') && (body.length < 500 || body.includes('Sign in') || body.includes('Log in'));
     return {
-      needsLogin: url.includes('/auth') || url.includes('/login') || url.includes('/sign') || body.includes('Sign in') || body.includes('Log in') || body.includes('登录') || body.includes('登 录') || !!document.querySelector('input[type="password"]'),
+      needsLogin: url.includes('/auth') || url.includes('/login') || url.includes('/sign') || hasPasswordInput || hasLoginButton,
       url: url,
       hasChatInput: !!document.querySelector('#chat-input, textarea[placeholder], textarea, [contenteditable="true"]'),
       bodySnippet: body.slice(0, 300),
@@ -624,7 +646,7 @@ const EXPR = {
     const sels = ['[class*="model-name"]','[class*="modelName"]','[class*="model-name-display"]','[class*="model-select"]','[class*="modelSelect"]','[class*="model"] button','button[class*="model"]'];
     for (const s of sels) { const el = document.querySelector(s); if (el) { const t = (el.innerText || el.textContent || '').trim(); if (t) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return { text: t.slice(0, 60), tag: el.tagName.toLowerCase() }; } } }
     const all = Array.from(document.querySelectorAll('button, [role="button"]'));
-    for (const el of all) { const t = (el.innerText || el.textContent || '').trim(); if (t && /deepseek|r1|v3|ocr|模型/i.test(t)) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return { text: t.slice(0, 60), tag: el.tagName.toLowerCase() }; } }
+    for (const el of all) { const t = (el.innerText || el.textContent || '').trim(); if (t && /deepseek|r1|v3|v4|flash|pro|ocr|模型/i.test(t)) { const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return { text: t.slice(0, 60), tag: el.tagName.toLowerCase() }; } }
     return { text: '', tag: '' };
   })()`,
 
@@ -637,6 +659,9 @@ const EXPR = {
 async function ensureLoggedIn(pageId) {
   await waitReady(pageId, 30000);
   const st = await evalJs(pageId, EXPR.loginState);
+  if (st.needsLogin || !st.hasChatInput) {
+    log('ensureLoggedIn: needsLogin=' + st.needsLogin + ' hasChatInput=' + st.hasChatInput + ' url=' + st.url + ' bodySnippet=' + (st.bodySnippet || '').slice(0, 100));
+  }
   return st;
 }
 
@@ -665,18 +690,20 @@ async function applyConfig(pageId, opts) {
   try {
     /* 1) model badge: expert wants R1/deep-think; quick wants base model */
     if (opts.mode === 'expert') {
-      const r1 = await evalJs(pageId, EXPR.clickText(['DeepSeek-R1', '深度思考', 'DeepThink', 'R1']));
+      const r1 = await evalJs(pageId, EXPR.clickText(['专家模式', 'DeepSeek-R1', '深度思考', 'DeepThink', 'R1', 'V4 Pro', 'Pro']));
       if (r1.clicked) report.toggles.push('model:expert(' + r1.matched + ')');
-      else report.warnings.push('expert mode: R1/deep-think control not found');
+      else report.warnings.push('expert mode: expert/deep-think/V4 Pro control not found');
     } else {
-      const r = await evalJs(pageId, EXPR.clickText(['DeepSeek', 'V3', '快速', '通用']));
+      const r = await evalJs(pageId, EXPR.clickText(['DeepSeek', 'V3', 'V4', 'Flash', '快速', '通用']));
       if (r.clicked) report.toggles.push('model:quick(' + r.matched + ')');
     }
     await sleep(600);
-    /* 2) deep-think pill (often a toggle next to the composer) */
-    const thinkLabels = ['深度思考', 'DeepThink', 'Deep Think', '深度推理'];
-    const t = await evalJs(pageId, EXPR.clickText(thinkLabels));
-    if (t.clicked) report.toggles.push('think:toggled(' + t.matched + ')');
+    /* 2) deep-think pill — 仅非专家模式需要单独切换（专家模式选模型时已自动开启） */
+    if (wantThink && opts.mode !== 'expert') {
+      const thinkLabels = ['深度思考', 'DeepThink', 'Deep Think', '深度推理'];
+      const t = await evalJs(pageId, EXPR.clickText(thinkLabels));
+      if (t.clicked) report.toggles.push('think:toggled(' + t.matched + ')');
+    }
     await sleep(300);
     /* 3) web search pill */
     if (wantSearch) {
@@ -742,11 +769,25 @@ async function sendMessage(pageId, text, opts) {
       return true;
     })()`);
   }
-  await sleep(350);
-  /* 点击发送按钮（输入后等 React 更新按钮状态） */
+  /* 等待发送按钮可用（React 异步更新按钮状态，最多等 3 秒） */
+  let sendReady = false;
+  for (let i = 0; i < 10; i++) {
+    await sleep(300);
+    try {
+      sendReady = await evalJs(pageId, `(() => {
+        const sels = ['button[aria-label*="Send" i]','[data-testid="send-button"]','button[type="submit"]','[class*="send-btn"]','[class*="sendBtn"]','[class*="send-button"]','[class*="send-icon"]'];
+        for (const s of sels) { const el = document.querySelector(s); if (el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !el.disabled; } }
+        return false;
+      })()`);
+    } catch (e) { /* ignore */ }
+    if (sendReady) break;
+  }
+  if (!sendReady) log('sendMessage: send button not ready after 3s, trying anyway');
+  /* 点击发送按钮 */
   const clicked = await evalJs(pageId, EXPR.clickSend);
   if (!clicked) {
-    /* 完整 Enter 序列（keyDown + char + keyUp，对照 Playwright keyboard.press） */
+    /* 完整 Enter 序列（keyDown + char + keyUp，对照 Playwright keyboard.press）。
+     * CDP 级 Enter 不受 contenteditable 换行影响，直接触发提交 */
     const enterKeys = [
       { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
       { type: 'char', text: '\r', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
@@ -760,8 +801,19 @@ async function sendMessage(pageId, text, opts) {
 async function newChat(pageId) {
   const clicked = await evalJs(pageId, EXPR.clickNewChat);
   if (clicked) { await sleep(1200); return; }
+  /* 点击失败 → 导航到首页（DeepSeek 首页即新对话） */
   try { await navigate(pageId, DS_URL); } catch (e) { log('newChat navigate fallback failed', e.message); }
-  await sleep(1500);
+  await sleep(2000);
+  /* 验证是否真的开了新对话：URL 应该是 / 而非 /chat/xxx */
+  const urlOk = await evalJs(pageId, `(() => {
+    const u = window.location.href;
+    return u === ${JSON.stringify(DS_URL)} || u === ${JSON.stringify(DS_URL)} + '#/' || !u.includes('/chat/');
+  })()`).catch(() => false);
+  if (!urlOk) {
+    log('newChat: URL still shows old chat, trying navigate again');
+    try { await navigate(pageId, DS_URL); } catch (e) { /* ignore */ }
+    await sleep(2000);
+  }
 }
 
 async function waitForResponse(state, timeoutMs, stableDelayMs) {
@@ -1899,7 +1951,7 @@ handlers.inspect = async (params) => {
   const buttons = await evalJs(pid, EXPR.buttons);
   const login = await evalJs(pid, EXPR.loginState);
   const badge = await evalJs(pid, EXPR.modelBadge);
-  return { dom: info, buttons: buttons.slice(0, 60), login, modelBadge: badge };
+  return { dom: info, buttons: buttons.slice(0, 60), login, modelBadge: badge, channels: [...channels.keys()], freePages: subPages.length };
 };
 
 /* ------------------------------------------------------------------ */
@@ -1911,21 +1963,68 @@ const streamStates = new Map(); // streamId -> { pageId, stopped }
 /* 单页常驻（对照 deepseek-browser-agent）：主 agent 用 thePage（连续对话、网页版历史保持）。
  * 子 agent 并发：当有请求正在处理时，新请求用独立页面（多窗口并行，会话隔离）。 */
 let thePage = null;
-const subPages = []; // 子 agent 独立页面池（用完归还复用）
+const subPages = []; // 空闲页面池（用完归还复用；通道回收的页面也进这里）
 let streamActive = 0;
+
+/* 会话通道（并发最佳实践：会话亲和——每个逻辑会话绑定专属页面，网关按指纹分配 pageKey）。
+ * channels: pageKey -> { pageId }；页面健康失败自动重建；releaseChannel 清历史归还池。 */
+const channels = new Map();
+
+let thePageHealthFails = 0;
+
+/** 获取/创建指定通道的页面（pageKey='main' 走 thePage 常驻逻辑）。
+ * 优先复用空闲页面池（subPages），池空则新开 tab 并导航到 DeepSeek。 */
+async function ensureChannelPage(pageKey) {
+  if (pageKey === 'main') return ensurePage({ name: 'default', headless: false });
+  let ch = channels.get(pageKey);
+  if (ch && pageInfo(ch.pageId)) {
+    /* 健康检查：页面可能已崩溃/关闭 → 重建 */
+    try { await evalJs(ch.pageId, '1'); return ch.pageId; } catch (e) { /* fallthrough: rebuild */ }
+  }
+  const pageId = subPages.pop() || await newPage();
+  try { await navigate(pageId, DS_URL); } catch (e) { log('ensureChannelPage navigate warn', e.message); }
+  try { await waitReady(pageId, 30000); } catch (e) { /* ignore */ }
+  channels.set(pageKey, { pageId });
+  log('channel ' + pageKey + ' ready: ' + pageId);
+  return pageId;
+}
 
 async function ensurePage(profile) {
   if (thePage && pageInfo(thePage)) {
-    /* 复用：确保页面就绪（可能被导航/加载中） */
-    try { await waitReady(thePage, 15000); } catch (e) { /* ignore */ }
-    return thePage;
+    /* 健康检查：页面可能看似存在但已崩溃（OOM/Navigation），连续 evalJs 失败则重建 */
+    try {
+      await evalJs(thePage, '1');
+      thePageHealthFails = 0;
+    } catch (e) {
+      thePageHealthFails++;
+      log('ensurePage health check fail #' + thePageHealthFails, e.message);
+      if (thePageHealthFails >= 2) {
+        log('ensurePage thePage unhealthy, rebuilding');
+        try { await closePage(thePage); } catch (e2) { /* ignore */ }
+        thePage = null;
+      }
+    }
+    if (thePage) {
+      try { await waitReady(thePage, 15000); } catch (e) { /* ignore */ }
+      return thePage;
+    }
   }
+  thePageHealthFails = 0;
   await ensureBrowser(profile || { name: 'default', headless: false });
   thePage = await newPage();
   try { await navigate(thePage, DS_URL); } catch (e) { log('ensurePage navigate warn', e.message); }
-  /* 等待页面完全加载（chat 界面或登录页），避免首次请求误判未登录 */
   await sleep(3000);
   try { await waitReady(thePage, 30000); } catch (e) { /* ignore */ }
+  /* 验证是否成功导航到 DeepSeek（避免页面在 about:blank 导致误判未登录） */
+  const urlOk = await evalJs(thePage, `(() => {
+    const u = window.location.href;
+    return u.startsWith(${JSON.stringify(DS_URL)}) || u.includes('chat.deepseek.com') || u.includes('chat.deepseek');
+  })()`).catch(() => false);
+  if (!urlOk) {
+    log('ensurePage: page not at deepseek, retrying navigation');
+    try { await navigate(thePage, DS_URL); } catch (e) { log('ensurePage retry navigate warn', e.message); }
+    await sleep(3000);
+  }
   await sleep(1500);
   log('single page ready: ' + thePage);
   return thePage;
@@ -2163,15 +2262,21 @@ handlers.streamAsk = async (params) => {
   if (!question || !String(question).trim()) throw new Error('question required');
   const profile = { name: (params && params.profile) || 'default', headless: params && params.headless !== undefined ? !!params.headless : false };
   const streamId = 's' + (++streamSeqs.n);
-  /* 页面分配：无并发请求 → thePage（主 agent 连续对话）；有并发 → 独立页面（子 agent 并行） */
+  /* 页面分配（并发最佳实践：会话亲和）：
+   * 1. 带 pageKey（网关会话注册表分配）→ 专属通道页面——同一会话固定同一 tab，历史保持
+   * 2. 无 pageKey（兼容路径：手动 rpc / 旧客户端）→ 无并发用 thePage，有并发用独立页面 */
   streamActive++;
+  const hasChannel = !!(params && params.pageKey);
   const isConcurrent = streamActive > 1;
   let pageId = null;
   try {
-    if (!isConcurrent) {
+    if (hasChannel) {
+      pageId = await ensureChannelPage(params.pageKey);
+    } else if (!isConcurrent) {
       pageId = await ensurePage(profile);
     } else {
       pageId = subPages.pop() || await newPage();
+      try { await navigate(pageId, DS_URL); } catch (e) { /* 子页面导航失败时由登录检测兜底 */ }
       try { await ensureLoggedIn(pageId); } catch (e) { /* 子页面登录态与主共享 */ }
     }
   } catch (e) {
@@ -2190,7 +2295,7 @@ handlers.streamAsk = async (params) => {
         login = await ensureLoggedIn(pageId);
       }
       if (login.needsLogin || !login.hasChatInput) {
-        emitEvent('stream-end', { streamId, ok: false, error: 'login required: 页面已关闭或未登录。请打开 http://127.0.0.1:5688/login 重新登录（建议勾选保持登录），登录后页面会保持常驻。' });
+        emitEvent('stream-end', { streamId, ok: false, error: 'login required: 页面已关闭或未登录。请打开 http://127.0.0.1:5688/login 重新登录（建议勾选保持登录），登录后页面会保持常驻。 url=' + (login.url || '?') + ' body=' + (login.bodySnippet || '').slice(0, 80) });
         return;
       }
       /* 模型切换由校准回放（applyCalibration）负责——不调用 applyConfig
@@ -2258,7 +2363,8 @@ handlers.streamAsk = async (params) => {
         /* 发送前旧文本（用于检测新回复出现） */
         const beforeText = await evalJs(pageId, EXPR.extractLast).catch(() => '');
         let lastText = beforeText || '';
-        let lastChange = Date.now();
+        let lastChange = 0; /* 不为初始值 Date.now()，避免 5s 兜底在文本未出现时误触发 */
+        let firstSeen = false; /* 首次看到新回复文本 */
         let genSeen = false; /* 是否见过生成中（文本相同的新回复靠 generating 完成判定） */
         while (Date.now() - start < timeoutMs) {
           if (st.stopped) throw new Error('stopped');
@@ -2268,13 +2374,16 @@ handlers.streamAsk = async (params) => {
           try { gen = await evalJs(pageId, EXPR.generating); } catch (e) { /* assume generating */ }
           if (gen) genSeen = true;
           if (text && text !== lastText) {
+            if (!firstSeen) { firstSeen = true; log('streamAsk firstText len=' + text.length + ' after ' + (Date.now() - start) + 'ms'); }
+            const delta = text.slice(lastText.length);
+            if (delta) emitEvent('stream-delta', { streamId, delta });
             lastText = text;
             lastChange = Date.now();
           }
           /* 完成：非生成中 + 文本已出现 + （文本变化过或生成开始过）+ 稳定 800ms；
-           * 5 秒未变兜底防卡 */
-          if (lastText.length > 10 && !gen && (lastChange !== start || genSeen) && Date.now() - lastChange >= 800) break;
-          if (Date.now() - lastChange >= 5000) break;
+           * 5 秒未变兜底防卡（仅当文本已出现时才触发，避免新会话无文本时误退出） */
+          if (lastText.length > 10 && !gen && (lastChange > 0 || genSeen) && Date.now() - lastChange >= 800) break;
+          if (lastChange > 0 && Date.now() - lastChange >= 5000) break;
           await sleep(350);
         }
         finalText = cleanText(lastText);
@@ -2296,8 +2405,8 @@ handlers.streamAsk = async (params) => {
     } finally {
       streamStates.delete(streamId);
       streamActive--;
-      /* 子 agent 独立页面归还池（不关闭，复用）；主 agent 页面常驻 */
-      if (isConcurrent && pageId && pageInfo(pageId)) {
+      /* 通道页面不归还（会话亲和：绑定持续到网关回收）；兼容路径的并发页面归还池复用 */
+      if (!hasChannel && isConcurrent && pageId && pageInfo(pageId)) {
         try { await newChat(pageId); } catch (e) { /* ignore */ }
         subPages.push(pageId);
       }
@@ -2310,6 +2419,28 @@ handlers.streamStop = async (params) => {
   const st = streamStates.get(params && params.streamId);
   if (st) st.stopped = true;
   return { stopped: !!st };
+};
+
+/** 回收会话通道（网关在会话 TTL 超时/驱逐时调用）：
+ * newChat 清掉该通道的网页版历史（避免下个复用者看到残留上下文）；
+ * main 通道常驻只清历史；其他通道解绑后页面归还空闲池（池满则关闭 tab 控制资源）。 */
+handlers.releaseChannel = async (params) => {
+  const key = params && params.pageKey;
+  if (!key) return { released: false };
+  if (key === 'main') {
+    if (thePage && pageInfo(thePage)) {
+      try { await newChat(thePage); } catch (e) { /* ignore */ }
+    }
+    return { released: true, main: true };
+  }
+  const ch = channels.get(key);
+  channels.delete(key);
+  if (ch && pageInfo(ch.pageId)) {
+    try { await newChat(ch.pageId); } catch (e) { /* ignore */ }
+    if (subPages.length < 2) subPages.push(ch.pageId);
+    else { try { await closePage(ch.pageId); } catch (e) { /* ignore */ } }
+  }
+  return { released: true };
 };
 
 /* ------------------------------------------------------------------ */
@@ -2401,7 +2532,7 @@ handlers.calibrateApply = async (params) => {
     await evalJs(pageId, `(() => {
       const btn = Array.from(document.querySelectorAll('button, [role="button"]')).find((e) => {
         const t = (e.textContent || '').trim().replace(/\\s+/g, ' ');
-        return t.length > 0 && t.length < 30 && /快速|专家|识图|deepseek|r1|v3|模型/i.test(t);
+        return t.length > 0 && t.length < 30 && /快速|专家|识图|deepseek|r1|v3|v4|flash|pro|模型/i.test(t);
       });
       if (btn) btn.click();
       return !!btn;
