@@ -45,7 +45,7 @@ const extractThinkingExpr = eval('`' + extractThinkingSrc + '`');
 
 /* ---------- fake DOM ---------- */
 function el(opts) {
-  /* opts: { cls, tag, children, innerText, display, closestBtn } */
+  /* opts: { cls, tag, children, innerText, display, visibility, closestBtn, dataType, dataRole } */
   const node = {
     nodeType: 1,
     tagName: String(opts.tag || 'div').toUpperCase(),
@@ -55,6 +55,12 @@ function el(opts) {
     parentElement: null,
     getBoundingClientRect: () => ({ width: 100, height: 50 }),
     __display: opts.display || 'block',
+    __visibility: opts.visibility || 'visible',
+    getAttribute: (name) => {
+      if (name === 'data-type') return opts.dataType || null;
+      if (name === 'data-role') return opts.dataRole || null;
+      return null;
+    },
   };
   if (opts.innerText !== undefined) node.innerText = opts.innerText;
   if (opts.closestBtn) node.closest = () => ({ tag: 'button' });
@@ -78,7 +84,7 @@ function runExpr(expr, doc) {
   const sandbox = {
     document: doc,
     window: {
-      getComputedStyle: (e) => ({ display: e.__display || 'block', visibility: 'visible', opacity: '1' }),
+      getComputedStyle: (e) => ({ display: e.__display || 'block', visibility: e.__visibility || 'visible', opacity: '1' }),
       document: doc,
     },
   };
@@ -189,16 +195,91 @@ check('2i ds-think-content 可见 → extractThinking 提取思考流', runExpr(
 const thinkRealHidden = el({ cls: 'ds-think-content', display: 'none', children: [tx(THINK_REAL)] });
 check('2j ds-think-content 折叠 display:none → thinking=false', runExpr(thinkingExpr, makeDoc({ '[class*="think"], [class*="reasoning"]': [thinkRealHidden] })) === false);
 
+/* ---------- 2s. searching 检测（智能搜索阶段防线） ---------- */
+const searchingExprSrc = grabExpr(SRC, 'searching');
+const searchingExpr = eval('`' + searchingExprSrc + '`');
+
+/* 2s-a 搜索中：body 含"搜索中" */
+check('2s-a body 含"搜索中..." → searching=true', runExpr(searchingExpr, makeDoc({}, '搜索中...')) === true);
+check('2s-a2 body 含"联网搜索中" → searching=true', runExpr(searchingExpr, makeDoc({}, '联网搜索中')) === true);
+check('2s-a3 body 含英文 "Searching..." → searching=true', runExpr(searchingExpr, makeDoc({}, 'Searching...')) === true);
+
+/* 2s-b 搜索结果容器可见 */
+const searchResult = el({ cls: 'ds-search-result', innerText: '以下是搜索到的网页摘要……', children: [tx('以下是搜索到的网页摘要……')] });
+check('2s-b 可见搜索结果容器 → searching=true', runExpr(searchingExpr, makeDoc({ '[class*="search"], [class*="web-search"], [class*="searching"], [class*="search-result"]': [searchResult] })) === true);
+
+/* 2s-c 搜索完成态文案"搜索到 N 个网页"不算搜索中 */
+const searchDone = el({ cls: 'ds-search-result', innerText: '搜索到 43 个网页', children: [tx('搜索到 43 个网页')] });
+check('2s-c 完成态"搜索到 43 个网页" → searching=false', runExpr(searchingExpr, makeDoc({ '[class*="search"], [class*="web-search"], [class*="searching"], [class*="search-result"]': [searchDone] })) === false);
+
+/* 2s-c2 搜索完成态长文案（含搜索结果摘要）不算搜索中 */
+const searchDoneLong = el({ cls: 'ds-search-result', innerText: '搜索到 43 个网页\n网页1: xxx\n网页2: yyy\n网页3: zzz', children: [tx('搜索到 43 个网页\n网页1: xxx\n网页2: yyy\n网页3: zzz')] });
+check('2s-c2 完成态长文案含"搜索到 N 个网页" → searching=false', runExpr(searchingExpr, makeDoc({ '[class*="search"], [class*="web-search"], [class*="searching"], [class*="search-result"]': [searchDoneLong] })) === false);
+
+/* 2s-d 搜索开关 pill（短文本）不算搜索中 */
+const searchPill = el({ cls: 'ds-search-toggle', innerText: '智能搜索', closestBtn: true });
+check('2s-d 搜索开关 pill（button 内）→ searching=false', runExpr(searchingExpr, makeDoc({ '[class*="search"], [class*="web-search"], [class*="searching"], [class*="search-result"]': [searchPill] })) === false);
+
+/* 2s-e 无搜索容器 */
+check('2s-e 无搜索容器 → searching=false', runExpr(searchingExpr, makeDoc({})) === false);
+
+/* 2s-f 折叠搜索容器 display:none */
+const searchHidden = el({ cls: 'ds-search-result', display: 'none', children: [tx('搜索结果内容')] });
+check('2s-f display:none 搜索容器 → searching=false', runExpr(searchingExpr, makeDoc({ '[class*="search"], [class*="web-search"], [class*="searching"], [class*="search-result"]': [searchHidden] })) === false);
+
+/* ---------- 1s. extractLast：搜索文本不混入正文 ---------- */
+const SEARCH_TEXT = '搜索到 43 个网页\n网页1: xxx\n网页2: yyy';
+const mainSearch = el({ cls: 'ds-assistant-message-main-content', children: [
+  el({ cls: 'ds-search-result', children: [tx(SEARCH_TEXT)] }),
+  el({ cls: 'ds-markdown', children: [tx(BODY_TEXT)] }),
+] });
+const docSearch = makeDoc({ '.ds-assistant-message-main-content': [mainSearch] });
+const rSearch = runExpr(extractLastExpr, docSearch);
+check('1s-a 搜索结果文本不混入正文', rSearch.indexOf(SEARCH_TEXT) < 0, rSearch.slice(0, 120));
+check('1s-b 搜索结果旁正文完整提取', rSearch.indexOf(BODY_TEXT) >= 0, rSearch.slice(0, 120));
+
 /* ---------- 3. 完成判定源码断言（轮询循环无法离线驱动，静态验证关键条件） ---------- */
-check('3a streamAsk 完成判定含 !thinking', /lastChange > 0 && lastText\.length > 10 && !gen && !thinking/.test(SRC));
-check('3b 5s 兜底稳定即完成（不再依赖 !gen，防 generating 误判卡死）', /lastChange > 0 && !thinking && Date\.now\(\) - lastChange >= 5000/.test(SRC));
+check('3a streamAsk 完成判定含 !thinking && !searching', /lastChange > 0 && lastText\.length > 10 && !gen && !thinking && !searching/.test(SRC));
+check('3b 兜底稳定超时即完成（gen=true 时 30s，gen=false 时 5s，防搜索阶段误判）', /lastChange > 0 && !thinking && !searching && Date\.now\(\) - lastChange >= \(gen \? 30000 : 5000\)/.test(SRC));
 check('3c waitForResponse 思考防线 + gen 独立兜底（稳定≥5s 即完成）', /if \(!thinking\) \{[\s\S]*?!gen \|\| Date\.now\(\) - stableStart >= Math\.max\(stableDelayMs, 5000\)\) break;/.test(SRC));
-check('3d walk 排除思考容器（think/reasoning 且非强正文类，去掉 content 以免 .ds-think-content 漏过）', /cls && \/think\|reasoning\/\.test\(cls\) && !\/markdown\|answer\|message\|reply\|response\/\.test\(cls\)/.test(SRC));
+check('3d walk 排除思考容器（think/reasoning 且非 markdown/answer，排除列表精简防误判）', /cls && \/think\|reasoning\/\.test\(cls\) && !\/markdown\|answer\/\.test\(cls\)/.test(SRC));
 check('3e EXPR.doneActions 定义（完成态正信号：复制/重新生成按钮）', /doneActions: `\(\(\) => \{/.test(SRC));
 check('3f 完成判定含 doneSignal（停止按钮消失 或 完成态动作按钮）', /const doneSignal = \(genSeen && !gen\) \|\| doneActions;/.test(SRC));
-check('3g 正信号路径：doneSignal 稳定 400ms 即完成（最快、最可靠）', /doneSignal && !thinking && Date\.now\(\) - lastChange >= 400/.test(SRC));
-check('3h 兜底路径：非生成+非思考 稳定 1500ms 完成（防生成中静默间隙误 break）', /!gen && !thinking && Date\.now\(\) - lastChange >= 1500/.test(SRC));
-check('3i 终态兜底收割：退出前再抓一次 extractLast 取较长者防丢内容', /const re = cleanText\(await evalJs\(pageId, EXPR\.extractLast\)/.test(SRC) && /if \(re\.length > finalText\.length\) finalText = re;/.test(SRC));
+check('3g 正信号路径：doneSignal 稳定 400ms 即完成（最快、最可靠）', /doneSignal && !thinking && !searching && Date\.now\(\) - lastChange >= 400/.test(SRC));
+check('3h 兜底路径：非生成+非思考+非搜索 稳定 1500ms 完成（防生成中静默间隙误 break）', /!gen && !thinking && !searching && Date\.now\(\) - lastChange >= 1500/.test(SRC));
+check('3i 终态兜底收割：退出前再抓一次 extractLast 取较长者防丢内容', /const re = cleanText\(await evalJs\(pageId, EXPR\.extractLast\)/.test(SRC) && /if \(re\.length > finalText\.length\)/.test(SRC) && /finalText = re;/.test(SRC));
+
+/* ---------- 1d. extractLast：data-role 含 think 的容器也跳过 ---------- */
+const mainDR = el({ cls: 'ds-assistant-message-main-content', children: [
+  el({ cls: 'custom-block', dataRole: 'think', children: [tx(THINK_STREAM)] }),
+  el({ cls: 'ds-markdown', children: [tx(BODY_TEXT)] }),
+] });
+const docDR = makeDoc({ '.ds-assistant-message-main-content': [mainDR] });
+const rDR = runExpr(extractLastExpr, docDR);
+check('1d-a data-role=think 的容器文本不混入正文', rDR.indexOf(THINK_STREAM) < 0, rDR.slice(0, 120));
+check('1d-b data-role=think 旁正文完整提取', rDR.indexOf(BODY_TEXT) >= 0, rDR.slice(0, 120));
+
+/* ---------- 1e. extractLast：display:none 的容器整体跳过 ---------- */
+const mainHidden = el({ cls: 'ds-assistant-message-main-content', children: [
+  el({ cls: 'ds-think-content', display: 'none', children: [tx(THINK_STREAM)] }),
+  el({ cls: 'ds-markdown', children: [tx(BODY_TEXT)] }),
+] });
+const docHidden = makeDoc({ '.ds-assistant-message-main-content': [mainHidden] });
+const rHidden = runExpr(extractLastExpr, docHidden);
+check('1e-a display:none 思考容器文本不混入正文', rHidden.indexOf(THINK_STREAM) < 0, rHidden.slice(0, 120));
+check('1e-b display:none 旁正文完整提取', rHidden.indexOf(BODY_TEXT) >= 0, rHidden.slice(0, 120));
+
+/* ---------- 3j. 正文去重：thinkSent 防思考内容重复输出 ---------- */
+check('3j 正文去重：thinkSent 变量追踪已发思考文本', /thinkSent = thinkText;/.test(SRC));
+check('3j2 正文去重：首个 delta 用 deduped 替代 text', /emitEvent\('stream-delta', \{ streamId, delta: deduped \}\)/.test(SRC));
+check('3j3 正文去重：首句前缀匹配去思考重叠', /textNorm\.startsWith\(thinkHead\)/.test(SRC));
+check('3j4 正文去重：sentEnd 追踪已发送偏移（增量去重基线）', /sentEnd = deduped\.length/.test(SRC));
+check('3j5 正文去重：增量 delta 从 sentEnd 切片', /deduped\.slice\(sentEnd\)/.test(SRC));
+check('3j6 正文去重：每次轮询都做去重（不仅 firstSeen）', /let deduped = text;[\s\S]*?if \(thinkSent && thinkSent\.length > 20 && text\)/.test(SRC));
+
+/* ---------- 3k. 开发模式：DS_WEB_DEBUG 环境变量 ---------- */
+check('3k 开发模式：driver.js 支持 DS_WEB_DEBUG', /const DEBUG = !!process\.env\.DS_WEB_DEBUG/.test(SRC));
+check('3k2 开发模式：driver.js 有 logDbg 函数', /function logDbg/.test(SRC));
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

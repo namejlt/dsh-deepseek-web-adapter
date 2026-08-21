@@ -21,8 +21,10 @@ const DS_URL = 'https://chat.deepseek.com/';
 /* ------------------------------------------------------------------ */
 /* logging                                                             */
 /* ------------------------------------------------------------------ */
+const DEBUG = !!process.env.DS_WEB_DEBUG;
 function log(...a) { console.error('[dsweb]', ...a); }
 function logErr(...a) { console.error('[dsweb][err]', ...a); }
+function logDbg(...a) { if (DEBUG) console.error('[dsweb][dbg]', ...a); }
 
 /* ------------------------------------------------------------------ */
 /* config                                                              */
@@ -549,13 +551,27 @@ const EXPR = {
       if (!node) return;
       if (node.nodeType === 3) { out.push(node.textContent); return; }
       if (node.nodeType !== 1) return;
+      /* 折叠/隐藏元素整体跳过：思考容器折叠后 display:none / visibility:hidden，
+       * 其内容不应混入正文（已通过 extractThinking → kind=thinking 流式输出） */
+      const cs = node.nodeType === 1 ? window.getComputedStyle(node) : null;
+      if (cs && (cs.display === 'none' || cs.visibility === 'hidden')) return;
       /* 思考模式（DeepThink）修复：class 含 think/reasoning 的容器（思考流/折叠头
        * "已深度思考（用时N秒）"）整体跳过——思考文本绝不能混入回答。
        * 排除（保留）列表只放强正文信号 markdown/answer/message/reply/response；
        * 不要放 content（几乎每个容器都含 content，真实思考容器正是 .ds-think-content，
-       * 含 think 又含 content，放 content 会让排除条件失效、思考文本泄漏进正文）。 */
+       * 含 think 又含 content，放 content 会让排除条件失效、思考文本泄漏进正文）。
+       * 额外检测：data-type/data-role 含 think/reasoning 的容器也跳过
+       * （DeepSeek Web 可能用 data-* 属性而非 class 标记思考容器）。 */
       const cls = String(node.className || '').toLowerCase();
-      if (cls && /think|reasoning/.test(cls) && !/markdown|answer|message|reply|response/.test(cls)) return;
+      const dataRole = (node.getAttribute('data-type') || node.getAttribute('data-role') || '').toLowerCase();
+      const isThink = (cls && /think|reasoning/.test(cls) && !/markdown|answer/.test(cls))
+                   || (dataRole && /think|reasoning/.test(dataRole));
+      if (isThink) return;
+      /* 智能搜索模式修复：class 含 search 的容器（搜索结果/搜索指示器/搜索摘要）
+       * 整体跳过——搜索文本绝不能混入回答正文（搜索结果由 thinking 流或正文输出）。
+       * 排除列表仅保留 markdown/answer（强正文信号），移除 message/content/reply/response
+       * （过于通用，搜索结果容器常含这些词导致过滤失效）。 */
+      if (cls && /search/.test(cls) && !/markdown|answer/.test(cls)) return;
       const tag = node.tagName.toLowerCase();
       if (tag === 'pre') {
         const codeEl = node.querySelector('code');
@@ -680,18 +696,54 @@ const EXPR = {
     return false;
   })()`,
 
+  /* 智能搜索中检测（联网搜索/智能搜索阶段）——搜索阶段的完成判定防线：
+   * DeepSeek 思考折叠后进入搜索阶段时，thinking=false 但页面仍在搜索/处理搜索结果，
+   * 此时正文尚未出现，文本可能暂时稳定。若不加 !searching 守卫，5s 兜底条件会
+   * 误判为完成，导致正文内容丢失（仅输出思考文本就结束）。
+   * 检测方式：
+   * 1) 全局进行时文本（"搜索中"/"联网搜索中"/"Searching..."）；
+   * 2) 可见的搜索结果容器（class 含 search/web-search/searching/search-result）；
+   *    排除搜索开关 pill（短文本，通常是"智能搜索"/"联网搜索"）和完成态文案。
+   * 用途：轮询完成判定加 !searching——搜索阶段绝不提前退出（防截断正文） */
+  searching: `(() => {
+    const body = (document.body && document.body.innerText) || '';
+    if (/搜索中[\\.。…]*|联网搜索中|网络搜索中|Searching\\.\\./.test(body)) return true;
+    /* 搜索完成态文案模式（完成态不算搜索中，允许完成判定通过）：
+     * 1) 短文案以"搜索到"/"已搜索"/"Found"/"Searched"开头（<80字符）
+     * 2) 长文案包含"搜索到 N 个网页"模式（搜索结果摘要容器可能很长，
+     *    但只要包含完成态关键词，说明搜索已完成，正文正在/已经生成） */
+    const doneShort = /^(搜索到|已搜索|Found \\d|Searched)/;
+    const doneLong = /搜索到\\s*\\d+\\s*个网页|已搜索|Found \\d+|Searched \\d+/;
+    const els = document.querySelectorAll('[class*="search"], [class*="web-search"], [class*="searching"], [class*="search-result"]');
+    for (const el of els) {
+      if (el.closest && el.closest('button, [role="button"], label')) continue;
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const t = (el.innerText || '').trim();
+      if (!t) continue;
+      if (doneShort.test(t) && t.length < 80) continue;
+      if (doneLong.test(t)) continue;
+      if (t.length <= 8 && /搜索|search/i.test(t)) continue;
+      return true;
+    }
+    return false;
+  })()`,
+
   /* ---------- pill 开关（2026-08 页面重构：无模型选择器，输入框下方 pill） ----------
    * toggleState：读开关当前状态（true=开/false=关/null=无法判定）
    * 状态信号优先级：aria-pressed > aria-checked > data-state > class 中的 active 类名 */
   toggleState: (labels) => `(() => {
     const labels = ${JSON.stringify(labels)};
     function findPill() {
-      const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], [class*="pill"], label, div[class*="option"], span[class*="option"]'));
+      const els = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], [role="radio"], [class*="toggle"], [class*="switch"], [class*="pill"], [class*="mode"], [class*="tab"], label, div[class*="option"], span[class*="option"], a[role="tab"]'));
       for (const lab of labels) {
         const needle = String(lab).toLowerCase();
         for (const el of els) {
           const txt = ((el.innerText || el.textContent || '').trim() || '').toLowerCase();
-          if (txt && (txt === needle || txt.includes(needle))) {
+          const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          const title = (el.getAttribute('title') || '').toLowerCase();
+          const all = [txt, aria, title];
+          if (all.some((s) => s && (s === needle || s.includes(needle)))) {
             const r = el.getBoundingClientRect();
             if (r.width > 0 && r.height > 0) return el;
           }
@@ -706,12 +758,15 @@ const EXPR = {
       const ac = el.getAttribute('aria-checked');
       if (ac === 'true') return true;
       if (ac === 'false') return false;
+      const as = el.getAttribute('aria-selected');
+      if (as === 'true') return true;
+      if (as === 'false') return false;
       const ds = el.getAttribute('data-state');
-      if (ds === 'checked' || ds === 'on' || ds === 'active' || ds === 'open') return true;
-      if (ds === 'unchecked' || ds === 'off' || ds === 'inactive') return false;
+      if (ds === 'checked' || ds === 'on' || ds === 'active' || ds === 'open' || ds === 'selected') return true;
+      if (ds === 'unchecked' || ds === 'off' || ds === 'inactive' || ds === 'unselected') return false;
       const cls = String(el.className || '').toLowerCase();
       const parts = cls.split(/\\s+/);
-      if (parts.some((c) => /^(active|selected|checked|enabled|on|open|isOpen)$/.test(c))) return true;
+      if (parts.some((c) => /^(active|selected|checked|enabled|on|open|isOpen|current)$/.test(c))) return true;
       return null;
     }
     const pill = findPill();
@@ -726,12 +781,15 @@ const EXPR = {
     const labels = ${JSON.stringify(labels)};
     const want = ${JSON.stringify(!!want)};
     function findPill() {
-      const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], [class*="pill"], label, div[class*="option"], span[class*="option"]'));
+      const els = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], [role="radio"], [class*="toggle"], [class*="switch"], [class*="pill"], [class*="mode"], [class*="tab"], label, div[class*="option"], span[class*="option"], a[role="tab"]'));
       for (const lab of labels) {
         const needle = String(lab).toLowerCase();
         for (const el of els) {
           const txt = ((el.innerText || el.textContent || '').trim() || '').toLowerCase();
-          if (txt && (txt === needle || txt.includes(needle))) {
+          const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          const title = (el.getAttribute('title') || '').toLowerCase();
+          const all = [txt, aria, title];
+          if (all.some((s) => s && (s === needle || s.includes(needle)))) {
             const r = el.getBoundingClientRect();
             if (r.width > 0 && r.height > 0) return el;
           }
@@ -746,12 +804,15 @@ const EXPR = {
       const ac = el.getAttribute('aria-checked');
       if (ac === 'true') return true;
       if (ac === 'false') return false;
+      const as = el.getAttribute('aria-selected');
+      if (as === 'true') return true;
+      if (as === 'false') return false;
       const ds = el.getAttribute('data-state');
-      if (ds === 'checked' || ds === 'on' || ds === 'active' || ds === 'open') return true;
-      if (ds === 'unchecked' || ds === 'off' || ds === 'inactive') return false;
+      if (ds === 'checked' || ds === 'on' || ds === 'active' || ds === 'open' || ds === 'selected') return true;
+      if (ds === 'unchecked' || ds === 'off' || ds === 'inactive' || ds === 'unselected') return false;
       const cls = String(el.className || '').toLowerCase();
       const parts = cls.split(/\\s+/);
-      if (parts.some((c) => /^(active|selected|checked|enabled|on|open|isOpen)$/.test(c))) return true;
+      if (parts.some((c) => /^(active|selected|checked|enabled|on|open|isOpen|current)$/.test(c))) return true;
       return null;
     }
     const pill = findPill();
@@ -809,32 +870,38 @@ const EXPR = {
   })()`,
 
   buttons: `(() => {
-    const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], label'));
+    const els = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], [role="radio"], [class*="toggle"], [class*="switch"], [class*="mode"], [class*="tab"], label'));
     const seen = [];
     const out = [];
     for (const el of els) {
       const txt = (el.innerText || el.textContent || '').trim();
-      if (!txt) continue;
-      const key = txt.slice(0, 40);
+      const aria = (el.getAttribute('aria-label') || '').trim();
+      const title = (el.getAttribute('title') || '').trim();
+      const display = txt || aria || title;
+      if (!display) continue;
+      const key = display.slice(0, 40);
       if (seen.includes(key)) continue;
       seen.push(key);
       const r = el.getBoundingClientRect();
       if (r.width === 0 && r.height === 0) continue;
-      out.push({ text: txt.slice(0, 80), aria: el.getAttribute('aria-pressed'), cls: String(el.className || '').slice(0, 60), tag: el.tagName.toLowerCase() });
+      out.push({ text: display.slice(0, 80), aria: el.getAttribute('aria-pressed') || el.getAttribute('aria-selected'), ariaLabel: aria, title, cls: String(el.className || '').slice(0, 60), tag: el.tagName.toLowerCase() });
     }
     return out;
   })()`,
 
   clickText: (labels) => `(() => {
     const labels = ${JSON.stringify(labels)};
-    const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], [class*="option"], [class*="menu-item"], div[class*="model"], span[class*="model"]'));
+    const els = Array.from(document.querySelectorAll('button, [role="button"], [role="tab"], [role="radio"], [class*="toggle"], [class*="switch"], [class*="option"], [class*="menu-item"], [class*="mode"], [class*="tab"], div[class*="model"], span[class*="model"], a[role="tab"]'));
     for (const lab of labels) {
       const needle = String(lab).toLowerCase();
       for (const el of els) {
         const txt = ((el.innerText || el.textContent || '').trim() || '').toLowerCase();
-        if (txt && (txt === needle || txt.includes(needle))) {
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        const title = (el.getAttribute('title') || '').toLowerCase();
+        const all = [txt, aria, title];
+        if (all.some((s) => s && (s === needle || s.includes(needle)))) {
           const r = el.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) { el.click(); return { clicked: true, matched: lab, text: txt.slice(0, 60) }; }
+          if (r.width > 0 && r.height > 0) { el.click(); return { clicked: true, matched: lab, text: (txt || aria || title).slice(0, 60) }; }
         }
       }
     }
@@ -927,9 +994,9 @@ async function applyConfig(pageId, opts) {
      * quick 入口找不到时静默——页面默认即快速模式（无显式入口）；
      * expert/vision 找不到才告警（显式切换失败）。 */
     const modeLabels = {
-      quick: ['快速', '快速模式', 'Quick'],
-      expert: ['专家', '专家模式', 'Expert'],
-      vision: ['识图', '视图', '识图模式', '图片理解', 'Vision'],
+      quick: ['快速', '快速模式', 'Quick', '闪电', '闪电模式', 'Instant'],
+      expert: ['专家', '专家模式', 'Expert', '钻石', '钻石模式', 'Pro'],
+      vision: ['识图', '视图', '识图模式', '图片理解', 'Vision', '眼睛'],
     };
     const wantMode = modeLabels[opts.mode] ? opts.mode : 'quick';
     const m = await setPill(pageId, modeLabels[wantMode], true, 'mode');
@@ -2750,18 +2817,23 @@ handlers.streamAsk = async (params) => {
         const beforeClean = cleanText(beforeText);
         let lastText = ''; /* 本轮新回复的累计文本（cleanText 后；firstSeen 后才有效） */
         let lastThink = ''; /* 思考流累计快照（思考增量差分基线；每 attempt 重置） */
+        let thinkSent = ''; /* 已发送的思考全量文本（用于正文去重：正文不应重复输出思考内容） */
+        let sentEnd = 0; /* 已发送正文的字符偏移（cleanText 后文本中的位置；增量去重基线） */
         let lastChange = 0; /* 不为初始值 Date.now()，避免 5s 兜底在文本未出现时误触发 */
         let firstSeen = false; /* 首次看到新回复文本 */
         let genSeen = false; /* 是否见过生成中（文本相同的新回复靠 generating 完成判定） */
+        let pollCount = 0; /* 轮询计数（调试日志用） */
         while (Date.now() - start < timeoutMs) {
           if (st.stopped) throw new Error('stopped');
-          /* 四项探测并行（CDP roundtrip 串行会把轮询周期拉长近一倍）：
-           * 正文 / 生成中 / 思考中 / 思考文本（非思考模式无容器 → ''，空跑一轮） */
-          const [textR, genR, thinkR, thinkTextR] = await Promise.all([
+          /* 五项探测并行（CDP roundtrip 串行会把轮询周期拉长近一倍）：
+           * 正文 / 生成中 / 思考中 / 思考文本 / 搜索中
+           * （非思考/搜索模式无容器 → ''/false，空跑一轮） */
+          const [textR, genR, thinkR, thinkTextR, searchR] = await Promise.all([
             evalJs(pageId, EXPR.extractLast).catch(() => ''),
             evalJs(pageId, EXPR.generating).catch(() => true),
             evalJs(pageId, EXPR.thinking).catch(() => false),
             evalJs(pageId, EXPR.extractThinking).catch(() => ''),
+            evalJs(pageId, EXPR.searching).catch(() => false),
           ]);
           /* 思考流增量（kind=thinking，网关转 reasoning_content）：
            * 思考文本只增（生成中）；收缩/折叠（完成）→ 只更新基线不发增量。
@@ -2769,77 +2841,131 @@ handlers.streamAsk = async (params) => {
           const thinkText = thinkTextR || '';
           if (thinkText && thinkText !== lastThink) {
             const td = thinkText.length > lastThink.length ? thinkText.slice(lastThink.length) : '';
-            if (td) emitEvent('stream-delta', { streamId, delta: td, kind: 'thinking' });
+            if (td) {
+              emitEvent('stream-delta', { streamId, delta: td, kind: 'thinking' });
+              logDbg('streamAsk think-delta: +' + td.length + ' chars (total=' + thinkText.length + ')');
+            }
             lastThink = thinkText;
+            thinkSent = thinkText;
           }
+          /* 思考折叠后 extractThinking 返回 ''，但 thinkSent 保留已发思考全量。
+           * 用于正文去重：extractLast 可能泄漏思考文本（class 过滤遗漏），需要
+           * 在 delta 发送前去除与 thinkSent 重叠的前缀部分。 */
           /* 正文 cleanText 后比较：流式增量与终态 result 同基准
            * （网关前缀对齐补尾的前提；cleanText 幂等——按钮行/空行中途出现不破坏前缀）。 */
           const text = cleanText(textR || '');
           const gen = genR !== false; /* 探测失败按生成中处理（保守不退出） */
           const thinking = !!thinkR;
+          const searching = !!searchR;
           if (gen) genSeen = true;
+          pollCount++;
+          /* 调试日志：每 10 轮或关键状态变化时输出（避免日志洪泛） */
+          if (pollCount <= 3 || pollCount % 10 === 0 || (!gen && genSeen) || (firstSeen && text !== lastText)) {
+            log('streamAsk poll#' + pollCount + ' gen=' + gen + ' thinking=' + thinking + ' searching=' + searching + ' firstSeen=' + firstSeen + ' textLen=' + text.length + ' thinkLen=' + thinkText.length + ' lastChange=' + (lastChange > 0 ? (Date.now() - lastChange) + 'ms' : 'n/a'));
+          }
+          /* 正文去重 v3：extractLast 可能泄漏思考内容（class/data 过滤遗漏），
+           * 正文文本会以已发送的思考文本开头。去除重叠前缀，防止思考内容在
+           * reasoning_content 和 content 中重复输出。
+           * 策略：每次轮询都对 text 做去重（不仅 firstSeen），因为思考内容可能
+           * 随正文一起增长。用 thinkHead 前缀匹配找到切割点，映射回原始 text。
+           * sentEnd 跟踪已发送正文的字符偏移（在去重后文本中），增量从 sentEnd 切片。 */
+          let deduped = text;
+          let dedupOffset = 0;
+          if (thinkSent && thinkSent.length > 20 && text) {
+            const thinkHead = thinkSent.replace(/\s+/g, ' ').trim().slice(0, 200);
+            const textNorm = text.replace(/\s+/g, ' ').trim();
+            if (textNorm.startsWith(thinkHead) && textNorm.length > thinkHead.length) {
+              const suffixNorm = textNorm.slice(thinkHead.length).replace(/^\s+/, '');
+              if (suffixNorm.length > 0) {
+                const idx = text.indexOf(suffixNorm.charAt(0), Math.floor(thinkHead.length * 0.8));
+                if (idx > 0) {
+                  deduped = text.slice(idx).replace(/^\s*\n/, '');
+                  dedupOffset = idx;
+                  logDbg('streamAsk think-dedup: offset=' + dedupOffset + ' rawLen=' + text.length + ' dedupedLen=' + deduped.length);
+                }
+              }
+            }
+          }
           /* 变化检测：与发送前基线不同 = 新回复开始出现。
            * 修复：delta 从新回复自身累计（首轮发全量、后续发增量），
            * 旧实现 text.slice(beforeText.length) 假设新回复是旧回复的前缀扩展——
            * 两轮回复内容无关，切片会把新回复开头截掉。 */
-          if (text && !firstSeen && text !== beforeClean) {
+          if (deduped && !firstSeen && text !== beforeClean) {
             firstSeen = true;
             lastText = text;
+            sentEnd = deduped.length;
             lastChange = Date.now();
-            log('streamAsk firstText len=' + text.length + ' after ' + (Date.now() - start) + 'ms');
+            log('streamAsk firstText len=' + deduped.length + ' (raw=' + text.length + ' dedupOffset=' + dedupOffset + ') after ' + (Date.now() - start) + 'ms');
             /* 受限提示检测（先于 delta 发出）：新回复文本短且命中风控模式 → 立即终止。
              * 检测先行保证限流文案绝不流入客户端——切号重试无残留文本污染。 */
-            if (!limitHit && lastText.length < 400) {
-              const lim = detectLimit(lastText);
+            if (!limitHit && deduped.length < 400) {
+              const lim = detectLimit(deduped);
               if (lim && lim.kind === 'length') {
                 lengthHit = true;
-                log('streamAsk 对话过长检测命中: text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                log('streamAsk 对话过长检测命中: text[:120]=' + deduped.slice(0, 120).replace(/\n/g, '\\n'));
                 break;
               }
               if (lim && (lim.kind === 'quota' || lim.kind === 'captcha')) {
                 limitHit = lim;
-                log('streamAsk 限流检测命中: kind=' + lim.kind + ' text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                log('streamAsk 限流检测命中: kind=' + lim.kind + ' text[:120]=' + deduped.slice(0, 120).replace(/\n/g, '\\n'));
                 break;
               }
             }
-            emitEvent('stream-delta', { streamId, delta: text });
+            emitEvent('stream-delta', { streamId, delta: deduped });
           } else if (firstSeen && text && text !== lastText) {
             /* 流式增长：发增量。修复：页面重渲染/占位符闪烁可能导致文本瞬时缩短，
              * 此时绝不回退 lastText（保留已捕获的最长文本，防内容丢失）；仅当变长才
-             * 发增量并更新 lastText；变短只重置稳定计时（页面仍在变化，未完）。 */
+             * 发增量并更新 lastText；变短只重置稳定计时（页面仍在变化，未完）。
+             * 增量从去重后文本的 sentEnd 位置切片，确保不重复发送已输出内容。 */
             const grew = text.length > lastText.length;
-            const delta = grew ? text.slice(lastText.length) : '';
-            if (grew) lastText = text;
+            if (grew) {
+              const newPart = deduped.slice(sentEnd);
+              lastText = text;
+              sentEnd = deduped.length;
+              if (newPart) emitEvent('stream-delta', { streamId, delta: newPart });
+            }
             lastChange = Date.now();
-            if (!limitHit && lastText.length < 400) {
-              const lim = detectLimit(lastText);
+            if (!limitHit && deduped.length < 400) {
+              const lim = detectLimit(deduped);
               if (lim && lim.kind === 'length') {
                 lengthHit = true;
-                log('streamAsk 对话过长检测命中: text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                log('streamAsk 对话过长检测命中: text[:120]=' + deduped.slice(0, 120).replace(/\n/g, '\\n'));
                 break;
               }
               if (lim && (lim.kind === 'quota' || lim.kind === 'captcha')) {
                 limitHit = lim;
-                log('streamAsk 限流检测命中: kind=' + lim.kind + ' text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                log('streamAsk 限流检测命中: kind=' + lim.kind + ' text[:120]=' + deduped.slice(0, 120).replace(/\n/g, '\\n'));
                 break;
               }
             }
-            if (delta) emitEvent('stream-delta', { streamId, delta });
           }
-          /* 完成判定（v3c 稳健版，防提前终止丢内容）：
+          /* 完成判定（v3d 搜索兼容版，防提前终止丢内容）：
+           * 与 v3c 相比，新增 !searching 守卫——智能搜索阶段（思考折叠后、正文出现前/中）
+           * 页面显示搜索结果容器，文本可能暂时稳定，但生成尚未完成。
+           * !thinking && !searching 在所有分支都要求——思考/搜索→正文间隙绝不退出。
            * 1) 正信号（最可靠、最快）：见过生成中(genSeen)且当下 !gen（停止按钮消失），
            *    或页面出现完成态动作按钮(复制/重新生成，生成中不显示) → 稳定 400ms 即完成；
            *    直接解决 generating 选择器漏检时"文本稳定"误判提前 break 的问题。
-           * 2) 非生成中 + 非思考中 + 文本稳定 1500ms → 完成（generating 漏检兜底；
+           * 2) 非生成中 + 非思考中 + 非搜索中 + 文本稳定 1500ms → 完成（generating 漏检兜底；
            *    1500ms 而非 800ms，避免生成中 DOM 突发 >800ms 静默间隙误触发提前 break）。
-           * 3) 安全网：文本稳定 5s 即完成（不再要求 !gen，防 generating 误判常驻卡死到 240s）。
-           * 非思考(!thinking)在所有分支都要求——DeepThink 思考折叠→正文开始间隙绝不退出。 */
+           * 3) 安全网：文本稳定超时即完成（防 generating 误判常驻卡死到 240s）。
+           *    gen=true 时用 30s 超时（搜索阶段文本可能长时间稳定，需更长等待）；
+           *    gen=false 时保留 5s 超时（generating 误判常驻兜底）。 */
           let doneActions = false;
-          if (!gen && !thinking) { try { doneActions = await evalJs(pageId, EXPR.doneActions); } catch (e) { /* ignore */ } }
+          if (!gen && !thinking && !searching) { try { doneActions = await evalJs(pageId, EXPR.doneActions); } catch (e) { /* ignore */ } }
           const doneSignal = (genSeen && !gen) || doneActions;
-          if (lastChange > 0 && doneSignal && !thinking && Date.now() - lastChange >= 400) break;
-          if (lastChange > 0 && lastText.length > 10 && !gen && !thinking && Date.now() - lastChange >= 1500) break;
-          if (lastChange > 0 && !thinking && Date.now() - lastChange >= 5000) break;
+          if (lastChange > 0 && doneSignal && !thinking && !searching && Date.now() - lastChange >= 400) {
+            logDbg('streamAsk done: doneSignal (genSeen=' + genSeen + ' gen=' + gen + ' doneActions=' + doneActions + ') after ' + (Date.now() - start) + 'ms');
+            break;
+          }
+          if (lastChange > 0 && lastText.length > 10 && !gen && !thinking && !searching && Date.now() - lastChange >= 1500) {
+            logDbg('streamAsk done: stable 1500ms after ' + (Date.now() - start) + 'ms');
+            break;
+          }
+          if (lastChange > 0 && !thinking && !searching && Date.now() - lastChange >= (gen ? 30000 : 5000)) {
+            logDbg('streamAsk done: timeout (' + (gen ? 30 : 5) + 's) after ' + (Date.now() - start) + 'ms');
+            break;
+          }
           await sleep(200);
         }
         /* 对话过长：attempt 未用尽 → 迁移+摘要重试（循环开头处理）；
@@ -2862,18 +2988,24 @@ handlers.streamAsk = async (params) => {
          * 确保不丢内容；网关按前缀对齐会把缺失尾部补发给客户端。 */
         try {
           const re = cleanText(await evalJs(pageId, EXPR.extractLast).catch(() => ''));
-          if (re.length > finalText.length) finalText = re;
+          if (re.length > finalText.length) {
+            logDbg('streamAsk final-harvest: ' + finalText.length + ' → ' + re.length + ' chars');
+            finalText = re;
+          }
         } catch (e) { /* ignore */ }
         toolCalls = parseToolCalls(finalText, params.tools);
+        logDbg('streamAsk attempt=' + attempt + ' finalTextLen=' + finalText.length + ' toolCalls=' + toolCalls.length + ' looksLikeTool=' + looksLikeToolCall(finalText));
         /* 解析成功 或 文本不像工具调用（正常回答）→ 停止重试 */
         if (toolCalls.length || !looksLikeToolCall(finalText)) break;
       }
       /* 诊断日志：工具调用解析失败时打印实际输出与工具列表，方便定位 */
       if (toolCalls.length) {
         log('streamAsk toolCalls: ' + JSON.stringify(toolCalls).slice(0, 400));
+        logDbg('streamAsk emitting stream-end with toolCalls=' + toolCalls.length + ' resultLen=' + finalText.length);
       } else {
         const names = (params.tools || []).map((t) => ((t.function || t).name || '?')).join(',');
         log('streamAsk NO-toolCalls | 输出[:1500]: ' + String(finalText).slice(0, 1500).replace(/\n/g, '\\n') + ' | tools: ' + names.slice(0, 400));
+        logDbg('streamAsk emitting stream-end ok=true resultLen=' + finalText.length);
       }
       if (limitHit) {
         /* 受限（quota/captcha）：结构化上报网关（errorKind）→ 网关标记账号并切换重试 */

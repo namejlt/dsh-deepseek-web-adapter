@@ -41,7 +41,7 @@ const toggleStateFn = eval('(labels) => `' + grabTemplate(DRV_SRC, 'toggleState'
 
 /* ---------- fake DOM pill ---------- */
 function pill(opts) {
-  /* opts: { text, pressed, checked, dataState, cls } */
+  /* opts: { text, pressed, checked, selected, dataState, cls, ariaLabel, title } */
   const state = { clicked: false };
   const node = {
     nodeType: 1, tagName: 'BUTTON', className: opts.cls || '',
@@ -50,6 +50,9 @@ function pill(opts) {
     getAttribute: (n) => {
       if (n === 'aria-pressed') return opts.pressed;
       if (n === 'aria-checked') return opts.checked;
+      if (n === 'aria-selected') return opts.selected;
+      if (n === 'aria-label') return opts.ariaLabel;
+      if (n === 'title') return opts.title;
       if (n === 'data-state') return opts.dataState;
       return null;
     },
@@ -178,9 +181,75 @@ check('4c 校准降级为 fallback（pill 未找到才回放）', /needFallback[
 check('4d applyConfig 幂等 setPill think', /setPill\(pageId, \['深度思考'/.test(DRV_SRC));
 check('4e applyConfig 幂等 setPill search', /setPill\(pageId, \['智能搜索'/.test(DRV_SRC));
 check('4f 旧"专家模式"盲点击已移除', !/clickText\(\['专家模式', 'DeepSeek-R1'/.test(DRV_SRC));
-check('4g applyConfig 三模式入口（quick/expert/vision）', /quick: \['快速'/.test(DRV_SRC) && /expert: \['专家'/.test(DRV_SRC) && /vision: \['识图'/.test(DRV_SRC));
+check('4g applyConfig 三模式入口含图标标签（闪电/钻石/眼睛）', /quick: \['快速'/.test(DRV_SRC) && /expert: \['专家'/.test(DRV_SRC) && /vision: \['识图'/.test(DRV_SRC) && /闪电/.test(DRV_SRC) && /钻石/.test(DRV_SRC) && /眼睛/.test(DRV_SRC));
 check('4h search 仅 quick 模式应用', /wantSearch = opts\.search === true && wantMode === 'quick'/.test(DRV_SRC));
 check('4i expert 模式入口找不到时降级盲点击', /!m\.ok && wantMode !== 'quick'/.test(DRV_SRC));
+
+/* ---------- 5. aria-label / title 匹配（图标按钮定位修复） ---------- */
+const EXPERT = ['专家', '专家模式', 'Expert', '钻石', '钻石模式', 'Pro'];
+/* 5a 图标按钮无 innerText 但有 aria-label="专家模式" → 可定位 */
+{
+  const p = pill({ ariaLabel: '专家模式', pressed: 'false' });
+  const { ret } = runPill(setToggleFn(EXPERT, true), [p]);
+  check('5a aria-label 匹配"专家模式" → found+clicked', ret.found === true && ret.action === 'clicked' && p.__state.clicked === true, JSON.stringify(ret));
+}
+/* 5b 图标按钮有 title="擅长复杂问题" → includes "专家" 不可匹配，但 includes "钻石" 也不可；
+ *    但 title="专家模式 · 擅长复杂问题" → includes "专家" 可匹配 */
+{
+  const p = pill({ title: '专家模式 · 擅长复杂问题', pressed: 'false' });
+  const { ret } = runPill(setToggleFn(EXPERT, true), [p]);
+  check('5b title 含"专家模式" → found+clicked', ret.found === true && ret.action === 'clicked' && p.__state.clicked === true, JSON.stringify(ret));
+}
+/* 5c aria-label 匹配 + 已激活 → 不重复点击 */
+{
+  const p = pill({ ariaLabel: '专家模式', selected: 'true' });
+  const { ret } = runPill(setToggleFn(EXPERT, true), [p]);
+  check('5c aria-label 匹配 + aria-selected=true → 幂等不点击', ret.action === 'none' && p.__state.clicked === false, JSON.stringify(ret));
+}
+/* 5d aria-selected 状态检测 */
+{
+  const p = pill({ text: '专家', selected: 'false' });
+  const { ret } = runPill(setToggleFn(EXPERT, true), [p]);
+  check('5d aria-selected=false → 判定为关 → 点击', ret.action === 'clicked' && p.__state.clicked === true, JSON.stringify(ret));
+}
+/* 5e data-state=selected 判定为开 */
+{
+  const p = pill({ text: '专家', dataState: 'selected' });
+  const { ret } = runPill(setToggleFn(EXPERT, true), [p]);
+  check('5e data-state=selected → 判定为开 → 幂等不点击', ret.action === 'none', JSON.stringify(ret));
+}
+/* 5f class 含 current 判定为开 */
+{
+  const p = pill({ text: '专家', cls: 'tab-item current' });
+  const { ret } = runPill(setToggleFn(EXPERT, true), [p]);
+  check('5f class 含 current → 判定为开 → 幂等不点击', ret.action === 'none', JSON.stringify(ret));
+}
+/* 5g toggleState 也支持 aria-label 匹配 */
+{
+  const p = pill({ ariaLabel: '专家模式', selected: 'true' });
+  const { ret } = runPill(toggleStateFn(EXPERT), [p]);
+  check('5g toggleState aria-label 匹配 + aria-selected=true', ret.found === true && ret.state === true, JSON.stringify(ret));
+}
+/* 5h 快速模式闪电图标：aria-label="快速模式" */
+{
+  const QUICK = ['快速', '快速模式', 'Quick', '闪电', '闪电模式', 'Instant'];
+  const p = pill({ ariaLabel: '快速模式', pressed: 'true' });
+  const { ret } = runPill(setToggleFn(QUICK, true), [p]);
+  check('5h 快速模式 aria-label 匹配 + 已激活 → 幂等', ret.action === 'none' && p.__state.clicked === false, JSON.stringify(ret));
+}
+/* 5i 识图模式眼睛图标：title="识图模式" */
+{
+  const VISION = ['识图', '视图', '识图模式', '图片理解', 'Vision', '眼睛'];
+  const p = pill({ title: '识图模式', pressed: 'false' });
+  const { ret } = runPill(setToggleFn(VISION, true), [p]);
+  check('5i 识图模式 title 匹配 → found+clicked', ret.found === true && ret.action === 'clicked' && p.__state.clicked === true, JSON.stringify(ret));
+}
+/* 5j 无文本无 aria-label 无 title → not-found */
+{
+  const p = pill({ text: '', ariaLabel: '', title: '' });
+  const { ret } = runPill(setToggleFn(EXPERT, true), [p]);
+  check('5j 纯图标无辅助属性 → not-found', ret.found === false, JSON.stringify(ret));
+}
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

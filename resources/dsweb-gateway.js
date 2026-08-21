@@ -103,7 +103,9 @@ const MODELS = {
 };
 
 /** 网关日志（带时间戳与 [gw] 前缀，stdout）。 */
+const GW_DEBUG = !!process.env.DS_WEB_DEBUG;
 function log(...a) { console.log('[' + new Date().toISOString().slice(11, 19) + '][gw]', ...a); }
+function logDbg(...a) { if (GW_DEBUG) console.log('[' + new Date().toISOString().slice(11, 19) + '][gw][dbg]', ...a); }
 
 /* ---------- driver 生命周期（单一常驻） ---------- */
 let D = null;
@@ -184,6 +186,7 @@ function onData(d, chunk) {
     } else if (m.event === 'stream-delta' && m.streamId) {
       const c = d.consumers.get(m.streamId);
       if (c) c.push(m.delta || '', m.kind);
+      logDbg('stream-delta: streamId=' + m.streamId + ' kind=' + (m.kind || 'content') + ' deltaLen=' + (m.delta || '').length);
     } else if (m.event === 'channels-reset') {
       /* driver 因 profile 切换重启浏览器：所有通道的网页版历史已销毁。
        * 把全部会话标记为 epoch 失配 → 各会话下一请求强制 recovery 重建上下文，
@@ -193,6 +196,7 @@ function onData(d, chunk) {
     } else if (m.event === 'stream-end' && m.streamId) {
       const c = d.consumers.get(m.streamId);
       if (c) c.end({ ok: !!m.ok, error: m.error, errorKind: m.errorKind, result: m.result, toolCalls: m.toolCalls });
+      logDbg('stream-end: streamId=' + m.streamId + ' ok=' + !!m.ok + ' toolCalls=' + ((m.toolCalls && m.toolCalls.length) || 0) + ' resultLen=' + ((m.result && m.result.length) || 0));
     }
   }
 }
@@ -943,11 +947,48 @@ function sseChunk(res, obj) { res.write('data: ' + JSON.stringify(obj) + '\n\n')
 /** 判断流式首段文本是否像工具调用（提示工程 JSON——网页版无原生 function calling）。
  * 命中 → 该轮正文静默累计不转发（工具 JSON 不外泄进 content，
  * DSH 只应收到终态 tool_calls chunks）。
- * 误判代价 = 该轮退回一次性输出（终态全量补发），无正确性风险。 */
+ * 误判代价 = 该轮退回一次性输出（终态全量补发），无正确性风险。
+ *
+ * v2 修复：减少误判导致 silent 卡死——
+ * 1. 仅当文本以 ```tool_call 或 ```json 开头时才判定（模型被提示工程约束只输出这两种格式）
+ * 2. 裸 JSON（不以代码块开头）仅在同时含 name+args 且不含散文特征时判定
+ * 3. 排除代码块内的 JSON 示例（前面有文字说明的） */
 function looksLikeToolCallText(t) {
   const s = String(t || '').trim();
   if (!s) return false;
-  return /tool_call/i.test(s) || s.startsWith('{') || s.startsWith('[') || s.startsWith('```') || /^<tool_call>/i.test(s);
+  if (/tool_call/i.test(s)) return true;
+  if (/^<tool_call>function/.test(s)) return true;
+  /* ```tool_call 代码块：最明确的工具调用信号 */
+  if (/^```tool_call/i.test(s)) return true;
+  /* ```json 代码块：含 name+args 特征时判定为工具调用 */
+  if (/^```json/i.test(s)) {
+    const body = s.replace(/^```json\s*\n?/i, '');
+    if (/"name"\s*:/.test(body.slice(0, 500)) && (/"args"\s*:/.test(body.slice(0, 500)) || /"arguments"\s*:/.test(body.slice(0, 500)))) return true;
+    return false;
+  }
+  /* 无代码块的裸 JSON：仅当同时含 name+args 且无散文特征时判定。
+   * 散文特征（句号/换行+文字/Markdown 标题）= 模型在解释中引用 JSON 示例，
+   * 不是工具调用。这是 silent 卡死的主要误判来源。 */
+  if (s.startsWith('{')) {
+    const head = s.slice(0, 300);
+    const hasName = /"name"\s*:/.test(head);
+    const hasArgs = /"args"\s*:/.test(head) || /"arguments"\s*:/.test(head);
+    if (hasName && hasArgs) {
+      const hasProse = /\n[^"{\[\s]/.test(head) || /\.\s+[A-Z]/.test(head) || /^#{1,6}\s/.test(head);
+      if (!hasProse) return true;
+    }
+    try {
+      const obj = JSON.parse(s.length > 2000 ? s.slice(0, 2000) + '}' : s);
+      if (obj && (obj.tool !== undefined || obj.function !== undefined)) return true;
+    } catch (e) { /* incomplete JSON, already checked above */ }
+  }
+  if (s.startsWith('[')) {
+    try {
+      const arr = JSON.parse(s.length > 2000 ? s.slice(0, 2000) + ']' : s);
+      if (Array.isArray(arr) && arr.length > 0 && arr[0] && (arr[0].name !== undefined || arr[0].tool !== undefined)) return true;
+    } catch (e) { /* ignore */ }
+  }
+  return false;
 }
 /**
  * 处理 /v1/chat/completions（网关主流程，OpenAI 兼容契约的唯一实现点）。
@@ -981,6 +1022,8 @@ async function handleChatCompletion(req, res, payload) {
   let accContent = '';
   let toolMode = 'buffer';
   let toolBuf = '';
+  let silentStart = 0; /* silent 模式开始时间（超时回退 stream 用） */
+  const SILENT_TIMEOUT_MS = 60000; /* silent 模式最长等待 60s，超时回退 stream */
   let finished = false; /* 响应已结束（客户端断开检测用） */
   let curStreamId = null; /* driver 侧当前 streamId（客户端断开时停止生成） */
   const emitText = (t) => {
@@ -1074,7 +1117,7 @@ async function handleChatCompletion(req, res, payload) {
      * → 切号重试不会产生残留文本污染。 */
     const askOnce = async (profileName, askMode) => {
       /* 切号重试轮重置：新一轮从零累计（客户端看到上一轮已流出内容 + 本轮完整流式） */
-      accThinking = ''; accContent = ''; toolMode = 'buffer'; toolBuf = '';
+      accThinking = ''; accContent = ''; toolMode = 'buffer'; toolBuf = ''; silentStart = 0;
       /* 工具提示词：first/recovery 随首包注入（网页版此时是空白会话），
        * delta 不重复携带——网页版历史里已有首轮的工具说明。
        * 工具块由 buildContext 内嵌到 [用户] 之前（位置优化），不再单独传 driver。 */
@@ -1123,29 +1166,39 @@ async function handleChatCompletion(req, res, payload) {
               accContent += evt.delta;
               if (wantStream) {
                 if (toolMode === 'buffer') {
-                  /* v3b 真流式修复：工具 JSON 仅在开头暴露特征（{ / [ / ``` / tool_call /
-                   * <tool_call>），正常回答绝不以这些开头。据此：首段一旦不像工具调用，
-                   * 立即转 stream 并补发已缓冲首段，后续逐 delta 真流式——不再无条件憋
-                   * 120 字（短回复/逐字流开头被憋成大块一次发，是「等完整接收后一起输出」
-                   * 的主因）。仅当内容疑似工具调用才继续静默（silent），由终态 emitTool 发
-                   * 干净 tool_calls；误判代价 = 该轮退回一次性补全量补发，无正确性风险。
-                   * 400 字上限防止以 { 开头的正常代码/JSON 示例被永久憋死。 */
                   toolBuf += evt.delta;
                   if (looksLikeToolCallText(toolBuf) && toolBuf.length < 400) {
                     toolMode = 'silent';
+                    silentStart = Date.now();
+                    log('toolMode → silent (toolBuf[:80]=' + toolBuf.slice(0, 80).replace(/\n/g, '\\n') + ')');
                   } else {
                     toolMode = 'stream';
+                    log('toolMode → stream (toolBuf len=' + toolBuf.length + ')');
                     if (toolBuf) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: toolBuf }, finish_reason: null }] });
                   }
-                } else if (toolMode === 'stream') {
+                } else if (toolMode === 'silent') {
+                  /* silent 超时回退：如果 silent 模式持续超过 SILENT_TIMEOUT_MS，
+                   * 说明 driver 侧可能解析失败在重试，或模型输出的不是真正的工具调用。
+                   * 回退到 stream 模式，补发已缓冲的全部内容，避免客户端无限卡死。 */
+                  if (silentStart && Date.now() - silentStart > SILENT_TIMEOUT_MS) {
+                    log('toolMode silent timeout (' + Math.round(SILENT_TIMEOUT_MS / 1000) + 's), fallback → stream (accContentLen=' + accContent.length + ')');
+                    toolMode = 'stream';
+                    if (accContent) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: accContent }, finish_reason: null }] });
+                  }
+                }
+                if (toolMode === 'stream') {
                   sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: evt.delta }, finish_reason: null }] });
                 }
                 /* silent：工具 JSON 静默累计不转发（accContent 继续累计供终态对齐判断） */
               }
+              logDbg('delta kind=' + (evt.kind || 'content') + ' len=' + evt.delta.length + ' toolMode=' + toolMode + ' accContentLen=' + accContent.length);
             }
             continue;
           }
-          if (evt.ok !== undefined || evt.error !== undefined || evt.toolCalls !== undefined) break;
+          if (evt.ok !== undefined || evt.error !== undefined || evt.toolCalls !== undefined) {
+            log('stream-end received: ok=' + evt.ok + ' toolCalls=' + (evt.toolCalls ? evt.toolCalls.length : 0) + ' resultLen=' + (evt.result ? evt.result.length : 0) + ' toolMode=' + toolMode + ' accContentLen=' + accContent.length);
+            break;
+          }
         }
       } finally { clearTimeout(waitTimer); }
       d.consumers.delete(streamId);
@@ -1215,8 +1268,13 @@ async function handleChatCompletion(req, res, payload) {
       /* v3 真流式终态对齐：流式增量与终态 result 同为 cleanText 基准（driver 保证），
        * 公共前缀之后补发差异尾部（流式期间页面文本微调/尾部清理的兜底）。
        * 正文未流式（silent 工具误判回退 / buffer 未判定 / 非流式 / 无增量）
-       * → 全量输出，完整性优先。 */
-      if (wantStream && toolMode === 'stream' && accContent) {
+       * → 全量输出，完整性优先。
+       * silent 误判修复：toolMode=silent 但 toolCalls 为空 = 误判为工具调用，
+       * 此时 accContent 已累计全部文本但未转发客户端，必须全量补发。 */
+      if (wantStream && toolMode === 'silent' && !evt.toolCalls) {
+        log('silent misfire: toolCalls empty, emitting accContent (len=' + accContent.length + ')');
+        emitText(accContent || result);
+      } else if (wantStream && toolMode === 'stream' && accContent) {
         let i = 0;
         const n = Math.min(accContent.length, result.length);
         while (i < n && accContent.charCodeAt(i) === result.charCodeAt(i)) i++;

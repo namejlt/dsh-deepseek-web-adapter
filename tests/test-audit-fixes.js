@@ -89,9 +89,9 @@ check('H3 finished 后不再 stop（正常结束不误触发）', /if \(finished
 /* ---------- A/B. streamAsk 轮询逻辑（源码断言 + 行为模拟） ---------- */
 check('A1 超时且未见新文本 → 报错 stream-end(ok:false)', /if \(!firstSeen && !genSeen\) \{\s*\n\s*emitEvent\('stream-end', \{ streamId, ok: false, error: 'timeout:/.test(DRV_SRC));
 check('A2 lastText 初始化为空串（不再继承旧回复）', /let lastText = ''; \/\* 本轮新回复的累计文本/.test(DRV_SRC));
-check('B1 firstSeen 由 text !== beforeClean 触发（cleanText 基线变化检测）', /if \(text && !firstSeen && text !== beforeClean\) \{/.test(DRV_SRC));
-check('B2 首个 delta 发新回复全量', /emitEvent\('stream-delta', \{ streamId, delta: text \}\);/.test(DRV_SRC));
-check('B3 后续 delta 从新回复自身增量切片（变长才发增量，变短不回退 lastText）', /const grew = text\.length > lastText\.length;\s*\n\s*const delta = grew \? text\.slice\(lastText\.length\) : '';/.test(DRV_SRC));
+check('B1 firstSeen 由 deduped && text !== beforeClean 触发（cleanText 基线变化检测 + 去重后正文）', /if \(deduped && !firstSeen && text !== beforeClean\) \{/.test(DRV_SRC));
+check('B2 首个 delta 发新回复全量（去重后）', /emitEvent\('stream-delta', \{ streamId, delta: deduped \}\);/.test(DRV_SRC));
+check('B3 后续 delta 从 sentEnd 切片增量（变长才发增量，去重后偏移追踪）', /const grew = text\.length > lastText\.length;[\s\S]*?deduped\.slice\(sentEnd\)/.test(DRV_SRC));
 check('I1 三项探测 Promise.all 并行', /Promise\.all\(\[\s*\n\s*evalJs\(pageId, EXPR\.extractLast\)/.test(DRV_SRC));
 
 /* ---------- B 行为模拟：delta 序列正确性 ---------- */
