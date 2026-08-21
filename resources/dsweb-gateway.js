@@ -5,7 +5,7 @@
  *
  * API:
  *   POST /v1/chat/completions    OpenAI 兼容（流式 SSE，支持 tool_calls）
- *   GET  /v1/models              模型列表（deepseek-chat/reasoner/vision）
+ *   GET  /v1/models              模型列表（chat/reasoner/search/think-search/expert/expert-reasoner/vision/vision-reasoner）
  *   GET  /login                  有头登录（自动检测完成）
  *   GET  /login-status           登录状态
  *   POST /calibrate/record       开始校准（有头窗口 + 录制点击）
@@ -34,6 +34,7 @@ const { spawn } = require('child_process');
 
 /* ---------- 配置 ---------- */
 const args = process.argv.slice(2);
+/** 解析命令行参数：支持 `--name value` 与 `--name=value` 两种形式。 */
 function argVal(name) {
   const eq = args.find((a) => a.startsWith(name + '='));
   if (eq) return eq.slice(name.length + 1);
@@ -43,19 +44,65 @@ function argVal(name) {
 }
 const PORT = parseInt(argVal('--port') || '5688', 10) || 5688;
 const BASE_DIR = argVal('--base') || path.join(__dirname, '.gw');
-const DRIVER_PATH = argVal('--driver') || path.join(BASE_DIR, 'driver.js');
+/* DRIVER_PATH 默认指向 resources/driver.js（单一源码；测试/诊断均读此文件）。
+ * 历史上曾在 BASE_DIR 下维护一份 runtime/driver.js 副本，易与源分叉（修复失效），
+ * 现已统一为单一文件：网关直接执行源，本地数据仍经 DS_WEB_BASE=BASE_DIR 落在 runtime/。
+ * 可用 --driver 覆盖（向后兼容手动调试）。 */
+const DRIVER_PATH = argVal('--driver') || path.join(__dirname, 'driver.js');
 const DRIVER_MARKER = 'deepseek-web-driver.js';
 const CALIB_FILE = path.join(BASE_DIR, 'calibration.json');
-const state = { headless: false, maxConcurrent: 2, maxTurnsPerChat: 50, maxPages: 4, sessionTtlMs: 10 * 60 * 1000 };
+const ACCOUNTS_FILE = path.join(BASE_DIR, 'accounts.json');
+const state = {
+  headless: false, maxConcurrent: 2, maxTurnsPerChat: 50, maxPages: 4, sessionTtlMs: 10 * 60 * 1000,
+  /* 账号池（动态风控应对）：公平使用风控无固定数值/重置时间 → 只信页面信号 +
+   * 指数退避 + 探测恢复（SPEC-v2 §0/§5.1） */
+  accountPool: true, maxAccounts: 3, autoRelogin: true,
+  quotaBackoffBaseMs: 5 * 60 * 1000, quotaBackoffMaxMs: 6 * 60 * 60 * 1000,
+  quotaConfirmWindowMs: 10 * 60 * 1000, maxAccountSwitchesPerRequest: 2,
+};
 let gatewayStartTime = Date.now();
 let gatewayRequestCount = 0;
+/* 单次 streamAsk 结果等待兜底超时：driver 正常路径最长 ≈3×240s 重试 + 前置开销 ≈13min；
+ * 超此值视为 driver 卡死（防会话锁/信号量被挂起请求永久占用，SPEC-v2 稳定性） */
+const ASK_WAIT_TIMEOUT_MS = 20 * 60 * 1000;
+/* 全局生成并发槽位等待超时：并发上限被占满时，新请求在队列中最多等待这么久，
+ * 超时即明确报错返回（而非无限挂起——后者在 DSH 侧表现为「对话阻塞」）。
+ * 默认 120s：单账号下并发=2，一个慢生成（搜索+思考/工具循环）约数十秒，
+ * 120s 足以让前方请求释放槽位；若仍拿不到说明确有积压，明确告知优于静默卡死。 */
+const SEM_WAIT_TIMEOUT_MS = 120 * 1000;
 
+/* 模型映射（2026-08 页面重构：三模式入口 + pill 开关组合）：
+ *   模式入口三选一（applyConfig 幂等切换）：
+ *     quick  快速模式（V3）—— 可选 pill：深度思考、智能搜索（可同开）
+ *     expert 专家模式（R1 推理模型，原生输出 thinking）—— 可选 pill：深度思考
+ *     vision 识图模式 —— 可选 pill：深度思考
+ *   说明（三模式均可选深度思考，与 chat.deepseek.com 当前页面一致）：
+ *     - 深度思考 = 开启对应模式的"深度思考"pill：quick 下为 V3 增强 CoT；
+ *       expert/vision 下为在 R1 推理模型上开启深度思考。applyConfig 对三模式
+ *       均会尝试点击该 pill（pill 不存在时静默跳过，不告警）。
+ *     - 智能搜索 pill 仅 quick 入口提供；expert/vision 页面无此开关。
+ *   组合即模型（8 种，与官方 API 命名对齐）：
+ *     deepseek-chat             快速 V3（无附加开关，默认）
+ *     deepseek-reasoner        快速 V3 + 深度思考（quick 的 深度思考 pill，V3 增强 CoT）
+ *     deepseek-search           快速 V3 + 智能搜索
+ *     deepseek-think-search     快速 V3 + 深度思考 + 智能搜索（仅 quick 有搜索 pill）
+ *     deepseek-expert          专家模式（R1，原生思考输出）
+ *     deepseek-expert-reasoner 专家模式 + 深度思考（R1 上开启深度思考 pill）
+ *     deepseek-vision           识图（纯识图，不带思考）
+ *     deepseek-vision-reasoner  识图 + 深度思考（识图模式下开启深度思考 pill）
+ * driver 侧 applyConfig 幂等切换模式入口与 pill（先读状态不一致才点击）。 */
 const MODELS = {
-  'deepseek-chat': { name: 'DeepSeek V4 Flash', mode: 'quick', deepThink: false },
-  'deepseek-reasoner': { name: 'DeepSeek V4 Pro', mode: 'expert', deepThink: true },
-  'deepseek-vision': { name: 'DeepSeek 识图', mode: 'vision', deepThink: false },
+  'deepseek-chat':            { name: 'DeepSeek 快速（网页版）',          mode: 'quick',  deepThink: false, search: false },
+  'deepseek-reasoner':        { name: 'DeepSeek 深度思考（网页版）',      mode: 'quick',  deepThink: true,  search: false },
+  'deepseek-search':          { name: 'DeepSeek 智能搜索（网页版）',      mode: 'quick',  deepThink: false, search: true  },
+  'deepseek-think-search':    { name: 'DeepSeek 深度思考+搜索（网页版）', mode: 'quick',  deepThink: true,  search: true  },
+  'deepseek-expert':          { name: 'DeepSeek 专家（网页版）',          mode: 'expert', deepThink: false, search: false },
+  'deepseek-expert-reasoner': { name: 'DeepSeek 专家+深度思考（网页版）',  mode: 'expert', deepThink: true,  search: false },
+  'deepseek-vision':          { name: 'DeepSeek 识图（网页版）',          mode: 'vision', deepThink: false, search: false },
+  'deepseek-vision-reasoner': { name: 'DeepSeek 识图+深度思考（网页版）',  mode: 'vision', deepThink: true,  search: false },
 };
 
+/** 网关日志（带时间戳与 [gw] 前缀，stdout）。 */
 function log(...a) { console.log('[' + new Date().toISOString().slice(11, 19) + '][gw]', ...a); }
 
 /* ---------- driver 生命周期（单一常驻） ---------- */
@@ -66,11 +113,19 @@ let terminating = false;
  * 网页版会话历史已丢失，该会话下一个请求走 recovery 重建。 */
 let driverEpoch = 0;
 
+/** 确保 driver 进程存活（单例 Promise）：不存在/上次启动失败 → 重新拉起。
+ * 并发调用复用同一启动 Promise，失败时清空以便下次重试。 */
 function ensureDriver() {
   if (!driverPromise) driverPromise = spawnDriver().catch((e) => { driverPromise = null; throw e; });
   return driverPromise;
 }
 
+/** 启动 driver 子进程并建立 RPC 通道。
+ * - 校验 driver.js 完整性（DRIVER_MARKER）后以 stdio pipe 方式 spawn
+ * - 挂载 stdout（RPC 响应/事件分发）、stderr（日志转发）监听
+ * - 进程退出：拒绝全部在途 RPC、终结全部流消费者，1.5s 后自动 respawn
+ * - driverEpoch 递增：所有旧会话自动 epoch 失配 → 下轮 recovery 重建
+ * @returns {Promise<object>} 就绪后的 driver 连接对象（D） */
 function spawnDriver() {
   driverEpoch++;
   const src = fs.readFileSync(DRIVER_PATH, 'utf8');
@@ -104,6 +159,13 @@ function spawnDriver() {
   return waitReady(d, 20000).then(() => { log('driver ready pid=' + cp.pid); return d; });
 }
 
+/** driver stdout 数据分发（JSON-lines 协议解析）。
+ * 按行切分后路由四类消息：
+ * - RPC 响应（带 id）：resolve 对应 pending 请求
+ * - ready 事件：driver 初始化完成
+ * - stream-delta 事件：转发给对应流消费者（伪流式增量）
+ * - stream-end 事件：终结对应流消费者（携带 ok/errorKind/result/toolCalls）
+ * - channels-reset 事件：profile 切换通知，重置全部会话 epoch */
 function onData(d, chunk) {
   d.buffer += chunk;
   let i;
@@ -121,14 +183,21 @@ function onData(d, chunk) {
       d.ready = true;
     } else if (m.event === 'stream-delta' && m.streamId) {
       const c = d.consumers.get(m.streamId);
-      if (c) c.push(m.delta || '');
+      if (c) c.push(m.delta || '', m.kind);
+    } else if (m.event === 'channels-reset') {
+      /* driver 因 profile 切换重启浏览器：所有通道的网页版历史已销毁。
+       * 把全部会话标记为 epoch 失配 → 各会话下一请求强制 recovery 重建上下文，
+       * 否则 delta 增量发进空白页面，模型文不对题（profile 切换的连带伤害）。 */
+      log('driver 通道重置（profile ' + (m.from || '?') + ' → ' + (m.to || '?') + '）：全部会话转 recovery');
+      for (const s of sessions.values()) s.epoch = -1;
     } else if (m.event === 'stream-end' && m.streamId) {
       const c = d.consumers.get(m.streamId);
-      if (c) c.end({ ok: !!m.ok, error: m.error, result: m.result, toolCalls: m.toolCalls });
+      if (c) c.end({ ok: !!m.ok, error: m.error, errorKind: m.errorKind, result: m.result, toolCalls: m.toolCalls });
     }
   }
 }
 
+/** 轮询等待 driver 就绪（ready 事件），超时抛出（附带 stderr 尾部便于诊断）。 */
 function waitReady(d, timeoutMs) {
   return new Promise((resolve, reject) => {
     if (d.ready) return resolve();
@@ -137,6 +206,13 @@ function waitReady(d, timeoutMs) {
   });
 }
 
+/** 调用 driver RPC 方法（请求-响应模式，自增 id 关联）。
+ * 通过 stdin 写入 JSON 行，超时（默认 120s）或进程退出时 reject 并清理 pending。
+ * 流式方法（streamAsk）的增量结果不经此返回，而是走 makeConsumer 事件通道。
+ * @param {string} method RPC 方法名
+ * @param {object} params 参数
+ * @param {number} [timeoutMs] 超时毫秒
+ * @returns {Promise<any>} driver 返回的 result */
 function rpc(method, params, timeoutMs) {
   return ensureDriver().then((d) => new Promise((resolve, reject) => {
     const id = ++d.seq;
@@ -147,10 +223,18 @@ function rpc(method, params, timeoutMs) {
   }));
 }
 
+/** 创建流式事件消费者（streamAsk 的增量/结束事件通道）。
+ * push(delta, kind)：driver 侧 stream-delta 到达时入队（或唤醒等待者）；
+ *   kind='thinking' 为思考流增量（网关转 reasoning_content），缺省为正文增量；
+ * end(info)：stream-end 到达，终结消费者（info 含 ok/errorKind/result/toolCalls）；
+ * next()：异步取下一个事件（delta 或结束信息），供 askOnce 循环消费。
+ * 内部队列 + 等待者数组实现，事件先到与先等均正确。
+ * @param {object} d driver 连接
+ * @param {string} streamId driver 侧流标识 */
 function makeConsumer(d, streamId) {
   const c = {
     q: [], w: [], ended: false, endInfo: null,
-    push(delta) { if (this.ended) return; const w = this.w.shift(); if (w) w({ delta }); else this.q.push({ delta }); },
+    push(delta, kind) { if (this.ended) return; const w = this.w.shift(); if (w) w({ delta, kind }); else this.q.push({ delta, kind }); },
     end(info) { if (this.ended) return; this.ended = true; this.endInfo = info; const w = this.w.shift(); if (w) w(info); },
     next() { if (this.q.length) return Promise.resolve(this.q.shift()); if (this.ended) return Promise.resolve(this.endInfo || { ok: false }); return new Promise((r) => this.w.push(r)); },
   };
@@ -158,12 +242,281 @@ function makeConsumer(d, streamId) {
   return c;
 }
 
+/* ---------- 账号池（多账号 · 限流自动切换核心，SPEC-v2 §5.1/§5.2） ----------
+ * 动态风控原则（§0）：无固定配额数值、无固定解冻时间 →
+ *  - 受限信号只来自 driver streamAsk 的 errorKind（页面文案检测）
+ *  - 恢复策略 = 指数退避（base×2^(n-1) 封顶 max）+ 探测恢复（到期后由真实请求探测）
+ * 状态机：active →（二次 quota 确认）→ cooling →（到期）→ probing →（请求成功）→ active
+ *          needs_login（登录失效）/ disabled（captcha 或手动禁用，转人工）
+ * 落盘 runtime/accounts.json：只含名字/状态/统计，不含任何凭据（FF8）。
+ * accountPool=false → 完全旁路（恒用 default，v1 行为）。 */
+const pool = {
+  accounts: new Map(), // name -> acct 记录
+  loginBusy: null,     /* 登录互斥：同时只允许一个登录窗口（Promise 链） */
+};
+
+/** 新建账号记录（内部）。 */
+function newAcct(name) {
+  return {
+    name, state: 'active', addedAt: Date.now(),
+    backoffCount: 0, cooldownUntil: 0, quotaHits: 0, lastQuotaAt: 0,
+    lastUsedAt: 0, requestCount: 0,
+  };
+}
+
+/** 账号池落盘（原子写：tmp + rename，防写一半损坏）。 */
+function poolSave() {
+  try {
+    const data = { version: 1, accounts: [...pool.accounts.values()].map((a) => ({
+      name: a.name, state: a.state, addedAt: a.addedAt, backoffCount: a.backoffCount,
+      cooldownUntil: a.cooldownUntil, quotaHits: a.quotaHits, lastQuotaAt: a.lastQuotaAt,
+      lastUsedAt: a.lastUsedAt, requestCount: a.requestCount,
+    })) };
+    const tmp = ACCOUNTS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    fs.renameSync(tmp, ACCOUNTS_FILE);
+  } catch (e) { log('accounts.json 落盘失败: ' + e.message); }
+}
+
+/** 账号池加载（启动时；损坏/缺失 → 仅 default）。 */
+function poolLoad() {
+  pool.accounts.clear();
+  try {
+    const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    for (const a of data.accounts || []) {
+      if (!a || !a.name) continue;
+      const acct = newAcct(a.name);
+      Object.assign(acct, {
+        state: ['active', 'cooling', 'probing', 'needs_login', 'disabled'].includes(a.state) ? a.state : 'active',
+        addedAt: a.addedAt || Date.now(), backoffCount: a.backoffCount || 0,
+        cooldownUntil: a.cooldownUntil || 0, quotaHits: a.quotaHits || 0,
+        lastQuotaAt: a.lastQuotaAt || 0, lastUsedAt: a.lastUsedAt || 0,
+        requestCount: a.requestCount || 0,
+      });
+      pool.accounts.set(acct.name, acct);
+    }
+    log('账号池加载: ' + [...pool.accounts.values()].map((a) => a.name + '(' + a.state + ')').join(', '));
+  } catch (e) { /* 首次运行无文件 */ }
+  if (!pool.accounts.size) pool.accounts.set('default', newAcct('default'));
+}
+
+/** 当前退避时长（指数：base × 2^(n-1)，封顶 max）。 */
+function backoffMs(count) {
+  const b = Math.max(60000, state.quotaBackoffBaseMs);
+  const m = Math.max(b, state.quotaBackoffMaxMs);
+  return Math.min(b * Math.pow(2, Math.max(0, count - 1)), m);
+}
+
+/** 惰性状态刷新：cooling 到期 → probing（探测候选，可被调度选中）。 */
+function poolRefresh(acct) {
+  if (acct.state === 'cooling' && Date.now() >= acct.cooldownUntil) {
+    acct.state = 'probing';
+    log('账号 ' + acct.name + ' 退避到期 → probing（探测候选）');
+  }
+  return acct;
+}
+
+/**
+ * 受限信号处理（动态风控核心）。
+ * 退避次数语义：backoffCount = 已进入 cooling 的次数（首次确认=1 → base，之后每次翻倍）。
+ * - 首次（active 且窗口外）：仅 suspect 标记（调度时窗口内绕开），保持 active——单次疑似不中断服务
+ * - 窗口内二次确认（active）：第 1 次退避 → cooling(base)
+ * - probing 探测失败：backoffCount++ → cooling(base×2^(n-1))
+ * - cooling 中收到信号（在途旧请求残留）：只刷新 lastQuotaAt，不延长退避
+ * @param {string} name 账号名
+ */
+function poolMarkQuota(name) {
+  const a = pool.accounts.get(name);
+  if (!a) return null;
+  const now = Date.now();
+  a.quotaHits++;
+  const inWindow = now - a.lastQuotaAt < state.quotaConfirmWindowMs;
+  a.lastQuotaAt = now;
+  if (a.state === 'probing') {
+    a.backoffCount += 1;
+    a.state = 'cooling';
+    a.cooldownUntil = now + backoffMs(a.backoffCount);
+    log('账号 ' + name + ' 探测失败 → cooling ' + Math.round(backoffMs(a.backoffCount) / 60000) + 'min（退避第 ' + a.backoffCount + ' 次）');
+  } else if (a.state === 'active' && inWindow) {
+    a.backoffCount = Math.max(1, a.backoffCount + 1);
+    a.state = 'cooling';
+    a.cooldownUntil = now + backoffMs(a.backoffCount);
+    log('账号 ' + name + ' 受限二次确认 → cooling ' + Math.round(backoffMs(a.backoffCount) / 60000) + 'min（退避第 ' + a.backoffCount + ' 次，到期 ' + new Date(a.cooldownUntil).toISOString().slice(11, 19) + '）');
+  } else if (a.state === 'active') {
+    log('账号 ' + name + ' 首次受限信号（' + Math.round(state.quotaConfirmWindowMs / 60000) + 'min 内再现才确认 cooling）');
+  } else {
+    log('账号 ' + name + ' 收到受限信号（当前 ' + a.state + '，不改变退避）');
+  }
+  poolSave();
+  return a;
+}
+
+/** 请求成功（probing 探测成功 / 登录恢复 / 正常使用）：清零退避回 active（disabled 不自动恢复）。 */
+function poolMarkOk(name) {
+  const a = pool.accounts.get(name);
+  if (!a) return;
+  if (a.state !== 'active' && a.state !== 'disabled') {
+    log('账号 ' + name + '（' + a.state + '）恢复 → active（退避清零）');
+    a.state = 'active';
+    a.backoffCount = 0;
+    a.cooldownUntil = 0;
+    a.lastQuotaAt = 0; /* suspect 窗口一并清除 */
+  }
+  a.lastUsedAt = Date.now();
+  a.requestCount++;
+  poolSave(); /* 统计持久化：重启后 requestCount/lastUsedAt 不回退 */
+}
+
+/** captcha / 登录失效标记。kind='captcha' → disabled（转人工）；'login' → needs_login。 */
+function poolMarkDown(name, kind) {
+  const a = pool.accounts.get(name);
+  if (!a) return;
+  a.state = kind === 'captcha' ? 'disabled' : 'needs_login';
+  log('账号 ' + name + ' → ' + a.state + (kind === 'captcha' ? '（验证码，转人工，可通过 /accounts/enable 重新启用）' : '（登录失效）'));
+  poolSave();
+}
+
+/** 账号管理操作（/accounts API 用）。 */
+function poolAdd(name) {
+  if (!name || !/^[\w-]{1,32}$/.test(name)) throw new Error('账号名无效（字母数字-_，≤32 字符）');
+  if (pool.accounts.has(name)) throw new Error('账号已存在: ' + name);
+  if (pool.accounts.size >= state.maxAccounts) throw new Error('账号数已达上限 ' + state.maxAccounts + '（可通过 /config 调大 maxAccounts）');
+  const a = newAcct(name);
+  a.state = 'needs_login'; /* 新账号需先登录 */
+  pool.accounts.set(name, a);
+  poolSave();
+  return a;
+}
+function poolRemove(name, confirm) {
+  const a = pool.accounts.get(name);
+  if (!a) throw new Error('账号不存在: ' + name);
+  if (name === 'default') throw new Error('default 账号不可删除（可 disable）');
+  if (!confirm) throw new Error('需 confirm=true（将删除该账号的浏览器 profile 目录，登录态不可恢复）');
+  pool.accounts.delete(name);
+  poolSave();
+  return a;
+}
+function poolSetEnabled(name, enabled) {
+  const a = pool.accounts.get(name);
+  if (!a) throw new Error('账号不存在: ' + name);
+  a.state = enabled ? 'needs_login' : 'disabled'; /* 启用后需登录验证 */
+  poolSave();
+  return a;
+}
+
+/** 可用性判定：active/probing 且不在二次确认窗口内（窗口内 = 刚收到首次信号，优先绕开）。 */
+function poolUsable(a) {
+  poolRefresh(a);
+  if (a.state !== 'active' && a.state !== 'probing') return false;
+  if (a.state === 'active' && a.lastQuotaAt && Date.now() - a.lastQuotaAt < state.quotaConfirmWindowMs) return false;
+  return true;
+}
+
+/**
+ * 调度选账号（SPEC-v2 §5.2）：sticky > 当前浏览器 profile（避免重启）> lastUsedAt 最旧。
+ * profile 乒乓问题：单浏览器多账号下，若每次都轮转选不同账号，driver 会反复
+ * 重启浏览器（每次 ~5-10s 且销毁全部通道历史）。调度优先当前 profile（currentProfile）
+ * 中的可用账号，仅在切换重试（账号受限）时才真正换 profile。
+ * @param {string} [stickyName] 会话粘性账号（其可用则优先，保网页版历史）
+ * @param {Set<string>} [exclude] 本请求已试过且失败的账号（切换重试时排除）
+ * @returns {object|null} 账号记录；null = 无可用
+ */
+let currentProfile = 'default'; /* driver 当前浏览器绑定的 profile（最近一次成功请求的账号） */
+function poolPick(stickyName, exclude) {
+  if (!state.accountPool) {
+    const d = pool.accounts.get('default');
+    return d || null;
+  }
+  if (stickyName) {
+    const s = pool.accounts.get(stickyName);
+    if (s && poolUsable(s) && !(exclude && exclude.has(s.name))) return s;
+  }
+  let best = null;
+  let bestCur = null;
+  for (const a of pool.accounts.values()) {
+    if (!poolUsable(a)) continue;
+    if (exclude && exclude.has(a.name)) continue;
+    if (!best || a.lastUsedAt < best.lastUsedAt) best = a;
+    if (a.name === currentProfile && (!bestCur || a.lastUsedAt < bestCur.lastUsedAt)) bestCur = a;
+  }
+  /* 当前浏览器 profile 的账号可用 → 优先（避免 profile 切换重启浏览器） */
+  return bestCur || best;
+}
+
+/** 最早退避到期时间（全受限时给用户的提示信息用）。 */
+function poolEarliestRetry() {
+  let min = null;
+  for (const a of pool.accounts.values()) {
+    if (a.state !== 'cooling' && a.state !== 'probing') continue;
+    poolRefresh(a);
+    if (a.state !== 'cooling') continue;
+    if (!min || a.cooldownUntil < min.cooldownUntil) min = a;
+  }
+  return min;
+}
+
+/** 账号池状态描述（/accounts、/health）。 */
+function poolDescribe() {
+  return {
+    enabled: state.accountPool,
+    total: pool.accounts.size,
+    accounts: [...pool.accounts.values()].map((a) => {
+      poolRefresh(a);
+      return {
+        name: a.name, state: a.state, backoffCount: a.backoffCount,
+        cooldownRemainMs: a.state === 'cooling' ? Math.max(0, a.cooldownUntil - Date.now()) : 0,
+        quotaHits: a.quotaHits, requestCount: a.requestCount,
+        lastUsedAt: a.lastUsedAt, suspectWindowMs: (a.state === 'active' && a.lastQuotaAt && Date.now() - a.lastQuotaAt < state.quotaConfirmWindowMs) ? state.quotaConfirmWindowMs - (Date.now() - a.lastQuotaAt) : 0,
+      };
+    }),
+  };
+}
+
+/** 登录互斥（同时只一个登录窗口）：串行执行登录 rpc。 */
+function poolLogin(name, timeoutMs) {
+  const prev = pool.loginBusy || Promise.resolve();
+  let done;
+  pool.loginBusy = new Promise((r) => { done = r; });
+  return prev.then(() => rpc('login', { profile: name, timeoutMs }, timeoutMs + 15000))
+    .finally(() => { done(); });
+}
+
+poolLoad();
+
 /* ---------- 并发信号量 ---------- */
 let semActive = 0;
 const semQueue = [];
-function acquireSem() {
-  if (semActive < state.maxConcurrent) { semActive++; return Promise.resolve(() => { semActive--; const n = semQueue.shift(); if (n) n(); }); }
-  return new Promise((resolve) => semQueue.push(() => { semActive++; resolve(() => { semActive--; const n = semQueue.shift(); if (n) n(); }); }));
+/* P0 单浏览器模型：多账号时切换 profile 需重启浏览器 → 全局串行；
+ * 单账号（或账号池关闭）保持 v1 并发不变（FF1）。P1 多 Chrome 实例后放开。 */
+/** 实际生效的并发上限：多账号时退化为 1（单浏览器切 profile 需重启，并发切换会互踩）。 */
+function effectiveConcurrent() {
+  return (state.accountPool && pool.accounts.size > 1) ? 1 : state.maxConcurrent;
+}
+/** 槽位释放函数（统一实现，供即时获取与排队获取复用）。 */
+function makeSemRelease() {
+  return () => { semActive--; const n = semQueue.shift(); if (n) n(); };
+}
+/** 获取全局生成并发槽位（FIFO 排队，带超时）。
+ * - 拿到槽位：返回释放函数，槽位归还时唤醒队首等待者；
+ * - 槽位满且 timeoutMs 内未获槽位：reject('concurrency-full')，
+ *   调用方据此明确报错返回（而非无限挂起 → DSH 侧「对话阻塞」）。
+ * @param {number} [timeoutMs] 排队超时（毫秒）；≤0 或不传则无限等待（兼容旧行为） */
+function acquireSem(timeoutMs) {
+  if (semActive < effectiveConcurrent()) { semActive++; return Promise.resolve(makeSemRelease()); }
+  if (!timeoutMs || timeoutMs <= 0) {
+    return new Promise((resolve) => semQueue.push(() => { semActive++; resolve(makeSemRelease()); }));
+  }
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const release = makeSemRelease();
+    const waiter = () => { if (timer) { clearTimeout(timer); timer = null; } semActive++; resolve(release); };
+    timer = setTimeout(() => {
+      const i = semQueue.indexOf(waiter);
+      if (i >= 0) semQueue.splice(i, 1);
+      reject(new Error('concurrency-full'));
+    }, timeoutMs);
+    semQueue.push(waiter);
+  });
 }
 
 /* ---------- 会话注册表（并发核心：会话亲和 + 页面通道） ----------
@@ -200,6 +553,7 @@ function sessionFingerprint(payload) {
     if (m.role !== 'user') continue;
     const text = blockText(m.content);
     if (!text || isRuntimeContext(text)) continue;
+    if (text.indexOf('Current runtime context') === 0) continue; /* ctx 失配兜底：防指纹漂移 */
     firstUser = text;
     break;
   }
@@ -282,6 +636,7 @@ async function resolveSession(payload) {
   const s = {
     id: 's' + (++sessionSeq), pageKey, fpFull: fp.full, fpLoose: fp.loose,
     epoch: driverEpoch, busy: false, lock: null, lastSeen: Date.now(),
+    acctName: null, /* 会话-账号粘性绑定（SPEC-v2 §5.2 调度第 1 步） */
   };
   sessions.set(s.id, s);
   log('新会话: ' + s.id + ' 通道=' + pageKey + '（活跃通道 ' + activeChannelCount() + '/' + state.maxPages + '）');
@@ -310,6 +665,9 @@ setInterval(() => {
 }, 60000).unref();
 
 /* ---------- 提示词组装 ---------- */
+/** 把 OpenAI 多模态消息内容（string / blocks 数组）压成纯文本。
+ * text 块取文本；tool-call 块压成占位标记；tool-result 块截断到 2000 字
+ * （网页版输入框对超长文本发送失败，工具结果只需模型知道要点）。 */
 function blockText(b) {
   if (typeof b === 'string') return b;
   if (Array.isArray(b)) return b.map(blockText).filter(Boolean).join('\n');
@@ -322,11 +680,17 @@ function blockText(b) {
   return '';
 }
 
+/** 识别 DSH 注入的 runtime context 快照消息。
+ * 文案随 approval 策略变化：ask → "Approval policy: ..."；
+ * never → "Approval prompts are disabled ..."（不含 "Approval policy" 字样）。
+ * 判定改为多特征任一命中——单一关键词失配曾导致 ctx 被误当用户消息、
+ * 首轮用户问题丢失（模型只回"运行环境信息已更新"）。 */
 function isRuntimeContext(text) {
-  return typeof text === 'string' &&
-    text.indexOf('Current runtime context') === 0 &&
-    text.indexOf('DSH file policy') > 0 &&
-    text.indexOf('Approval policy') > 0;
+  if (typeof text !== 'string' || text.indexOf('Current runtime context') !== 0) return false;
+  return text.indexOf('runtime-context snapshot') > 0 ||
+    text.indexOf('DSH file policy') > 0 ||
+    text.indexOf('Approval policy') > 0 ||
+    text.indexOf('Approval prompts are disabled') > 0;
 }
 
 /** 超长文本截断（网页版输入框对超长文本会发送失败，必须限长保护）。 */
@@ -370,7 +734,7 @@ function extractBaseline(msgs) {
  * @param {string} mode first | delta | recovery
  * @returns {string} 发送给网页版的文本（空串表示无可发送内容）
  */
-function buildContext(payload, mode) {
+function buildContext(payload, mode, toolsText) {
   const msgs = payload.messages || [];
   if (mode === 'first' || mode === 'recovery') {
     const { sysText, ctxText } = extractBaseline(msgs);
@@ -384,23 +748,36 @@ function buildContext(payload, mode) {
         if (m.role === 'system' || m.role === 'developer') continue;
         const text = blockText(m.content);
         if (!text || isRuntimeContext(text)) continue;
+        if (text.indexOf('Current runtime context') === 0) continue; /* ctx 失配兜底：不进压缩历史 */
         const tag = m.role === 'user' ? '[用户]' : m.role === 'assistant' ? '[助手]' : '[工具结果]';
         body.push(tag + '\n' + clipText(text, m.role === 'assistant' ? 400 : 800, m.role));
       }
       if (body.length) {
         parts.push('[此前的对话（网页会话中断，以下是压缩后的记录，请据此继续）]\n' + clipText(body.slice(-10).join('\n\n'), 8000, '对话历史'));
       }
+      /* 工具协议块放最后（紧邻回复点）：sys → ctx → 历史 → 工具 */
+      if (toolsText) parts.push(toolsText);
     } else {
-      /* 首轮：取最后一条真正的用户消息（跳过 runtime context 消息） */
-      let userText = '';
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        if (msgs[i].role !== 'user') continue;
-        const text = blockText(msgs[i].content);
+      /* 首轮：收集 ALL 非 system/runtime-context 的 user/tool 消息（按时间顺序）。
+       * 旧版只取最后一条 user——DSH 首轮发多条 user 消息（如"项目背景"+
+       * "参考资料"+"实际问题"）时前面全丢，上下文不完整导致模型回答驴唇不对马嘴。
+       * isRuntimeContext + 字符串前缀双保险，绝不把 runtime ctx 当用户输入。 */
+      const body = [];
+      for (const m of msgs) {
+        if (m.role === 'system' || m.role === 'developer') continue;
+        const text = blockText(m.content);
         if (!text || isRuntimeContext(text)) continue;
-        userText = text;
-        break;
+        if (text.indexOf('Current runtime context') === 0) continue;
+        const tag = m.role === 'user' ? '[用户]' : m.role === 'tool' ? '[工具结果]' : '[' + m.role + ']';
+        body.push(tag + '\n' + text);
       }
-      if (userText) parts.push('[用户]\n' + userText);
+      if (body.length) parts.push(body.join('\n\n'));
+      /* 工具协议块插在回复点（body 最后一段消息）之前：格式指令离回复点最近，
+       * 注意力最强，工具协议遵守率最高；无 body 则直接追加。 */
+      if (toolsText) {
+        if (body.length) parts.splice(parts.length - 1, 0, toolsText);
+        else parts.push(toolsText);
+      }
     }
     return parts.join('\n\n');
   }
@@ -413,6 +790,7 @@ function buildContext(payload, mode) {
     if (m.role === 'system' || m.role === 'developer') continue;
     const text = blockText(m.content);
     if (isRuntimeContext(text)) continue; /* 轮中更新的 runtime context：跳过，继续找真正的输入 */
+    if (text && text.indexOf('Current runtime context') === 0) continue; /* ctx 失配兜底 */
     if (!text && m.role !== 'tool') continue;
     const tag = m.role === 'user' ? '[用户]' : m.role === 'tool' ? '[工具结果]' : '[' + m.role + ']';
     return tag + '\n' + text;
@@ -420,11 +798,54 @@ function buildContext(payload, mode) {
   return '';
 }
 
+/**
+ * 组装工具提示词（提示工程核心——模型只靠这段话学会工具调用协议）。
+ * 优化点（相对旧版）：
+ *   1. 每工具描述压缩（句子边界截断 ~110 字）——30+ 工具时全部工具名保得住，
+ *      旧版不裁剪描述靠 driver 端全局截断，尾部工具被整体截掉（模型不知道它们存在）；
+ *   2. 参数带类型与枚举：`file_path(必填,string)` / `mode(string: fast|slow)`，
+ *      旧版只有名字，模型猜不到值类型；
+ *   3. 示例从真实工具生成（取参数最少的）——旧版硬编码 "write" 工具 + Windows
+ *      路径，不在工具列表里 = 邀请幻觉调用；
+ *   4. 说明 [工具结果] 回传标签（delta 轮以此标记，模型需提前建立对应关系）；
+ *   5. 明确"无需工具直接文本回答"分支，防过度调用；
+ *   6. 总预算 5500：先压描述、再砍示例，工具清单永不牺牲。
+ * @param {Array} tools OpenAI tools 数组
+ * @returns {string} 工具提示词（无工具返回空串）
+ */
 function buildToolsText(tools) {
   if (!tools || !tools.length) return '';
   const FENCE = '```';
-  const lines = [
-    '你可以调用工具来完成用户任务。工具会自动执行，不需要担心权限问题——直接调用即可。',
+  const BUDGET = 5500;
+
+  /* 单工具描述压缩：首句优先，超长截到句子/标点边界 */
+  function clipDesc(s, max) {
+    const t = String(s || '').trim().replace(/\s+/g, ' ');
+    if (t.length <= max) return t;
+    const cut = t.slice(0, max);
+    const m = cut.match(/^(.*[。.!?;；])/); /* 最后一个句末标点 */
+    return (m && m[1].length > max * 0.5 ? m[1] : cut) + '…';
+  }
+
+  /* 参数规格：name(必填,type) / name(string: a|b|c) */
+  function paramSpec(fn) {
+    try {
+      const props = (fn.parameters && fn.parameters.properties) || {};
+      const req = (fn.parameters && fn.parameters.required) || [];
+      const specs = Object.keys(props).map((k) => {
+        const p = props[k] || {};
+        let s = k + (req.includes(k) ? '(必填,' : '(') + (p.type || 'any');
+        if (Array.isArray(p.enum) && p.enum.length) {
+          s += ':' + p.enum.slice(0, 5).map(String).join('|') + (p.enum.length > 5 ? '|…' : '');
+        }
+        return s + ')';
+      });
+      return specs.length ? '  参数: ' + specs.join(', ') : '';
+    } catch (e) { return ''; }
+  }
+
+  const head = [
+    '你可以调用工具来完成用户任务。工具由系统执行，你只负责输出调用指令。',
     '',
     '当你需要调用工具时，你的整个回复必须 ONLY 是一个 tool_call 代码块——前后不要有任何文字、解释或标点：',
     '',
@@ -432,126 +853,398 @@ function buildToolsText(tools) {
     '{',
     '  "name": "工具名",',
     '  "args": {',
-    '    "参数1": "值1"',
+    '    "参数": "值"',
     '  }',
     '}',
     FENCE,
     '',
     '关键规则：',
-    '- 调用工具时整个回复 ONLY 代码块（无散文）。任务完成后才用纯文本回答。',
-    '- 一次只调用一个工具。',
-    '- 必须包含 "name" 和 "args" 两个键。',
-    '- 收到工具结果后，继续调用下一个工具或给出最终回答。',
+    '- 需要工具时整个回复 ONLY 代码块（无散文）；不需要工具时直接用纯文本回答。',
+    '- 一次只调用一个工具。必须包含 "name" 和 "args" 两个键，参数值类型按下方标注。',
+    '- 工具执行结果会以 [工具结果] 标签回传给你；收到后继续调用下一个工具或给出最终回答。',
+    '- 任务完成后用纯文本作答（不要输出代码块）。',
     '',
     '可用工具：',
   ];
-  for (const t of tools) {
-    const fn = t.function || t;
-    lines.push('- ' + (fn.name || '?') + ': ' + (fn.description || ''));
-    if (fn.parameters && fn.parameters.properties) {
-      try {
-        const props = fn.parameters.properties;
-        const req = (fn.parameters.required) || [];
-        lines.push('  参数: ' + Object.keys(props).map((k) => k + (req.includes(k) ? '(必填)' : '')).join(', '));
-      } catch (e) { /* ignore */ }
+
+  /* 工具清单构建（descMax 控制描述与参数行的保留度，供渐进降级）：
+   * 110=全量描述+参数；30=短描述+参数；0=仅工具名。
+   * 渐进降级保证总长受 BUDGET 硬上限约束——旧实现 body 无上限，30+ 工具时
+   * 总长轻松破万，触发网页版超长发送失败（toolsText 6000 截断的教训）。 */
+  const buildBody = (descMax) => {
+    const lines = [];
+    for (const t of tools) {
+      const fn = t.function || t;
+      lines.push('- ' + (fn.name || '?') + (descMax > 0 ? ': ' + clipDesc(fn.description, descMax) : ''));
+      if (descMax > 0) {
+        const ps = paramSpec(fn);
+        if (ps) lines.push(ps);
+      }
     }
+    return head.join('\n') + '\n' + lines.join('\n');
+  };
+  let body = buildBody(110);
+  if (body.length > BUDGET) body = buildBody(30);
+  if (body.length > BUDGET) body = buildBody(0);
+
+  /* 示例：从真实工具生成（参数最简单的优先），构造类型合法的 args */
+  function realExample() {
+    let best = null;
+    let bestN = Infinity;
+    for (const t of tools) {
+      const fn = t.function || t;
+      if (!fn.name) continue;
+      const props = (fn.parameters && fn.parameters.properties) || {};
+      const req = (fn.parameters && fn.parameters.required) || [];
+      /* 只要必填参数个数最少的（且 ≤3，示例简洁） */
+      if (req.length < bestN && req.length <= 3) { best = { fn, props, req }; bestN = req.length; }
+    }
+    if (!best) return '';
+    const args = {};
+    for (const k of best.req) {
+      const p = best.props[k] || {};
+      if (Array.isArray(p.enum) && p.enum.length) args[k] = p.enum[0];
+      else if (p.type === 'number' || p.type === 'integer') args[k] = 1;
+      else if (p.type === 'boolean') args[k] = false;
+      else if (p.description) args[k] = String(p.description).slice(0, 20); /* 描述当值：比"示例值"更有信息量 */
+      else args[k] = '示例值';
+    }
+    return FENCE + 'tool_call\n' + JSON.stringify({ name: best.fn.name, args }, null, 2) + '\n' + FENCE;
   }
-  lines.push('', '示例（写桌面文件）：' + FENCE + 'tool_call\n{"name": "write", "args": {"file_path": "C:\\\\Users\\\\hp\\\\Desktop\\\\test.txt", "content": "你好"}}\n' + FENCE);
-  return lines.join('\n');
+
+  const example = realExample();
+  /* 预算控制：超限时牺牲示例（工具清单永不截断——名字不可见=模型不会用） */
+  if (body.length + example.length + 20 > BUDGET) {
+    return body + '\n（工具说明已达长度上限，省略示例；严格按上方格式输出）';
+  }
+  return body + '\n\n调用示例（真实工具）：\n' + example;
 }
 
 /* ---------- SSE 输出 ---------- */
+/** 写 SSE 响应头（text/event-stream，附 CORS）。只能在响应开始前调用一次
+ * —— headersSent 守卫依赖此约定（异常路径二次 writeHead 会抛错导致连接悬挂）。 */
 function sseHeaders(res) {
   cors(res);
-  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    /* no-transform 防反代压缩改写 SSE 帧；no-cache 防中间缓存 */
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    /* 禁用 nginx 等反代缓冲 SSE：否则多包被合并成大块，表现为「内容攒齐后一起输出」 */
+    'X-Accel-Buffering': 'no',
+  });
+  /* 禁用 Nagle 算法：每个 chunk 立即发包，避免小帧被 TCP 合并导致流式延迟 */
+  if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true);
 }
+/** 写一条 SSE data 帧（OpenAI chunk 格式由调用方构造）。 */
 function sseChunk(res, obj) { res.write('data: ' + JSON.stringify(obj) + '\n\n'); }
 
 /* ---------- 核心：一次模型调用 ---------- */
+/** 判断流式首段文本是否像工具调用（提示工程 JSON——网页版无原生 function calling）。
+ * 命中 → 该轮正文静默累计不转发（工具 JSON 不外泄进 content，
+ * DSH 只应收到终态 tool_calls chunks）。
+ * 误判代价 = 该轮退回一次性输出（终态全量补发），无正确性风险。 */
+function looksLikeToolCallText(t) {
+  const s = String(t || '').trim();
+  if (!s) return false;
+  return /tool_call/i.test(s) || s.startsWith('{') || s.startsWith('[') || s.startsWith('```') || /^<tool_call>/i.test(s);
+}
+/**
+ * 处理 /v1/chat/completions（网关主流程，OpenAI 兼容契约的唯一实现点）。
+ * 流程：会话识别 → 会话锁/信号量 → 账号调度 → askOnce 循环
+ * （buildContext + rpc streamAsk + 等 stream-end，errorKind 触发换号 recovery 重试）
+ * → SSE/JSON 输出 → 释放资源。
+ * 关键防线：非流式聚合 JSON；客户端断开停止生成；异常路径 epoch=-1 + [DONE]；
+ * askOnce 20min 兜底超时（防 driver 卡死锁死会话锁）。
+ * @param {object} req HTTP 请求
+ * @param {object} res HTTP 响应
+ * @param {object} payload 已解析的请求体（model/messages/tools/stream）
+ */
 async function handleChatCompletion(req, res, payload) {
   const model = payload.model || 'deepseek-chat';
   const cfg = MODELS[model] || MODELS['deepseek-chat'];
   const created = Math.floor(Date.now() / 1000);
   const cid = 'chatcmpl-' + created;
+  /* OpenAI 兼容：stream=false → 完整 JSON 响应（旧实现一律 SSE，非流式客户端解析必炸） */
+  const wantStream = payload.stream !== false;
   const sendChunk = (obj) => sseChunk(res, obj);
+  /* 输出抽象：流式边收集边推送；非流式只收集，最后一次性 JSON 返回 */
+  const out = { text: '', tools: [] };
+  /* v3 真流式状态（askOnce 每轮重置；finish 闭包读取 accThinking——必须在 finish
+   * 定义前声明，防"无可用账号"等提前 finish 路径触发 TDZ）：
+   * - accThinking：思考累计（reasoning_content，DeepSeek 官方 API 字段）
+   * - accContent：本轮正文累计（终态前缀对齐补尾的基准）
+   * - toolMode：buffer=攒首段判工具 / stream=正文直通 / silent=像工具 JSON 静默累计
+   *   （网页版工具调用是提示工程 JSON 文本，外泄进 content 会污染 DSH 显示）
+   * - toolBuf：buffer 模式的首段缓冲 */
+  let accThinking = '';
+  let accContent = '';
+  let toolMode = 'buffer';
+  let toolBuf = '';
+  let finished = false; /* 响应已结束（客户端断开检测用） */
+  let curStreamId = null; /* driver 侧当前 streamId（客户端断开时停止生成） */
+  const emitText = (t) => {
+    if (t === undefined || t === null) return;
+    out.text += t;
+    if (wantStream) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: t }, finish_reason: null }] });
+  };
+  const emitTool = (i, tc) => {
+    out.tools.push(tc);
+    if (wantStream) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: '' } }] }, finish_reason: null }] });
+  };
+  const emitToolArgs = (i, args) => {
+    if (wantStream) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: args } }] }, finish_reason: null }] });
+  };
+  const finish = (reason) => {
+    if (finished) return;
+    finished = true;
+    if (wantStream) {
+      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: reason }] });
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      sendJson(res, {
+        id: cid, object: 'chat.completion', created, model,
+        /* reasoning_content：思考全文（DeepSeek 官方 API 字段，与流式 delta.reasoning_content 对应） */
+        choices: [{ index: 0, message: { role: 'assistant', content: out.text || null, reasoning_content: accThinking || undefined, tool_calls: out.tools.length ? out.tools : undefined }, finish_reason: reason }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
+    }
+  };
+  /* 客户端断开（DSH 取消/超时）：停止 driver 侧生成，别让浏览器空转 4 分钟。
+   * 防御：非 http req（测试 fake）无 on 方法时跳过 */
+  if (req && typeof req.on === 'function') {
+    req.on('close', () => {
+      if (finished || !curStreamId) return;
+      log('客户端断开，停止生成 streamId=' + curStreamId);
+      rpc('streamStop', { streamId: curStreamId }, 5000).catch(() => {});
+    });
+  }
   let session0 = null; /* 当前请求绑定的会话（try 内赋值，finally 刷新/解锁） */
   let releaseLock = null; /* 会话锁释放（try 内赋值，finally 防御性释放） */
   let release = null; /* 信号量释放（同上） */
   try {
+    /* 先抢全局生成并发槽位：槽位满则在 SEM_WAIT_TIMEOUT_MS 内排队，超时明确报错返回
+     * （而非无限挂起——后者在 DSH 侧表现为「对话阻塞」）。放在会话解析之前，
+     * 避免排队的请求提前分配页面通道、占用 maxPages 名额、甚至误驱逐健康空闲会话。 */
+    try {
+      release = await acquireSem(SEM_WAIT_TIMEOUT_MS);
+    } catch (e) {
+      const limit = effectiveConcurrent();
+      log('并发槽位等待超时（' + Math.round(SEM_WAIT_TIMEOUT_MS / 1000) + 's，并发上限 ' + limit + '）：明确报错返回，避免请求无限挂起');
+      if (wantStream) {
+        sseHeaders(res);
+        sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+      }
+      emitText('[并发已满] 当前 DeepSeek 网页版并发上限为 ' + limit + '，请求排队超过 ' + Math.round(SEM_WAIT_TIMEOUT_MS / 1000) + 's 仍未获得生成槽位。可能原因：其他对话正在跑长任务（智能搜索+深度思考/工具循环）或 driver 卡住。可稍后重试，或通过 POST /config 调大 maxConcurrent（注意：多账号下会退化为 1）。');
+      finish('stop');
+      return;
+    }
     /* 会话解析（并发核心：指纹识别 → 专属通道绑定）。
      * mode: first=新会话首轮 / delta=增量（网页版历史保持） / recovery=压缩重建 */
     const { session, mode } = await resolveSession(payload);
     session0 = session;
     log('会话: ' + session.id + ' 通道=' + session.pageKey + ' mode=' + mode + ' msgs=' + (payload.messages || []).length);
     releaseLock = await acquireSessionLock(session); /* 同一会话串行 */
-    release = await acquireSem(); /* 全局生成并发上限 */
-    const question = buildContext(payload, mode);
-    if (!question) {
-      sseHeaders(res);
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-      res.write('data: [DONE]\n\n');
-      res.end();
+    const d = await ensureDriver();
+    /* 账号调度（SPEC-v2 §5.2）：会话粘性 → 当前浏览器 profile（避免重启）→ 最旧；无可用 → 429 语义提示 */
+    let acct = poolPick(session.acctName);
+    if (!acct) {
+      const er = poolEarliestRetry();
+      const msg = er
+        ? '[账号暂时受限] 所有账号均在指数退避中（动态风控无固定解冻时间，到期后由真实请求探测恢复）。最早探测时间约 ' + Math.max(1, Math.ceil((er.cooldownUntil - Date.now()) / 60000)) + ' 分钟后。可稍后重试，或通过 POST /accounts/add 添加账号。'
+        : '[无可用账号] 全部账号未登录或已禁用。请打开 http://127.0.0.1:5688/login 登录，或通过 /accounts 管理账号。';
+      log('无可用账号: ' + msg);
+      if (wantStream) {
+        sseHeaders(res);
+        sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+      }
+      /* 本次未向 driver 发送任何内容：通道页面不存在，下轮必须走 recovery 重建
+       * （否则 delta 增量发进 ensureChannelPage 新建的空白页，模型文不对题） */
+      session0.epoch = -1;
+      emitText(msg);
+      finish('stop');
       return;
     }
-    /* 工具提示词：first/recovery 随首包注入（网页版此时是空白会话）；
-     * delta 不重复携带——网页版历史里已有首轮的工具说明。 */
-    const toolsText = mode === 'delta' ? '' : buildToolsText(payload.tools);
-    const d = await ensureDriver();
-    /* 模型联动：driver 在 newChat 后自动应用校准（calibKey=model），
-     * 因为 DeepSeek 模型选择是会话级的，新会话会重置为默认。 */
-    const { streamId } = await rpc('streamAsk', {
-      question, mode: cfg.mode, deepThink: cfg.deepThink, search: false,
-      headless: state.headless, toolsText, tools: payload.tools,
-      /* 会话亲和：driver 侧把 pageKey 固定映射到同一浏览器 tab */
-      pageKey: session.pageKey,
-      /* first/recovery → 强制 newChat（清掉网页版残留的旧会话，避免上下文污染）；
-       * delta → 'auto'（续当前会话，超限 driver 自动迁移+摘要）。 */
-      reset: mode === 'delta' ? 'auto' : true,
-      calibKey: model, maxTurnsPerChat: state.maxTurnsPerChat,
-    }, 30000);
-    const consumer = makeConsumer(d, streamId);
-    sseHeaders(res);
-    sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+    session.acctName = acct.name;
+    log('账号: ' + acct.name + (acct.state === 'probing' ? '（probing 探测）' : '') + ' mode=' + mode);
+    /* 单次 streamAsk（带 profile 账号绑定）。v3 真流式：driver 轮询差分的
+     * stream-delta 实时转发为 SSE chunk（正文 content / 思考 reasoning_content），
+     * 终态与已发增量前缀对齐补尾。限流文案 driver 侧检测先行（先检测后发增量）
+     * → 切号重试不会产生残留文本污染。 */
+    const askOnce = async (profileName, askMode) => {
+      /* 切号重试轮重置：新一轮从零累计（客户端看到上一轮已流出内容 + 本轮完整流式） */
+      accThinking = ''; accContent = ''; toolMode = 'buffer'; toolBuf = '';
+      /* 工具提示词：first/recovery 随首包注入（网页版此时是空白会话），
+       * delta 不重复携带——网页版历史里已有首轮的工具说明。
+       * 工具块由 buildContext 内嵌到 [用户] 之前（位置优化），不再单独传 driver。 */
+      const toolsText = askMode === 'delta' ? '' : buildToolsText(payload.tools);
+      const q = buildContext(payload, askMode, toolsText);
+      /* 无可发送内容（协议异常：末尾无新输入）→ 显式报错而非静默空回复。
+       * 网页版页面从未收到消息，绝不能当成功（poolMarkOk 会污染账号统计，
+       * 且空回复让 DSH 侧无从排查）。 */
+      if (!q) return { evt: { ok: false, error: 'nothing to send: messages 末尾无新输入（协议异常）' } };
+      /* 模式联动：driver 每次请求幂等应用 pill 开关（2026-08 页面重构后
+       * 无模型选择器）。calibKey=model 保留为 pill 未找到时的校准回放 fallback。 */
+      const { streamId } = await rpc('streamAsk', {
+        question: q, mode: cfg.mode, deepThink: cfg.deepThink, search: cfg.search === true,
+        headless: state.headless, tools: payload.tools,
+        /* 会话亲和：driver 侧把 pageKey 固定映射到同一浏览器 tab */
+        pageKey: session.pageKey,
+        /* 多账号：driver 按 profile 绑定浏览器 user-data-dir（cookie 隔离） */
+        profile: profileName,
+        /* first/recovery → 强制 newChat（清掉网页版残留的旧会话，避免上下文污染）；
+         * delta → 'auto'（续当前会话，超限 driver 自动迁移+摘要）。 */
+        reset: askMode === 'delta' ? 'auto' : true,
+        calibKey: model, maxTurnsPerChat: state.maxTurnsPerChat,
+      }, 30000);
+      curStreamId = streamId; /* 客户端断开时据此停止 driver 侧生成 */
+      const consumer = makeConsumer(d, streamId);
+      /* 兜底超时：driver 进程 hang（不死不退、stdio 堵塞）时 stream-end 永不到达，
+       * consumer.next() 永久挂起 → 会话锁/信号量永不释放 → 该会话后续请求全部
+       * 排队饿死。driver 正常路径最长 ≈3×240s 重试 + 前置开销 ≈13min，20min 兜底足够宽。 */
+      let evt;
+      let waitTimer = null;
+      const waitTimeout = new Promise((r) => { waitTimer = setTimeout(() => r({ __waitTimeout: true }), ASK_WAIT_TIMEOUT_MS); });
+      try {
+        for (;;) {
+          evt = await Promise.race([consumer.next(), waitTimeout]);
+          if (evt.__waitTimeout) {
+            evt = { ok: false, error: 'gateway timeout: 等待 driver 流式结果超时（' + Math.round(ASK_WAIT_TIMEOUT_MS / 60000) + 'min，driver 可能已卡死）' };
+            break;
+          }
+          /* v3 真流式核心：delta 增量实时转发为 SSE chunk（思考→reasoning_content，
+           * 正文→content），不再攒到终态一次性输出（旧实现 delta 被静默丢弃）。 */
+          if (evt.delta !== undefined) {
+            if (evt.kind === 'thinking') {
+              accThinking += evt.delta;
+              if (wantStream) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: evt.delta }, finish_reason: null }] });
+            } else {
+              accContent += evt.delta;
+              if (wantStream) {
+                if (toolMode === 'buffer') {
+                  /* v3b 真流式修复：工具 JSON 仅在开头暴露特征（{ / [ / ``` / tool_call /
+                   * <tool_call>），正常回答绝不以这些开头。据此：首段一旦不像工具调用，
+                   * 立即转 stream 并补发已缓冲首段，后续逐 delta 真流式——不再无条件憋
+                   * 120 字（短回复/逐字流开头被憋成大块一次发，是「等完整接收后一起输出」
+                   * 的主因）。仅当内容疑似工具调用才继续静默（silent），由终态 emitTool 发
+                   * 干净 tool_calls；误判代价 = 该轮退回一次性补全量补发，无正确性风险。
+                   * 400 字上限防止以 { 开头的正常代码/JSON 示例被永久憋死。 */
+                  toolBuf += evt.delta;
+                  if (looksLikeToolCallText(toolBuf) && toolBuf.length < 400) {
+                    toolMode = 'silent';
+                  } else {
+                    toolMode = 'stream';
+                    if (toolBuf) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: toolBuf }, finish_reason: null }] });
+                  }
+                } else if (toolMode === 'stream') {
+                  sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: evt.delta }, finish_reason: null }] });
+                }
+                /* silent：工具 JSON 静默累计不转发（accContent 继续累计供终态对齐判断） */
+              }
+            }
+            continue;
+          }
+          if (evt.ok !== undefined || evt.error !== undefined || evt.toolCalls !== undefined) break;
+        }
+      } finally { clearTimeout(waitTimer); }
+      d.consumers.delete(streamId);
+      return { evt };
+    };
+    if (wantStream) {
+      sseHeaders(res);
+      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+    }
+    /* 账号切换重试循环（SPEC-v2 §5.4）：errorKind 结构化信号 → 账号生命周期处理 → 换号 recovery 重建 */
     let evt;
-    let full = '';
-    for (;;) {
-      evt = await consumer.next();
-      if (evt.delta) full += evt.delta;
-      if (evt.ok !== undefined || evt.error !== undefined || evt.toolCalls !== undefined) break;
+    {
+      let askMode = mode;
+      const exclude = new Set();
+      for (;;) {
+        evt = (await askOnce(acct.name, askMode)).evt;
+        if (evt.ok) {
+          poolMarkOk(acct.name);
+          currentProfile = acct.name; /* driver 浏览器当前绑定该 profile（调度优先，减少重启） */
+          break;
+        }
+        const kind = evt.errorKind;
+        if (!kind) break; /* 普通错误：原样上报（v1 行为） */
+        if (kind === 'quota') {
+          poolMarkQuota(acct.name);
+        } else if (kind === 'captcha') {
+          poolMarkDown(acct.name, 'captcha');
+        } else if (kind === 'login') {
+          poolMarkDown(acct.name, 'login');
+          /* 自动登录（SPEC-v2 §5.5）：互斥弹有头窗口，成功后同账号 recovery 重试（不消耗切换预算） */
+          if (state.autoRelogin && exclude.size < state.maxAccountSwitchesPerRequest) {
+            log('自动登录: ' + acct.name + '（已打开浏览器登录窗口，等待完成…超时 5 分钟）');
+            try {
+              const r = await poolLogin(acct.name, 300000);
+              if (r && r.ok) {
+                poolMarkOk(acct.name);
+                log('自动登录成功: ' + acct.name + ' → recovery 模式重试');
+                askMode = 'recovery';
+                continue;
+              }
+              log('自动登录未完成: ' + acct.name);
+            } catch (e) { log('自动登录异常: ' + e.message); }
+          }
+        }
+        /* 切换下一可用账号（排除本请求已失败的） */
+        exclude.add(acct.name);
+        if (exclude.size > state.maxAccountSwitchesPerRequest) { log('账号切换预算已用尽（' + state.maxAccountSwitchesPerRequest + ' 次）'); break; }
+        const next = poolPick(null, exclude);
+        if (!next) { log('无可切换账号（其余账号受限/未登录/禁用）'); break; }
+        log('切换账号: ' + acct.name + ' → ' + next.name + '（recovery 重建上下文）');
+        acct = next;
+        session.acctName = next.name;
+        askMode = 'recovery';
+      }
     }
     if (evt.toolCalls && evt.toolCalls.length) {
       evt.toolCalls.forEach((tc, i) => {
         const callId = 'call_gw_' + i + '_' + Date.now().toString(36);
         const argsStr = typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments || {});
-        sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: callId, type: 'function', function: { name: tc.name, arguments: '' } }] }, finish_reason: null }] });
-        for (let k = 0; k < argsStr.length; k += 60) {
-          sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: argsStr.slice(k, k + 60) } }] }, finish_reason: null }] });
-        }
+        const tool = { id: callId, type: 'function', function: { name: tc.name, arguments: argsStr } };
+        emitTool(i, tool);
+        for (let k = 0; k < argsStr.length; k += 60) emitToolArgs(i, argsStr.slice(k, k + 60));
       });
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
+      finish('tool_calls');
     } else if (evt.ok) {
-      /* driver 返回完整 result（非流式）→ 一次性输出 */
-      const text = evt.result || full;
-      for (let k = 0; k < text.length; k += 120) {
-        sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: text.slice(k, k + 120) }, finish_reason: null }] });
+      const result = evt.result || '';
+      /* v3 真流式终态对齐：流式增量与终态 result 同为 cleanText 基准（driver 保证），
+       * 公共前缀之后补发差异尾部（流式期间页面文本微调/尾部清理的兜底）。
+       * 正文未流式（silent 工具误判回退 / buffer 未判定 / 非流式 / 无增量）
+       * → 全量输出，完整性优先。 */
+      if (wantStream && toolMode === 'stream' && accContent) {
+        let i = 0;
+        const n = Math.min(accContent.length, result.length);
+        while (i < n && accContent.charCodeAt(i) === result.charCodeAt(i)) i++;
+        if (i < result.length) emitText(result.slice(i));
+      } else {
+        emitText(result);
       }
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+      finish('stop');
     } else {
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: '[错误] ' + (evt.error || 'unknown') }, finish_reason: null }] });
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+      /* 请求失败（timeout/受限切换预算用尽等）：通道页面状态未知 → 下轮强制 recovery */
+      session0.epoch = -1;
+      emitText('[错误] ' + (evt.error || 'unknown'));
+      finish('stop');
     }
-    res.write('data: [DONE]\n\n');
-    res.end();
-    d.consumers.delete(streamId);
   } catch (e) {
+    /* 异常路径下会话通道状态未知（rpc 失败/driver 未就绪）→ epoch 置失配，
+     * 强制下一请求 recovery 重建上下文，防 delta 增量发进不存在的网页历史 */
+    if (session0) session0.epoch = -1;
     try {
-      sseHeaders(res);
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: '[错误] ' + String(e.message || e) }, finish_reason: null }] });
-      sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-      res.write('data: [DONE]\n\n');
-      res.end();
+      /* SSE 已开始（headers 已 flush）时二次 writeHead 会抛 ERR_HTTP_HEADERS_SENT
+       * 且被内层 catch 吞掉 → finish 不执行 → 客户端收不到 [DONE] 连接悬挂。
+       * headersSent 守卫：头未发过才补发 SSE 头，已发过直接续写错误文本。 */
+      if (wantStream && !res.headersSent) {
+        sseHeaders(res);
+        sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+      }
+      emitText('[错误] ' + String(e.message || e));
+      finish('stop');
     } catch (e2) { /* ignore */ }
   } finally {
     /* 释放顺序与获取相反：信号量 → 会话锁；同时刷新会话活跃时间 */
@@ -569,6 +1262,7 @@ const WB_REQ_DIR = path.join(__dirname, 'mock-api', 'requests');
 const WB_RES_DIR = path.join(__dirname, 'mock-api', 'responses');
 for (const d of [WB_REQ_DIR, WB_RES_DIR]) { try { fs.mkdirSync(d, { recursive: true }); } catch (e) { /* ignore */ } }
 let wbSeq = 0;
+/** 轮询等待 WorkBuddy 回应文件出现（800ms 间隔），超时 reject。 */
 function wbWaitResponse(seqId, timeoutMs) {
   const file = path.join(WB_RES_DIR, seqId + '.json');
   const start = Date.now();
@@ -583,6 +1277,9 @@ function wbWaitResponse(seqId, timeoutMs) {
     }, 800);
   });
 }
+/** WorkBuddy 落盘模式：请求写入 mock-api/requests/，轮询 mock-api/responses/
+ * 读取回应（外部进程消费），转成 OpenAI 兼容 SSE/JSON 输出。超时 900s。
+ * 与浏览器引擎完全无关——纯本地文件通信通道。 */
 async function handleWorkBuddy(req, res, payload) {
   /* 唯一 seqId（时间戳 + 计数器），避免撞历史遗留文件 */
   const seqId = 'req-' + Date.now().toString(36) + '-' + (++wbSeq);
@@ -628,16 +1325,19 @@ async function handleWorkBuddy(req, res, payload) {
 }
 
 /* ---------- HTTP 服务 ---------- */
+/** 设置 CORS 响应头（本机调试场景，放开全部来源）。 */
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
+/** 发送 JSON 响应（200 + CORS）。 */
 function sendJson(res, obj) {
   cors(res);
   res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
 }
+/** 读取请求体（字符串），8MB 上限防滥用。 */
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let s = '';
@@ -679,15 +1379,53 @@ const server = http.createServer(async (req, res) => {
       }
       return handleChatCompletion(req, res, payload);
     }
-    /* 登录 */
+    /* 登录（支持 ?profile=xxx 指定账号；多账号场景各账号独立登录） */
     if (req.method === 'GET' && (p === '/login')) {
+      const profileName = (u.searchParams.get('profile') || 'default').trim();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#17181c;color:#ddd"><h2>DeepSeek 网页版登录</h2><p>已打开浏览器窗口，请在其中登录 chat.deepseek.com。登录完成后会自动检测。</p><p><a href="/login-status">查看登录状态</a></p></body></html>');
-      const d = await ensureDriver();
-      rpc('login', { profile: 'default', timeoutMs: 300000 }, 330000)
-        .then((r) => log('登录结果:', JSON.stringify(r).slice(0, 160)))
-        .catch((e) => log('登录失败:', e.message));
+      res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#17181c;color:#ddd"><h2>DeepSeek 网页版登录（账号: ' + profileName + '）</h2><p>已打开浏览器窗口，请在其中登录 chat.deepseek.com。登录完成后会自动检测。</p><p><a href="/login-status">查看登录状态</a> · <a href="/accounts">账号列表</a></p></body></html>');
+      await ensureDriver();
+      poolLogin(profileName, 300000)
+        .then((r) => {
+          if (r && r.ok) poolMarkOk(profileName);
+          log('登录结果(' + profileName + '):', JSON.stringify(r).slice(0, 160));
+        })
+        .catch((e) => log('登录失败(' + profileName + '):', e.message));
       return;
+    }
+    /* 账号池管理（SPEC-v2 §5.7）：多账号保存 / 状态查看 / 启停 */
+    if (p === '/accounts' && req.method === 'GET') {
+      gatewayRequestCount++;
+      return sendJson(res, { ok: true, ...poolDescribe(), backoff: { baseMs: state.quotaBackoffBaseMs, maxMs: state.quotaBackoffMaxMs, confirmWindowMs: state.quotaConfirmWindowMs }, note: '受限信号只来自页面文案检测（动态风控无固定数值）；恢复=指数退避到期后真实请求探测' });
+    }
+    if (p === '/accounts/add' && req.method === 'POST') {
+      gatewayRequestCount++;
+      const b = JSON.parse((await readBody(req)) || '{}');
+      try {
+        const a = poolAdd(String(b.name || '').trim());
+        log('添加账号: ' + a.name + '（触发登录窗口）');
+        /* 异步触发登录（HTTP 立即返回；登录状态通过 /accounts 查看） */
+        ensureDriver().then(() => poolLogin(a.name, 300000))
+          .then((r) => { if (r && r.ok) { poolMarkOk(a.name); log('账号 ' + a.name + ' 登录成功'); } else log('账号 ' + a.name + ' 登录未完成（可打开 /login?profile=' + a.name + ' 重试）'); })
+          .catch((e) => log('账号 ' + a.name + ' 登录异常: ' + e.message));
+        return sendJson(res, { ok: true, account: { name: a.name, state: a.state }, message: '账号已入池，浏览器登录窗口已打开（5 分钟超时）。登录状态请查看 /accounts' });
+      } catch (e) { return sendJson(res, { ok: false, error: String(e.message || e) }); }
+    }
+    if ((p === '/accounts/disable' || p === '/accounts/enable') && req.method === 'POST') {
+      gatewayRequestCount++;
+      const b = JSON.parse((await readBody(req)) || '{}');
+      try {
+        const a = poolSetEnabled(String(b.name || '').trim(), p === '/accounts/enable');
+        return sendJson(res, { ok: true, account: { name: a.name, state: a.state }, note: p === '/accounts/enable' ? '已启用，需登录验证（/login?profile=' + a.name + '）后才可恢复使用' : '已禁用' });
+      } catch (e) { return sendJson(res, { ok: false, error: String(e.message || e) }); }
+    }
+    if (p === '/accounts/remove' && req.method === 'POST') {
+      gatewayRequestCount++;
+      const b = JSON.parse((await readBody(req)) || '{}');
+      try {
+        const a = poolRemove(String(b.name || '').trim(), !!b.confirm);
+        return sendJson(res, { ok: true, removed: a.name, note: '账号已移出池。浏览器 profile 目录保留在 runtime/profiles/' + a.name + '（如需彻底删除请手动清理）' });
+      } catch (e) { return sendJson(res, { ok: false, error: String(e.message || e) }); }
     }
     if (req.method === 'GET' && (p === '/login-status')) {
       gatewayRequestCount++;
@@ -726,13 +1464,14 @@ const server = http.createServer(async (req, res) => {
         requests: gatewayRequestCount,
         driver: { running: !!D, ready: !!(D && D.ready), pid: D && D.cp ? D.cp.pid : null },
         login,
+        accounts: poolDescribe(),
         sessions: {
           count: sessions.size,
           channels: activeChannelCount(),
           freeChannels: freePageKeys.length,
-          list: [...sessions.values()].map((s) => ({ id: s.id, pageKey: s.pageKey, busy: s.busy, idleMs: Date.now() - s.lastSeen })),
+          list: [...sessions.values()].map((s) => ({ id: s.id, pageKey: s.pageKey, busy: s.busy, idleMs: Date.now() - s.lastSeen, account: s.acctName })),
         },
-        config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages },
+        config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages, accountPool: state.accountPool, maxAccounts: state.maxAccounts, autoRelogin: state.autoRelogin },
       });
     }
     /* 配置 */
@@ -747,9 +1486,14 @@ const server = http.createServer(async (req, res) => {
         if (b.maxConcurrent !== undefined) state.maxConcurrent = Math.max(1, Math.min(5, parseInt(b.maxConcurrent, 10) || 2));
         if (b.maxTurnsPerChat !== undefined) state.maxTurnsPerChat = Math.max(2, Math.min(500, parseInt(b.maxTurnsPerChat, 10) || 50));
         if (b.maxPages !== undefined) state.maxPages = Math.max(1, Math.min(8, parseInt(b.maxPages, 10) || 4));
-        return sendJson(res, { ok: true, config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages }, note });
+        if (b.accountPool !== undefined) state.accountPool = !!b.accountPool;
+        if (b.maxAccounts !== undefined) state.maxAccounts = Math.max(1, Math.min(8, parseInt(b.maxAccounts, 10) || 3));
+        if (b.autoRelogin !== undefined) state.autoRelogin = !!b.autoRelogin;
+        if (b.quotaBackoffBaseMs !== undefined) state.quotaBackoffBaseMs = Math.max(60000, Math.min(3600000, parseInt(b.quotaBackoffBaseMs, 10) || 300000));
+        if (b.quotaBackoffMaxMs !== undefined) state.quotaBackoffMaxMs = Math.max(1800000, Math.min(86400000, parseInt(b.quotaBackoffMaxMs, 10) || 21600000));
+        return sendJson(res, { ok: true, config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages, accountPool: state.accountPool, maxAccounts: state.maxAccounts, autoRelogin: state.autoRelogin, quotaBackoffBaseMs: state.quotaBackoffBaseMs, quotaBackoffMaxMs: state.quotaBackoffMaxMs }, note });
       }
-      return sendJson(res, { ok: true, config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages } });
+      return sendJson(res, { ok: true, config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages, accountPool: state.accountPool, maxAccounts: state.maxAccounts, autoRelogin: state.autoRelogin, quotaBackoffBaseMs: state.quotaBackoffBaseMs, quotaBackoffMaxMs: state.quotaBackoffMaxMs } });
     }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'not found: ' + p } }));
@@ -763,6 +1507,7 @@ server.listen(PORT, '127.0.0.1', () => {
   log('driver: ' + DRIVER_PATH + ' | baseDir: ' + BASE_DIR);
   log('模型: ' + Object.keys(MODELS).join(', '));
   log('配置: headless=' + state.headless + ' maxConcurrent=' + state.maxConcurrent + ' maxTurnsPerChat=' + state.maxTurnsPerChat + ' maxPages=' + state.maxPages + '（会话亲和并发）');
+  log('账号池: ' + pool.accounts.size + ' 个账号（限流自动切换开' + (state.accountPool ? '启' : '关') + '，退避 ' + Math.round(state.quotaBackoffBaseMs / 60000) + 'min 起 ×2 封顶 ' + Math.round(state.quotaBackoffMaxMs / 3600000) + 'h）');
   ensureDriver().catch((e) => log('driver 启动失败: ' + e.message));
 });
 

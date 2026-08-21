@@ -48,6 +48,7 @@ let CFG = JSON.parse(JSON.stringify(DEFAULTS));
 function profileDir(name) { return path.join(CFG.baseDir, 'profiles', String(name || 'default')); }
 function effectiveHeadless(profile) { return profile && profile.headless !== undefined ? profile.headless : CFG.headless; }
 
+/** Promise 版延时。 */
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /* ------------------------------------------------------------------ */
@@ -56,18 +57,22 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 const pending = new Map();
 let rpcSeq = 0;
 
+/** 向网关写一行 JSON（stdout 通道；写失败只记日志不抛——断管道不应杀死 driver）。 */
 function send(obj) {
   try { process.stdout.write(JSON.stringify(obj) + '\n'); }
   catch (e) { logErr('stdout write failed', e.message); }
 }
+/** 回复 RPC 请求（按 id 关联）：ok 时携带 result，失败时携带 error 文本。 */
 function respond(id, ok, result, error) {
   if (ok) send({ id, ok: true, result });
   else send({ id, ok: false, error: String(error && error.message || error) });
 }
+/** 向网关单向推送事件（stream-delta / stream-end / channels-reset / login-progress 等）。 */
 function emitEvent(name, payload) { send({ event: name, ...(payload || {}) }); }
 
 const handlers = {};
 
+/** 从缓冲区切出一行（无完整行返回 null）——stdin JSON-lines 协议的分行器。 */
 function readLine(buf) {
   const i = buf.indexOf('\n');
   if (i < 0) return null;
@@ -105,6 +110,7 @@ process.on('SIGTERM', () => shutdown(0));
 process.on('SIGINT', () => shutdown(0));
 process.on('uncaughtException', (e) => { logErr('uncaught', e.stack || e.message); });
 
+/** 进程关闭：强杀浏览器与调试窗口子进程后退出（SIGTERM/SIGINT/stdin end 触发）。 */
 async function shutdown(code) {
   try { if (browser.proc) browser.proc.kill(); } catch (e) { /* ignore */ }
   try {
@@ -119,6 +125,10 @@ async function shutdown(code) {
 /* ------------------------------------------------------------------ */
 /* minimal WebSocket client (RFC6455) over a raw socket               */
 /* ------------------------------------------------------------------ */
+/** 发起 WebSocket 握手（手写 RFC6455，零依赖）：http Upgrade 请求 → 升级为原始 socket。
+ * @param {string} wsUrl ws:// 地址（CDP browser 端点）
+ * @param {number} [timeoutMs] 握手超时
+ * @returns {Promise<object>} makeWsClient 客户端 */
 function wsConnect(wsUrl, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     let u;
@@ -146,6 +156,11 @@ function wsConnect(wsUrl, timeoutMs = 15000) {
   });
 }
 
+/** 基于原始 socket 的最小 WebSocket 客户端：
+ * - 帧解析（opcode 1 文本 / 8 关闭 / 9-10 ping-pong 自动应答）
+ * - sendText：客户端→服务端帧必须掩码（RFC6455 §5.1）
+ * - onMessage：注册消息监听（返回注销函数）
+ * @param {net.Socket} socket 已升级的 socket */
 function makeWsClient(socket) {
   const client = {
     socket,
@@ -254,6 +269,7 @@ class CdpClient {
 /* ------------------------------------------------------------------ */
 /* Chrome discovery & browser lifecycle                                */
 /* ------------------------------------------------------------------ */
+/** 查找本机 Chrome/Edge 可执行文件（按平台搜索常见路径；DS_WEB_CHROME 可显式指定）。 */
 function findChrome() {
   if (CFG.chromePath) return CFG.chromePath;
   const candidates = [];
@@ -281,6 +297,7 @@ function findChrome() {
   return null;
 }
 
+/** 轮询等待文件出现并读取内容（Chrome 启动后写 DevToolsActivePort 有延迟），超时返回 null。 */
 async function waitForFile(file, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -300,11 +317,25 @@ const browser = {
   launching: null,
 };
 
+/**
+ * 启动/复用浏览器（单一常驻原则）。
+ * - 同 profile 已在运行 → 直接复用（不因 headless 差异重建，防 cookie 丢失）
+ * - profile 切换 → 先发 channels-reset 事件通知网关（全部会话转 recovery），再重启
+ * - 启动流程：清理残留锁文件 → spawn Chrome（动态调试端口）→ 读 DevToolsActivePort
+ *   → WebSocket 连接 CDP；失败自动重试 1 次
+ * @param {object} profile { name, headless } 账号 profile 配置 */
 async function launchBrowser(profile) {
   /* 单一常驻浏览器原则：只要 profile 相同就复用同一 Chrome 实例，
    * 绝不因 headless 参数差异重建（重建会导致 DeepSeek 会话 cookie 丢失）。
    * 首次启动的 headless 状态决定窗口可见性；登录/推理/校准共用该实例。 */
   if (browser.proc && browser.profile && browser.profile.name === profile.name && browser.cdp) return;
+  /* profile 切换重启：所有通道页面的网页版历史将随旧浏览器销毁。
+   * 通知网关把全部会话标记为 epoch 失配 → 各会话下一请求强制 recovery 重建，
+   * 否则 delta 增量发进空白页面，模型文不对题。 */
+  if (browser.proc && browser.profile && browser.profile.name !== profile.name) {
+    log('profile 切换: ' + browser.profile.name + ' → ' + profile.name + '（通知网关全部会话转 recovery）');
+    emitEvent('channels-reset', { from: browser.profile.name, to: profile.name });
+  }
   if (browser.launching) await browser.launching.catch(() => {});
   const launch = (async () => {
     await closeBrowser();
@@ -384,6 +415,7 @@ async function launchBrowser(profile) {
   try { await launch; } finally { browser.launching = null; }
 }
 
+/** 关闭浏览器进程并清空全部页面状态（Windows 用 taskkill 树杀，POSIX 用 SIGKILL）。 */
 async function closeBrowser() {
   const proc = browser.proc;
   browser.proc = null;
@@ -405,6 +437,7 @@ async function closeBrowser() {
   await sleep(600);
 }
 
+/** 确保浏览器以指定 profile 运行（缺省用配置首个 profile）。 */
 async function ensureBrowser(profile) {
   const p = profile || CFG.profiles[0] || { name: 'default', headless: CFG.headless };
   await launchBrowser(p);
@@ -414,6 +447,8 @@ async function ensureBrowser(profile) {
 /* ------------------------------------------------------------------ */
 /* page management                                                     */
 /* ------------------------------------------------------------------ */
+/** 新建浏览器 Tab（可选 newWindow 独立窗口），attach 后启用 Runtime/Page/DOM 域。
+ * @returns {Promise<string>} pageId（内部递增标识） */
 async function newPage(opts) {
   const cdp = browser.cdp;
   if (!cdp) throw new Error('browser not running');
@@ -431,8 +466,10 @@ async function newPage(opts) {
   return pageId;
 }
 
+/** 查询页面信息（targetId/sessionId/url）。 */
 function pageInfo(pageId) { return browser.pages.get(pageId); }
 
+/** 关闭 Tab；保活策略：最后一个页面被关时补 about:blank，防浏览器进程退出丢 cookie。 */
 async function closePage(pageId) {
   const p = pageInfo(pageId);
   if (!p) return;
@@ -444,6 +481,12 @@ async function closePage(pageId) {
   }
 }
 
+/** 在页面上下文执行 JavaScript 表达式（DOM 表达式引擎的唯一执行入口）。
+ * awaitPromise=true（支持页面侧 async IIFE）；页面抛异常时转 Node 侧 Error。
+ * @param {string} pageId 页面 ID
+ * @param {string} expression JS 表达式（非函数体，直接 eval）
+ * @param {object} [opts] { userGesture: true } 需要"用户手势"权限的操作（如下载/剪贴板）
+ * @returns {Promise<any>} 表达式返回值（returnByValue 序列化） */
 async function evalJs(pageId, expression, opts) {
   const p = pageInfo(pageId);
   if (!p) throw new Error('page gone');
@@ -457,6 +500,7 @@ async function evalJs(pageId, expression, opts) {
   return r.result && r.result.value;
 }
 
+/** 导航到 URL 并等待页面就绪（document.body 出现）。 */
 async function navigate(pageId, url) {
   const p = pageInfo(pageId);
   if (!p) throw new Error('page gone');
@@ -464,6 +508,7 @@ async function navigate(pageId, url) {
   await waitReady(pageId, 30000);
 }
 
+/** 轮询等待页面就绪（readyState + body 存在），超时返回 false（导航中间态异常吞掉继续等）。 */
 async function waitReady(pageId, timeoutMs) {
   const start = Date.now();
   for (;;) {
@@ -476,6 +521,7 @@ async function waitReady(pageId, timeoutMs) {
   }
 }
 
+/** 轮询等待表达式返回真值（页面条件等待通用器），超时返回 null。 */
 async function waitFor(pageId, expression, timeoutMs, intervalMs) {
   const start = Date.now();
   for (;;) {
@@ -503,6 +549,13 @@ const EXPR = {
       if (!node) return;
       if (node.nodeType === 3) { out.push(node.textContent); return; }
       if (node.nodeType !== 1) return;
+      /* 思考模式（DeepThink）修复：class 含 think/reasoning 的容器（思考流/折叠头
+       * "已深度思考（用时N秒）"）整体跳过——思考文本绝不能混入回答。
+       * 排除（保留）列表只放强正文信号 markdown/answer/message/reply/response；
+       * 不要放 content（几乎每个容器都含 content，真实思考容器正是 .ds-think-content，
+       * 含 think 又含 content，放 content 会让排除条件失效、思考文本泄漏进正文）。 */
+      const cls = String(node.className || '').toLowerCase();
+      if (cls && /think|reasoning/.test(cls) && !/markdown|answer|message|reply|response/.test(cls)) return;
       const tag = node.tagName.toLowerCase();
       if (tag === 'pre') {
         const codeEl = node.querySelector('code');
@@ -547,11 +600,166 @@ const EXPR = {
   })()`,
 
   generating: `(() => {
-    const stopSels = ['button[aria-label*="Stop" i]','[class*="stop-gen"]','[class*="stopGen"]','[class*="generating"]','[class*="is-generating"]','[class*="streaming"]','[class*="in-progress"]','[data-status="generating"]','[data-status="streaming"]'];
+    /* 停止按钮（生成中可见、完成后消失）是最可靠的"正在生成"正信号：
+     * 覆盖英文 Stop、中文 停止/暂停，以及常见 stop/pause/generating 类名 */
+    const stopSels = ['button[aria-label*="Stop" i]','button[aria-label*="停止" i]','button[aria-label*="暂停" i]','[class*="stop-gen"]','[class*="stopGen"]','[class*="stop"]','[class*="pause"]','[class*="abort"]','[class*="generating"]','[class*="is-generating"]','[class*="streaming"]','[class*="in-progress"]','[data-status="generating"]','[data-status="streaming"]'];
     for (const s of stopSels) { const el = document.querySelector(s); if (el) { const cs = window.getComputedStyle(el); if (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') return true; } }
-    const loaderSels = ['[class*="typing"]','[class*="loading"]','[class*="spinner"]','[class*="blink"]','[class*="cursor"]','[class*="pulsing"]','svg[class*="loading"]','svg[class*="spinner"]','[class*="dot-pulse"]','[class*="dot-flashing"]','[class*="thinking-indicator"]'];
+    /* 仅保留强"正在生成"信号：typing/loading/spinner/dot-pulse/dot-flashing/thinking-indicator
+     * 去掉易误判为常驻的 cursor/blink/pulsing（输入框光标、代码块复制按钮等会持续命中，
+     * 导致完成后仍判定为 generating → 轮询直到 240s 超时，表现为 dsh 不停止） */
+    const loaderSels = ['[class*="typing"]','[class*="loading"]','[class*="spinner"]','svg[class*="loading"]','svg[class*="spinner"]','[class*="dot-pulse"]','[class*="dot-flashing"]','[class*="thinking-indicator"]'];
     for (const s of loaderSels) { const el = document.querySelector(s); if (el) { const cs = window.getComputedStyle(el); if (cs.display !== 'none' && cs.visibility !== 'hidden') return true; } }
     return false;
+  })()`,
+
+  /* 思考中检测（DeepThink 流式期间）——思考模式的完成判定防线：
+   * 1) 全局进行时标题（"深度思考中…"/"Thinking..."）；
+   * 2) 可见的 thinking/reasoning 容器（innerText 跳过 display:none 的折叠内容，
+   *    textContent 会误读折叠后的思考正文导致永不退出）；
+   * 完成折叠头（"已深度思考（用时N秒）"/"Thought for N seconds"）不算思考中。
+   * 用途：轮询完成判定加 !thinking——思考中/折叠间隙绝不提前退出（防截断） */
+  thinking: `(() => {
+    const body = (document.body && document.body.innerText) || '';
+    if (/深度思考中|正在深度思考|思考中\\.\\.|Thinking\\.\\./.test(body)) return true;
+    const done = /^(已深度思考|深度思考（已|Thought for)/;
+    /* 真实思考容器为 .ds-think-content（含 think 但无 thinking 子串），
+     * [class*="thinking"] 匹配不到 → 改用 [class*="think"] 同时覆盖
+     * ds-think-content / ds-thinking-content / ds-thinking-block */
+    const els = document.querySelectorAll('[class*="think"], [class*="reasoning"]');
+    for (const el of els) {
+      if (el.closest && el.closest('button, [role="button"], label')) continue;
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const t = (el.innerText || '').trim();
+      if (!t) continue;
+      if (done.test(t) && t.length < 80) continue;
+      return true;
+    }
+    return false;
+  })()`,
+
+  /* 提取当前思考流文本（DeepThink 流式思考输出，v3 真流式核心）：
+   * - 只取可见容器（思考完成后折叠 display:none → 读不到，此时返回 ''，
+   *   思考全文已通过增量事件发完，由调用侧差分）
+   * - 跳过按钮内元素（pill 开关误命中）与折叠头文案（"已深度思考（用时N秒）"）
+   * - 多容器命中取最长（嵌套思考容器去重）
+   * 返回当前思考全量文本，调用侧与上次快照差分发 kind='thinking' 增量 */
+  extractThinking: `(() => {
+    const done = /^(已深度思考|深度思考（已|Thought for)/;
+    /* 同 EXPR.thinking：真实思考容器 .ds-think-content 需用 [class*="think"] 才能命中 */
+    const els = document.querySelectorAll('[class*="think"], [class*="reasoning"]');
+    let best = '';
+    for (const el of els) {
+      if (el.closest && el.closest('button, [role="button"], label')) continue;
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const t = (el.innerText || '').trim();
+      if (!t || t.length <= best.length) continue;
+      if (done.test(t) && t.length < 80) continue;
+      best = t;
+    }
+    return best;
+  })()`,
+
+  /* 完成态正信号（v3c 防提前终止丢内容）：DeepSeek 生成完成后才出现"复制 / 重新生成
+   * / 编辑 / 分享"动作按钮，生成中绝不显示。generating 选择器偶发漏检（停止按钮 class
+   * 不匹配）时，仅靠"文本稳定"判定会在生成中 DOM 突发静默间隙误触发提前 break；
+   * 用完成态动作按钮作可靠正信号，配合文本稳定即可确定完成。按按钮文字/aria-label
+   * 匹配，避免依赖易变 class。 */
+  doneActions: `(() => {
+    const acts = ['复制', '重新生成', 'regenerate', 'copy', '编辑', 'edit', '分享', 'share'];
+    const els = document.querySelectorAll('button, [role="button"]');
+    for (const el of els) {
+      const t = ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+      if (!t) continue;
+      if (acts.some((a) => t.includes(a.toLowerCase()))) {
+        const cs = window.getComputedStyle(el);
+        if (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') return true;
+      }
+    }
+    return false;
+  })()`,
+
+  /* ---------- pill 开关（2026-08 页面重构：无模型选择器，输入框下方 pill） ----------
+   * toggleState：读开关当前状态（true=开/false=关/null=无法判定）
+   * 状态信号优先级：aria-pressed > aria-checked > data-state > class 中的 active 类名 */
+  toggleState: (labels) => `(() => {
+    const labels = ${JSON.stringify(labels)};
+    function findPill() {
+      const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], [class*="pill"], label, div[class*="option"], span[class*="option"]'));
+      for (const lab of labels) {
+        const needle = String(lab).toLowerCase();
+        for (const el of els) {
+          const txt = ((el.innerText || el.textContent || '').trim() || '').toLowerCase();
+          if (txt && (txt === needle || txt.includes(needle))) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return el;
+          }
+        }
+      }
+      return null;
+    }
+    function readState(el) {
+      const ap = el.getAttribute('aria-pressed');
+      if (ap === 'true') return true;
+      if (ap === 'false') return false;
+      const ac = el.getAttribute('aria-checked');
+      if (ac === 'true') return true;
+      if (ac === 'false') return false;
+      const ds = el.getAttribute('data-state');
+      if (ds === 'checked' || ds === 'on' || ds === 'active' || ds === 'open') return true;
+      if (ds === 'unchecked' || ds === 'off' || ds === 'inactive') return false;
+      const cls = String(el.className || '').toLowerCase();
+      const parts = cls.split(/\\s+/);
+      if (parts.some((c) => /^(active|selected|checked|enabled|on|open|isOpen)$/.test(c))) return true;
+      return null;
+    }
+    const pill = findPill();
+    if (!pill) return { found: false, state: null };
+    return { found: true, state: readState(pill) };
+  })()`,
+
+  /* setToggle：幂等设置开关到期望状态——先读状态，仅在不一致时点击。
+   * 返回 { found, state, action: 'none'|'clicked' }。修复旧"点击了事"语义：
+   * pill 是开关，盲点击会把已开启的深度思考再次点关（连续请求状态错乱）。 */
+  setToggle: (labels, want) => `(() => {
+    const labels = ${JSON.stringify(labels)};
+    const want = ${JSON.stringify(!!want)};
+    function findPill() {
+      const els = Array.from(document.querySelectorAll('button, [role="button"], [class*="toggle"], [class*="switch"], [class*="pill"], label, div[class*="option"], span[class*="option"]'));
+      for (const lab of labels) {
+        const needle = String(lab).toLowerCase();
+        for (const el of els) {
+          const txt = ((el.innerText || el.textContent || '').trim() || '').toLowerCase();
+          if (txt && (txt === needle || txt.includes(needle))) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) return el;
+          }
+        }
+      }
+      return null;
+    }
+    function readState(el) {
+      const ap = el.getAttribute('aria-pressed');
+      if (ap === 'true') return true;
+      if (ap === 'false') return false;
+      const ac = el.getAttribute('aria-checked');
+      if (ac === 'true') return true;
+      if (ac === 'false') return false;
+      const ds = el.getAttribute('data-state');
+      if (ds === 'checked' || ds === 'on' || ds === 'active' || ds === 'open') return true;
+      if (ds === 'unchecked' || ds === 'off' || ds === 'inactive') return false;
+      const cls = String(el.className || '').toLowerCase();
+      const parts = cls.split(/\\s+/);
+      if (parts.some((c) => /^(active|selected|checked|enabled|on|open|isOpen)$/.test(c))) return true;
+      return null;
+    }
+    const pill = findPill();
+    if (!pill) return { found: false, state: null, action: 'none' };
+    const state = readState(pill);
+    if (state === want) return { found: true, state, action: 'none' };
+    pill.click();
+    return { found: true, state, action: 'clicked' };
   })()`,
 
   findInput: `(() => {
@@ -656,6 +864,8 @@ const EXPR = {
 /* ------------------------------------------------------------------ */
 /* chat operations                                                     */
 /* ------------------------------------------------------------------ */
+/** 检查页面登录状态（返回 loginState 表达式结果：needsLogin/hasChatInput/url 等）。
+ * 只检测不处理——登录引导由上层（网关 /login 或 streamAsk errorKind=login 路径）负责。 */
 async function ensureLoggedIn(pageId) {
   await waitReady(pageId, 30000);
   const st = await evalJs(pageId, EXPR.loginState);
@@ -665,6 +875,7 @@ async function ensureLoggedIn(pageId) {
   return st;
 }
 
+/** 轮询等待聊天输入框出现（页面加载/登录完成信号）；期间检测到 needsLogin 立即抛错。 */
 async function waitForChatInput(pageId, timeoutMs) {
   const start = Date.now();
   for (;;) {
@@ -682,42 +893,75 @@ async function waitForChatInput(pageId, timeoutMs) {
   }
 }
 
-async function applyConfig(pageId, opts) {
-  /* opts: { mode, deepThink, search } — best-effort UI toggling */
-  const report = { toggles: [], warnings: [] };
-  const wantThink = opts.mode === 'expert' || opts.deepThink === true;
-  const wantSearch = opts.search === true;
+/* 幂等设置单个 pill 开关：读状态 → 不一致才点击 → 复核。
+ * 返回 { ok, name, action: 'clicked'|'already'|'not-found', state } */
+async function setPill(pageId, labels, want, name) {
   try {
-    /* 1) model badge: expert wants R1/deep-think; quick wants base model */
-    if (opts.mode === 'expert') {
-      const r1 = await evalJs(pageId, EXPR.clickText(['专家模式', 'DeepSeek-R1', '深度思考', 'DeepThink', 'R1', 'V4 Pro', 'Pro']));
-      if (r1.clicked) report.toggles.push('model:expert(' + r1.matched + ')');
-      else report.warnings.push('expert mode: expert/deep-think/V4 Pro control not found');
-    } else {
-      const r = await evalJs(pageId, EXPR.clickText(['DeepSeek', 'V3', 'V4', 'Flash', '快速', '通用']));
-      if (r.clicked) report.toggles.push('model:quick(' + r.matched + ')');
+    const r = await evalJs(pageId, EXPR.setToggle(labels, want));
+    if (!r || !r.found) return { ok: false, name, action: 'not-found', state: null };
+    if (r.action === 'none') return { ok: true, name, action: 'already', state: r.state };
+    /* 点击后等待 UI 状态生效并复核 */
+    await sleep(450);
+    let after = null;
+    try { after = (await evalJs(pageId, EXPR.toggleState(labels))).state; } catch (e) { /* ignore */ }
+    return { ok: true, name, action: 'clicked', state: after };
+  } catch (e) {
+    return { ok: false, name, action: 'error', error: e.message };
+  }
+}
+
+/** 应用模型配置到页面（2026-08 页面重构后：三模式入口 + pill 开关组合）。
+ * 模式入口三选一（幂等 setMode：读激活态，不一致才点击）：
+ *   quick  快速模式 —— 可选 pill：深度思考、智能搜索（可同开）
+ *   expert 专家模式 —— 可选 pill：深度思考
+ *   vision 识图模式 —— 可选 pill：深度思考
+ * 顺序：模式入口 → 深度思考 pill（三模式通用）→ 智能搜索 pill（仅 quick 模式有）。
+ * 全程幂等（setPill 先读状态不一致才点击），并回填校准回退 fallback。
+ * @param {string} pageId 页面 ID
+ * @param {object} opts { mode: 'quick'|'expert'|'vision', deepThink, search }
+ * @returns {Promise<{toggles: string[], warnings: string[]}>} 应用报告 */
+async function applyConfig(pageId, opts) {
+  const report = { toggles: [], warnings: [] };
+  try {
+    /* 1) 模式入口（三选一，幂等：已激活则不点击）。
+     * quick 入口找不到时静默——页面默认即快速模式（无显式入口）；
+     * expert/vision 找不到才告警（显式切换失败）。 */
+    const modeLabels = {
+      quick: ['快速', '快速模式', 'Quick'],
+      expert: ['专家', '专家模式', 'Expert'],
+      vision: ['识图', '视图', '识图模式', '图片理解', 'Vision'],
+    };
+    const wantMode = modeLabels[opts.mode] ? opts.mode : 'quick';
+    const m = await setPill(pageId, modeLabels[wantMode], true, 'mode');
+    if (m.ok && m.action === 'clicked') {
+      report.toggles.push('mode:' + wantMode + '(' + m.action + ')');
+      await sleep(600); /* 模式切换后 UI 需要时间挂载对应 pill */
+    } else if (!m.ok && wantMode !== 'quick') {
+      /* 降级：setPill 状态读不到时退回盲点击（expert/vision 入口降级盲点击路径） */
+      const v = await evalJs(pageId, EXPR.clickText(modeLabels[wantMode]));
+      if (v.clicked) { report.toggles.push('mode:' + wantMode + '(clickText:' + v.matched + ')'); await sleep(600); }
+      else report.warnings.push(wantMode + ' mode entry not found');
     }
-    await sleep(600);
-    /* 2) deep-think pill — 仅非专家模式需要单独切换（专家模式选模型时已自动开启） */
-    if (wantThink && opts.mode !== 'expert') {
-      const thinkLabels = ['深度思考', 'DeepThink', 'Deep Think', '深度推理'];
-      const t = await evalJs(pageId, EXPR.clickText(thinkLabels));
-      if (t.clicked) report.toggles.push('think:toggled(' + t.matched + ')');
-    }
+    /* 2) 深度思考 pill（快速/专家/识图模式均可选） */
+    const wantThink = opts.deepThink === true;
+    const t = await setPill(pageId, ['深度思考', 'DeepThink', 'Deep Think', '深度推理'], wantThink, 'think');
+    if (t.ok) report.toggles.push('think:' + (wantThink ? 'on' : 'off') + '(' + t.action + (t.state !== null && t.state !== undefined ? ',state=' + t.state : '') + ')');
+    else if (wantThink) report.warnings.push('deep-think pill not found');
     await sleep(300);
-    /* 3) web search pill */
-    if (wantSearch) {
-      const s = await evalJs(pageId, EXPR.clickText(['联网搜索', '联网', 'Search', '搜索']));
-      if (s.clicked) report.toggles.push('search:on(' + s.matched + ')');
-      else report.warnings.push('web search toggle not found');
-    }
-    await sleep(500);
+    /* 3) 智能搜索 pill（仅 quick 模式提供；expert/vision 页面无此开关，跳过防误告警） */
+    const wantSearch = opts.search === true && wantMode === 'quick';
+    const s = await setPill(pageId, ['智能搜索', '联网搜索', '联网', 'Search'], wantSearch, 'search');
+    if (s.ok) report.toggles.push('search:' + (wantSearch ? 'on' : 'off') + '(' + s.action + ')');
+    else if (wantSearch) report.warnings.push('search pill not found');
+    await sleep(400);
   } catch (e) {
     report.warnings.push('applyConfig error: ' + e.message);
   }
   return report;
 }
 
+/** 上传图片（识图模式）：必要时先点附件按钮触发 file input 挂载，
+ * 再通过 CDP DOM.setFileInputFiles 直接设值（绕过隐藏 input 无法 click 的限制）。 */
 async function uploadImage(pageId, absPath) {
   const cdp = browser.cdp;
   const p = pageInfo(pageId);
@@ -736,6 +980,12 @@ async function uploadImage(pageId, absPath) {
   await sleep(1500);
 }
 
+/** 向聊天输入框填入文本并点击发送。
+ * 两种输入框：contenteditable（execCommand insertText 触发 React）/
+ * textarea（原生 setter + dispatchEvent）；点击后 CDP Enter 键兜底。
+ * @param {string} pageId 页面 ID
+ * @param {string} text 消息文本
+ * @param {object} [opts] { imageData }（识图模式附图路径） */
 async function sendMessage(pageId, text, opts) {
   const cdp = browser.cdp;
   const p = pageInfo(pageId);
@@ -798,6 +1048,25 @@ async function sendMessage(pageId, text, opts) {
   await sleep(500);
 }
 
+/** 提取当前网页会话的历史摘要（超限迁移用）：最近 15 条消息、每条压缩到 150 字。
+ * @param {string} pageId 页面 ID
+ * @returns {Promise<string>} 摘要文本（空串 = 提取失败/无历史）
+ */
+async function extractHistoryDigest(pageId) {
+  const texts = await evalJs(pageId, `(() => {
+    const out = [];
+    const els = document.querySelectorAll('.ds-message, [class*="message"], .ds-markdown');
+    for (const el of els) {
+      const t = (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 150);
+      if (t && t.length > 5) out.push(t);
+    }
+    return out;
+  })()`);
+  return (texts || []).slice(-15).join('\n');
+}
+
+/** 新建对话（清空网页版会话历史）：优先点击"新对话"按钮，
+ * 失败则导航回首页（DeepSeek 首页即新对话）并复核 URL 非 /chat/xxx。 */
 async function newChat(pageId) {
   const clicked = await evalJs(pageId, EXPR.clickNewChat);
   if (clicked) { await sleep(1200); return; }
@@ -816,6 +1085,15 @@ async function newChat(pageId) {
   }
 }
 
+/** 等待网页版回复完成（三阶段轮询）：
+ * 1. 等新消息出现（messageCount 超过初始值，最多 15s）
+ * 2. 轮询 extractLast 直到文本稳定（stableDelayMs 无变化）
+ *    —— 思考模式（DeepThink）下"思考中/折叠间隙"不退出（防正文截断）
+ * 3. 确认 generating=false 后取最终文本
+ * @param {object} state 任务状态（pageId + stopped 停止信号）
+ * @param {number} timeoutMs 总超时
+ * @param {number} stableDelayMs 文本稳定判定窗口
+ * @returns {Promise<string>} cleanText 后的最终回复 */
 async function waitForResponse(state, timeoutMs, stableDelayMs) {
   const pageId = state.pageId;
   const start = Date.now();
@@ -839,9 +1117,17 @@ async function waitForResponse(state, timeoutMs, stableDelayMs) {
     else if (text.length > 0) {
       if (stableStart === null) stableStart = Date.now();
       else if (Date.now() - stableStart >= stableDelayMs) {
-        let gen = true;
-        try { gen = await evalJs(pageId, EXPR.generating); } catch (e) { /* assume generating */ }
-        if (!gen) break;
+        let thinking = false;
+        try { thinking = await evalJs(pageId, EXPR.thinking); } catch (e) { /* ignore */ }
+        /* 思考模式（DeepThink）：思考中/折叠间隙不退出（防正文截断） */
+        if (!thinking) {
+          /* 稳定且不在思考即视为完成：不再强依赖 generating——生成中选择器偶发误判为
+           * 常驻时，原 !gen && !thinking 会让本函数等到 timeoutMs 才退出（重试等待挂起）。
+           * 兜底：稳定达到 max(stableDelayMs,5s) 即退出，挂起最多约 5s。 */
+          let gen = true;
+          try { gen = await evalJs(pageId, EXPR.generating); } catch (e) { /* assume generating */ }
+          if (!gen || Date.now() - stableStart >= Math.max(stableDelayMs, 5000)) break;
+        }
         stableStart = null;
       }
     }
@@ -852,6 +1138,8 @@ async function waitForResponse(state, timeoutMs, stableDelayMs) {
   return cleanText(final);
 }
 
+/** 清理助手回复文本：去思考块（<think>/Thinking…）、去代码块操作按钮文本
+ * （"1Copy/Run/Insert"行）、压缩连续空行。 */
 function cleanText(text) {
   if (!text) return '';
   return String(text)
@@ -862,7 +1150,11 @@ function cleanText(text) {
     .trim();
 }
 
-/* limit signal detection from the page body */
+/* 限制信号模式表（动态风控检测核心，SPEC-v2 §5.3）：
+ * - length：对话过长 → driver 内迁移+摘要重试（不上报网关不切账号）
+ * - quota：配额/频率限制（含"服务器繁忙"等动态文案）→ errorKind 上报网关切账号
+ * - captcha：人机验证 → errorKind 上报网关，账号转人工
+ * 误判防线在调用侧：仅新回复 <400 字符且已实际出现（firstSeen）时才检测。 */
 const LIMIT_PATTERNS = {
   length: [
     /对话.{0,8}(过长|超|限制|已满|已满员|无法继续)/i,
@@ -873,6 +1165,7 @@ const LIMIT_PATTERNS = {
     /(今日|当天|当前).{0,10}(对话|提问|消息|次数).{0,10}(用完|耗尽|达到上限|已达上限|已用完|受限)/i,
     /次数.{0,10}(用完|耗尽|上限|受限|限制)/i,
     /(发送|请求|操作).{0,6}(太频繁|过于频繁|请稍后|稍后再试)/i,
+    /(服务器|系统).{0,4}繁忙/i,
     /rate limit|too many requests|quota|limit reached|try again later|please slow down/i,
   ],
   captcha: [
@@ -880,6 +1173,8 @@ const LIMIT_PATTERNS = {
   ],
 };
 
+/** 检测文本是否命中限制模式（length/quota/captcha 任一命中即返回）。
+ * 注意：勿对正常长回复全文调用——调用侧保证只传新回复短文本（<400 字符）。 */
 function detectLimit(bodyText) {
   const t = String(bodyText || '');
   for (const kind of ['length', 'quota', 'captcha']) {
@@ -893,6 +1188,7 @@ function detectLimit(bodyText) {
 /* ------------------------------------------------------------------ */
 /* tool-call parser (ported from deepseek-browser-agent)               */
 /* ------------------------------------------------------------------ */
+/** 剥离思考块（<think>…</think> 与 "Thinking…" 前缀）——解析工具调用前必须先清理。 */
 function stripThinkingBlocks(text) {
   return String(text)
     .replace(/<think>[\s\S]*?<\/think>\n?/gi, '')
@@ -900,6 +1196,7 @@ function stripThinkingBlocks(text) {
     .trim();
 }
 
+/** JSON 容错修复解析：移除尾逗号、补未加引号的 key 后再 parse，失败返回 null。 */
 function attemptJsonFix(str) {
   try {
     const fixed = String(str)
@@ -909,6 +1206,8 @@ function attemptJsonFix(str) {
   } catch (e) { return null; }
 }
 
+/** 提取文本中最长的合法 JSON 对象（平衡括号扫描，正确处理字符串内 {}/转义）。
+ * 直接 parse 失败时尝试 attemptJsonFix 修复。供"纯参数无 name"场景兜底。 */
 function extractLargestJsonObject(text) {
   let best = null;
   let bestLen = 0;
@@ -938,6 +1237,9 @@ function extractLargestJsonObject(text) {
   return best;
 }
 
+/** 从助手回复解析单次工具调用（任务模式用）：按优先级尝试
+ * tool_call 前缀 / ```json 代码块 / <tool_call> 标签 / 最大 JSON 对象兜底，
+ * 兼容 name/tool/function 与 args/arguments/parameters/input 多种键名。 */
 function parseResponse(rawText) {
   const text = stripThinkingBlocks(rawText).trim();
   const mk = (name, args) => ({ type: 'tool_call', name, args, raw: rawText });
@@ -1922,6 +2224,9 @@ handlers.stop = async (params) => {
   return { stopped: true, taskId: t.id };
 };
 
+/** 打开有头登录窗口并轮询等待用户完成登录（不存密码，D4 决策）：
+ * 2s 轮询 loginState，期间推送 login-progress 事件；超时（默认 5min）返回未完成。
+ * @param {object} params { profile, timeoutMs } */
 handlers.login = async (params) => {
   const profileName = (params && params.profile) || 'default';
   const timeoutMs = (params && params.timeoutMs) || 300000;
@@ -1973,9 +2278,19 @@ const channels = new Map();
 let thePageHealthFails = 0;
 
 /** 获取/创建指定通道的页面（pageKey='main' 走 thePage 常驻逻辑）。
- * 优先复用空闲页面池（subPages），池空则新开 tab 并导航到 DeepSeek。 */
-async function ensureChannelPage(pageKey) {
-  if (pageKey === 'main') return ensurePage({ name: 'default', headless: false });
+ * 优先复用空闲页面池（subPages），池空则新开 tab 并导航到 DeepSeek。
+ * P0 单浏览器模型：目标 profile 与当前浏览器不同 → 重启浏览器切换账号（3-8s）；
+ * 重启后所有旧 pageId 失效 → 清空通道/页面池（网关侧 recovery 机制会重建上下文）。 */
+async function ensureChannelPage(pageKey, profile) {
+  const wantProfile = (profile && profile.name) || 'default';
+  if (browser.profile && browser.profile.name !== wantProfile) {
+    log('profile 切换: ' + browser.profile.name + ' → ' + wantProfile + '（重启浏览器）');
+    await launchBrowser({ name: wantProfile, headless: false });
+    thePage = null;
+    subPages.length = 0;
+    channels.clear();
+  }
+  if (pageKey === 'main') return ensurePage(profile || { name: 'default', headless: false });
   let ch = channels.get(pageKey);
   if (ch && pageInfo(ch.pageId)) {
     /* 健康检查：页面可能已崩溃/关闭 → 重建 */
@@ -1989,6 +2304,9 @@ async function ensureChannelPage(pageKey) {
   return pageId;
 }
 
+/** 确保主 Agent 常驻页面（thePage）可用（任务模式用）：
+ * 健康检查（evalJs('1')）连续 2 次失败 → 重建；否则复用。
+ * 新建流程：开 tab → 导航 DeepSeek → 复核 URL 确实到达（防 about:blank 误判未登录）。 */
 async function ensurePage(profile) {
   if (thePage && pageInfo(thePage)) {
     /* 健康检查：页面可能看似存在但已崩溃（OOM/Navigation），连续 evalJs 失败则重建 */
@@ -2030,10 +2348,13 @@ async function ensurePage(profile) {
   return thePage;
 }
 
-/* 在指定页面回放校准点击（打开模型面板 → 点击目标模型选项）。
- * 必须在 newChat（新会话）之后调用——DeepSeek 模型选择是会话级的，新会话会重置为默认。 */
-/* 模型联动：校准数据回放（14:44 确认正常的版本）。
- * 打开模型面板 → 回放用户录制的点击序列。不依赖"直接点击"（UI 变化时不可靠）。 */
+/** 在指定页面回放校准点击（打开模型面板 → 点击目标模型选项）。
+ * 必须在 newChat（新会话）之后调用——DeepSeek 模型选择是会话级的，新会话会重置为默认。
+ * 逐点击元素匹配（text/aria/class 三路候选 + role 优先级排序），命中即点击。
+ * 2026-08 页面重构后降级为 fallback：pill 开关未找到时才走此路径。
+ * @param {string} pageId 页面 ID
+ * @param {string} key 校准键（如模型 ID）
+ * @returns {Promise<number>} 成功回放的点击步数（0=无数据/未命中） */
 async function applyCalibration(pageId, key) {
   if (!key) return 0;
   let store = {};
@@ -2074,10 +2395,17 @@ async function applyCalibration(pageId, key) {
   return applied;
 }
 
-/* 从网页版回复中解析 tool_call（提示工程输出的 JSON）。
- * DeepSeek 网页版没有原生 function calling——它只输出参数 JSON（无 name 字段），
- * 所以除了识别带 name/function 的格式，还要按工具 schema（parameters.properties 的 key）
- * 推断工具名。 */
+/**
+ * 从网页版回复中解析 tool_call（提示工程输出的 JSON，工具调用协议的解析端）。
+ * DeepSeek 网页版没有原生 function calling——它只输出参数 JSON（常缺 name 字段），
+ * 所以除了识别带 name/function 的格式，还要按工具 schema（parameters.properties
+ * 的 key）推断工具名。
+ * 解析策略（优先级）：tool_call 前缀 → ```tool_call 块 → ```json 块 → 裸 ``` 块
+ * → <tool_call> XML → 平衡括号提取（schema 推断）→ Python 函数格式。
+ * @param {string} text 助手回复原文（含思考块亦可，内部会剥离）
+ * @param {Array} tools OpenAI tools 数组（schema 推断用）
+ * @returns {Array<{name: string, arguments: object|string}>} 工具调用列表（空数组=非工具回复）
+ */
 function parseToolCalls(text, tools) {
   const calls = [];
   const t = String(text || '');
@@ -2151,12 +2479,22 @@ function parseToolCalls(text, tools) {
      * 1) 模型给的 name 在工具列表里 → 直接用（可信）
      * 2) 否则用 schema 参数匹配推断（模型可能编造 name，如 write vs write_file；
      *    或纯参数形态无 name）
-     * 3) 兜底：模型给的 name */
+     * 3) 兜底（已移除）：旧实现在名字不在列表且无法按参数匹配时，仍回退用模型给的
+     *    原始名字转发——这会转发网页版自带能力（如智能搜索下的 web_search）或幻觉
+     *    工具名，触发 DSH 端「无效工具→报错/无结果→回传→再调」的死循环，
+     *    对话永远到不了终态（表现为阻塞）。现改为：名字不在列表且无法按参数匹配
+     *    到任一已授权工具 → 丢弃该调用（不转发）。后续 looksLikeToolCall 仍命中 →
+     *    走安全网纠正消息，让模型改用合法工具或直接文本回答。 */
     const nameKnown = name && Array.isArray(tools) && tools.some((t) => {
       const fn = t.function || t;
       return fn && fn.name === name;
     });
-    const finalName = nameKnown ? name : (matchToolByParams(argsObj) || name);
+    let finalName = null;
+    if (nameKnown) finalName = name;
+    else {
+      const byParams = matchToolByParams(argsObj);
+      if (byParams) finalName = byParams;
+    }
     if (finalName) {
       calls.push({
         name: finalName,
@@ -2257,6 +2595,19 @@ function looksLikeToolCall(text) {
   return false;
 }
 
+/**
+ * 流式问答（DSH 主路径，网关每轮 chat completion 的最终落点）。
+ * 异步模型：立即返回 streamId，过程经事件上报（stream-delta 增量 / stream-end 终态）。
+ * 流程：页面分配（pageKey 专属通道 / thePage / 子页面）→ 登录检测（失效 → errorKind=login）
+ * → 会话管理（reset=true 强制新会话 / 'auto' 超限自动迁移+摘要）
+ * → applyConfig pill 幂等切换（校准回放兜底）→ sendMessage
+ * → 轮询循环（Promise.all 并行探测文本/生成中/思考；detectLimit 限流检测：
+ *    length → 迁移+摘要重试（≤2 次）；quota/captcha → errorKind 上报网关切账号）
+ * → parseToolCalls 工具解析（安全网重试 ≤2 次）→ stream-end { ok, result, toolCalls }。
+ * @param {object} params { question, profile, pageKey, reset, mode, deepThink, search,
+ *   headless, calibKey, maxTurnsPerChat, timeoutMs, tools }
+ * @returns {Promise<{streamId: string}>} 流标识（结果走事件，不走 RPC 返回值）
+ */
 handlers.streamAsk = async (params) => {
   const question = params && params.question;
   if (!question || !String(question).trim()) throw new Error('question required');
@@ -2271,7 +2622,7 @@ handlers.streamAsk = async (params) => {
   let pageId = null;
   try {
     if (hasChannel) {
-      pageId = await ensureChannelPage(params.pageKey);
+      pageId = await ensureChannelPage(params.pageKey, profile);
     } else if (!isConcurrent) {
       pageId = await ensurePage(profile);
     } else {
@@ -2295,15 +2646,14 @@ handlers.streamAsk = async (params) => {
         login = await ensureLoggedIn(pageId);
       }
       if (login.needsLogin || !login.hasChatInput) {
-        emitEvent('stream-end', { streamId, ok: false, error: 'login required: 页面已关闭或未登录。请打开 http://127.0.0.1:5688/login 重新登录（建议勾选保持登录），登录后页面会保持常驻。 url=' + (login.url || '?') + ' body=' + (login.bodySnippet || '').slice(0, 80) });
+        emitEvent('stream-end', { streamId, ok: false, errorKind: 'login', error: 'login required: 页面已关闭或未登录。请打开 http://127.0.0.1:5688/login 重新登录（建议勾选保持登录），登录后页面会保持常驻。 url=' + (login.url || '?') + ' body=' + (login.bodySnippet || '').slice(0, 80) });
         return;
       }
       /* 模型切换由校准回放（applyCalibration）负责——不调用 applyConfig
        * （它会对 expert 模式点击两次"深度思考"，与校准冲突产生多余操作） */
-      /* 组装问题：工具提示词（让网页版知道可用工具）+ 用户消息 */
+      /* 问题组装由网关完成（buildContext 已内嵌工具协议块到 [用户] 之前，
+       * 位置最优；限长在网关 buildToolsText 智能压缩，不再 driver 端截断） */
       let payload = String(question);
-      const toolsText = params && params.toolsText;
-      if (toolsText && String(toolsText).trim()) payload = String(toolsText).trim() + '\n\n' + payload;
       /* 会话管理（绕限）：
        * reset=true  → 强制新会话（清历史）后应用校准
        * reset='auto' → 连续对话（网页版历史保持）；网页版会话超限（消息数 > 25）时
@@ -2321,32 +2671,37 @@ handlers.streamAsk = async (params) => {
         if (count > limit) {
           /* 超限迁移：提取网页版会话历史 → 压缩摘要 → 新会话注入 */
           let digest = '';
-          try {
-            const texts = await evalJs(pageId, `(() => {
-              const out = [];
-              const els = document.querySelectorAll('.ds-message, [class*="message"], .ds-markdown');
-              for (const el of els) {
-                const t = (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 150);
-                if (t && t.length > 5) out.push(t);
-              }
-              return out;
-            })()`);
-            digest = (texts || []).slice(-15).join('\n');
-          } catch (e) { /* ignore */ }
+          try { digest = await extractHistoryDigest(pageId); } catch (e) { /* ignore */ }
           await newChat(pageId);
           migrated = true;
           if (digest) payload = '【之前的对话摘要，请基于此继续】\n' + digest + '\n\n' + payload;
         }
       }
-      /* 模型联动：每次请求都应用校准（连续对话中也要切到目标模型）。
-       * 幂等：若已是目标模型，点击无变化。迁移（新会话）后需等待页面就绪。 */
-      if (params && params.calibKey) {
-        if (migrated) {
-          try { await waitReady(pageId, 15000); } catch (e) { /* ignore */ }
-          await sleep(1500);
-        }
-        try { await applyCalibration(pageId, params.calibKey); } catch (e) { log('applyCalibration warn', e.message); }
+      /* 模式应用（2026-08 页面重构）：旧"专家模式"选择器已下线，改为输入框下方
+       * pill 开关（深度思考/智能搜索）。每次请求都幂等应用——连续对话中上一请求
+       * 可能改变了开关状态（reasoner→chat 需关思考，反向需开）。
+       * 校准回放降级为 fallback：pill 未找到时若存在该模型的录制则回放
+       * （应对区域差异化改版）。迁移（新会话）后需等待页面就绪。 */
+      if (migrated) {
+        try { await waitReady(pageId, 15000); } catch (e) { /* ignore */ }
+        await sleep(1500);
       }
+      try {
+        const rep = await applyConfig(pageId, {
+          mode: params && params.mode,
+          deepThink: params && params.deepThink,
+          search: params && params.search,
+        });
+        if (rep.toggles && rep.toggles.length) log('applyConfig: ' + rep.toggles.join(' | '));
+        if (rep.warnings && rep.warnings.length) log('applyConfig warnings: ' + rep.warnings.join('; '));
+        /* pill 未找到（页面改版/区域差异）→ 回放该模型的校准录制 */
+        const needFallback = (params && params.calibKey) &&
+          rep.warnings.some((w) => w.indexOf('pill not found') >= 0 || w.indexOf('entry not found') >= 0);
+        if (needFallback) {
+          const applied = await applyCalibration(pageId, params.calibKey);
+          if (applied) log('applyCalibration fallback: ' + applied + ' 步回放');
+        }
+      } catch (e) { log('applyConfig warn', e.message); }
       await sendMessage(pageId, payload, {});
       const timeoutMs = (params && params.timeoutMs) || 240000;
       /* 参考 deepseek-browser-agent agent.js 的容错循环：
@@ -2354,39 +2709,161 @@ handlers.streamAsk = async (params) => {
       const RETRY_PROMPT = '你的上一条回复看起来包含工具调用，但格式无法解析。请重新输出：整个回复必须 ONLY 一个 ```tool_call 代码块（含 "name" 和 "args" 两个键），前后不要有任何文字、解释或标点。';
       let finalText = '';
       let toolCalls = [];
+      /* 限流检测（动态风控核心）：DeepSeek 公平使用风控的受限提示会作为"回复"本身出现
+       * （"服务器繁忙，请稍后再试"等）。仅当新回复较短（<400 字符）时对回复文本检测，
+       * 避免误判正常长回复中被复述的关键词；检测到 → 结构化 errorKind 上报网关切账号，
+       * 不把受限文案当正常回答发给 DSH。 */
+      let limitHit = null;
+      let lengthHit = false; /* 对话过长信号（SPEC-v2 §5.3）：走迁移+摘要重试，不上报网关不切账号 */
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) {
-          log('streamAsk 安全网: 像工具调用但解析失败，发纠正消息重试 ' + attempt + '/2');
-          await sendMessage(pageId, RETRY_PROMPT, {});
+          if (lengthHit) {
+            /* 对话过长 → 迁移+摘要：提取当前会话摘要 → newChat → 注入摘要重发原问题。
+             * 旧实现检测到 length 后直接忽略，"对话过长"文案被当正常回复发给 DSH。 */
+            log('streamAsk 对话过长 → 迁移+摘要重试 ' + attempt + '/2');
+            let digest = '';
+            try { digest = await extractHistoryDigest(pageId); } catch (e) { /* ignore */ }
+            await newChat(pageId);
+            migrated = true;
+            if (digest) payload = '【之前的对话摘要，请基于此继续】\n' + digest + '\n\n' + payload;
+            lengthHit = false;
+            /* 新会话就绪等待 + 模式 pill 幂等重应用（newChat 可能重置页面状态） */
+            try { await waitReady(pageId, 15000); } catch (e) { /* ignore */ }
+            await sleep(1500);
+            try {
+              await applyConfig(pageId, {
+                mode: params && params.mode,
+                deepThink: params && params.deepThink,
+                search: params && params.search,
+              });
+            } catch (e) { log('applyConfig warn', e.message); }
+          } else {
+            log('streamAsk 安全网: 像工具调用但解析失败，发纠正消息重试 ' + attempt + '/2');
+            await sendMessage(pageId, RETRY_PROMPT, {});
+          }
         }
         const start = Date.now();
-        /* 发送前旧文本（用于检测新回复出现） */
+        /* 发送前旧文本（仅用于检测"新回复出现"的基线，绝不当作本轮结果）。
+         * cleanText 后比较——与流式增量/终态 result 同一清洗基准，
+         * 网关侧前缀对齐补尾的前提（v3 真流式）。 */
         const beforeText = await evalJs(pageId, EXPR.extractLast).catch(() => '');
-        let lastText = beforeText || '';
+        const beforeClean = cleanText(beforeText);
+        let lastText = ''; /* 本轮新回复的累计文本（cleanText 后；firstSeen 后才有效） */
+        let lastThink = ''; /* 思考流累计快照（思考增量差分基线；每 attempt 重置） */
         let lastChange = 0; /* 不为初始值 Date.now()，避免 5s 兜底在文本未出现时误触发 */
         let firstSeen = false; /* 首次看到新回复文本 */
         let genSeen = false; /* 是否见过生成中（文本相同的新回复靠 generating 完成判定） */
         while (Date.now() - start < timeoutMs) {
           if (st.stopped) throw new Error('stopped');
-          let text = '';
-          try { text = await evalJs(pageId, EXPR.extractLast); } catch (e) { /* keep polling */ }
-          let gen = true;
-          try { gen = await evalJs(pageId, EXPR.generating); } catch (e) { /* assume generating */ }
+          /* 四项探测并行（CDP roundtrip 串行会把轮询周期拉长近一倍）：
+           * 正文 / 生成中 / 思考中 / 思考文本（非思考模式无容器 → ''，空跑一轮） */
+          const [textR, genR, thinkR, thinkTextR] = await Promise.all([
+            evalJs(pageId, EXPR.extractLast).catch(() => ''),
+            evalJs(pageId, EXPR.generating).catch(() => true),
+            evalJs(pageId, EXPR.thinking).catch(() => false),
+            evalJs(pageId, EXPR.extractThinking).catch(() => ''),
+          ]);
+          /* 思考流增量（kind=thinking，网关转 reasoning_content）：
+           * 思考文本只增（生成中）；收缩/折叠（完成）→ 只更新基线不发增量。
+           * 折叠后读 ''，不重置 lastThink——下轮 attempt 重试时在循环外重置。 */
+          const thinkText = thinkTextR || '';
+          if (thinkText && thinkText !== lastThink) {
+            const td = thinkText.length > lastThink.length ? thinkText.slice(lastThink.length) : '';
+            if (td) emitEvent('stream-delta', { streamId, delta: td, kind: 'thinking' });
+            lastThink = thinkText;
+          }
+          /* 正文 cleanText 后比较：流式增量与终态 result 同基准
+           * （网关前缀对齐补尾的前提；cleanText 幂等——按钮行/空行中途出现不破坏前缀）。 */
+          const text = cleanText(textR || '');
+          const gen = genR !== false; /* 探测失败按生成中处理（保守不退出） */
+          const thinking = !!thinkR;
           if (gen) genSeen = true;
-          if (text && text !== lastText) {
-            if (!firstSeen) { firstSeen = true; log('streamAsk firstText len=' + text.length + ' after ' + (Date.now() - start) + 'ms'); }
-            const delta = text.slice(lastText.length);
-            if (delta) emitEvent('stream-delta', { streamId, delta });
+          /* 变化检测：与发送前基线不同 = 新回复开始出现。
+           * 修复：delta 从新回复自身累计（首轮发全量、后续发增量），
+           * 旧实现 text.slice(beforeText.length) 假设新回复是旧回复的前缀扩展——
+           * 两轮回复内容无关，切片会把新回复开头截掉。 */
+          if (text && !firstSeen && text !== beforeClean) {
+            firstSeen = true;
             lastText = text;
             lastChange = Date.now();
+            log('streamAsk firstText len=' + text.length + ' after ' + (Date.now() - start) + 'ms');
+            /* 受限提示检测（先于 delta 发出）：新回复文本短且命中风控模式 → 立即终止。
+             * 检测先行保证限流文案绝不流入客户端——切号重试无残留文本污染。 */
+            if (!limitHit && lastText.length < 400) {
+              const lim = detectLimit(lastText);
+              if (lim && lim.kind === 'length') {
+                lengthHit = true;
+                log('streamAsk 对话过长检测命中: text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                break;
+              }
+              if (lim && (lim.kind === 'quota' || lim.kind === 'captcha')) {
+                limitHit = lim;
+                log('streamAsk 限流检测命中: kind=' + lim.kind + ' text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                break;
+              }
+            }
+            emitEvent('stream-delta', { streamId, delta: text });
+          } else if (firstSeen && text && text !== lastText) {
+            /* 流式增长：发增量。修复：页面重渲染/占位符闪烁可能导致文本瞬时缩短，
+             * 此时绝不回退 lastText（保留已捕获的最长文本，防内容丢失）；仅当变长才
+             * 发增量并更新 lastText；变短只重置稳定计时（页面仍在变化，未完）。 */
+            const grew = text.length > lastText.length;
+            const delta = grew ? text.slice(lastText.length) : '';
+            if (grew) lastText = text;
+            lastChange = Date.now();
+            if (!limitHit && lastText.length < 400) {
+              const lim = detectLimit(lastText);
+              if (lim && lim.kind === 'length') {
+                lengthHit = true;
+                log('streamAsk 对话过长检测命中: text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                break;
+              }
+              if (lim && (lim.kind === 'quota' || lim.kind === 'captcha')) {
+                limitHit = lim;
+                log('streamAsk 限流检测命中: kind=' + lim.kind + ' text[:120]=' + lastText.slice(0, 120).replace(/\n/g, '\\n'));
+                break;
+              }
+            }
+            if (delta) emitEvent('stream-delta', { streamId, delta });
           }
-          /* 完成：非生成中 + 文本已出现 + （文本变化过或生成开始过）+ 稳定 800ms；
-           * 5 秒未变兜底防卡（仅当文本已出现时才触发，避免新会话无文本时误退出） */
-          if (lastText.length > 10 && !gen && (lastChange > 0 || genSeen) && Date.now() - lastChange >= 800) break;
-          if (lastChange > 0 && Date.now() - lastChange >= 5000) break;
-          await sleep(350);
+          /* 完成判定（v3c 稳健版，防提前终止丢内容）：
+           * 1) 正信号（最可靠、最快）：见过生成中(genSeen)且当下 !gen（停止按钮消失），
+           *    或页面出现完成态动作按钮(复制/重新生成，生成中不显示) → 稳定 400ms 即完成；
+           *    直接解决 generating 选择器漏检时"文本稳定"误判提前 break 的问题。
+           * 2) 非生成中 + 非思考中 + 文本稳定 1500ms → 完成（generating 漏检兜底；
+           *    1500ms 而非 800ms，避免生成中 DOM 突发 >800ms 静默间隙误触发提前 break）。
+           * 3) 安全网：文本稳定 5s 即完成（不再要求 !gen，防 generating 误判常驻卡死到 240s）。
+           * 非思考(!thinking)在所有分支都要求——DeepThink 思考折叠→正文开始间隙绝不退出。 */
+          let doneActions = false;
+          if (!gen && !thinking) { try { doneActions = await evalJs(pageId, EXPR.doneActions); } catch (e) { /* ignore */ } }
+          const doneSignal = (genSeen && !gen) || doneActions;
+          if (lastChange > 0 && doneSignal && !thinking && Date.now() - lastChange >= 400) break;
+          if (lastChange > 0 && lastText.length > 10 && !gen && !thinking && Date.now() - lastChange >= 1500) break;
+          if (lastChange > 0 && !thinking && Date.now() - lastChange >= 5000) break;
+          await sleep(200);
+        }
+        /* 对话过长：attempt 未用尽 → 迁移+摘要重试（循环开头处理）；
+         * 用尽 → 显式报错（ok:false 无 errorKind，网关按普通错误上报，不切账号） */
+        if (lengthHit) {
+          if (attempt < 2) continue;
+          emitEvent('stream-end', { streamId, ok: false, error: 'length: 对话过长且迁移重试后仍受限，请重试或缩短对话' });
+          return;
+        }
+        /* 超时保护：新回复从未出现（发送失败/页面卡死）→ 报错而非把上一轮
+         * 旧回复当本轮结果返回（旧实现静默返回旧文本，用户看到重复的旧答案）。
+         * genSeen 兜底：见过生成中但文本与上轮完全相同（极端巧合）不误报 */
+        if (!firstSeen && !genSeen) {
+          emitEvent('stream-end', { streamId, ok: false, error: 'timeout: 等待 ' + Math.round(timeoutMs / 1000) + 's 未见新回复（页面可能卡死或发送失败），请重试' });
+          return;
         }
         finalText = cleanText(lastText);
+        /* 终态兜底收割（v3c）：循环可能因生成中 DOM 突发静默/选择器瞬时失配而稍早
+         * break，此时页面实际已输出更多内容。退出前再抓一次最终全文，取较长者，
+         * 确保不丢内容；网关按前缀对齐会把缺失尾部补发给客户端。 */
+        try {
+          const re = cleanText(await evalJs(pageId, EXPR.extractLast).catch(() => ''));
+          if (re.length > finalText.length) finalText = re;
+        } catch (e) { /* ignore */ }
         toolCalls = parseToolCalls(finalText, params.tools);
         /* 解析成功 或 文本不像工具调用（正常回答）→ 停止重试 */
         if (toolCalls.length || !looksLikeToolCall(finalText)) break;
@@ -2398,10 +2875,17 @@ handlers.streamAsk = async (params) => {
         const names = (params.tools || []).map((t) => ((t.function || t).name || '?')).join(',');
         log('streamAsk NO-toolCalls | 输出[:1500]: ' + String(finalText).slice(0, 1500).replace(/\n/g, '\\n') + ' | tools: ' + names.slice(0, 400));
       }
+      if (limitHit) {
+        /* 受限（quota/captcha）：结构化上报网关（errorKind）→ 网关标记账号并切换重试 */
+        emitEvent('stream-end', { streamId, ok: false, errorKind: limitHit.kind, error: 'DeepSeek 风控受限（' + limitHit.kind + '）: ' + String(finalText).slice(0, 200) });
+        return;
+      }
       if (toolCalls.length) emitEvent('stream-end', { streamId, ok: true, result: finalText, toolCalls });
       else emitEvent('stream-end', { streamId, ok: true, result: finalText });
     } catch (e) {
-      emitEvent('stream-end', { streamId, ok: false, error: e.message });
+      /* 登录失效的结构化信号（网关据此走自动登录/切换流程） */
+      const isLogin = String(e && e.message || '').startsWith('login required');
+      emitEvent('stream-end', { streamId, ok: false, errorKind: isLogin ? 'login' : undefined, error: e.message });
     } finally {
       streamStates.delete(streamId);
       streamActive--;
@@ -2415,6 +2899,8 @@ handlers.streamAsk = async (params) => {
   return { streamId };
 };
 
+/** 停止一个进行中的流式问答（网关在客户端断开时调用）：置 stopped 标志，
+ * streamAsk 轮询循环检测到后中断（防浏览器空转生成）。 */
 handlers.streamStop = async (params) => {
   const st = streamStates.get(params && params.streamId);
   if (st) st.stopped = true;

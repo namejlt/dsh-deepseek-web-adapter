@@ -7,6 +7,9 @@
   "files": [
     "lib/",
     "resources/",
+    "!resources/runtime/profiles",
+    "!resources/runtime/*.log",
+    "!resources/runtime/accounts.json",
     "cordis.patch.yml",
     "README.md",
     "README.en.md",

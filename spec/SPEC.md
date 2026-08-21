@@ -58,8 +58,9 @@
 │  └───────────────────────────┬───────────────────────────────────────┘  │
 │                              │ stdio JSON-lines RPC                     │
 │  ┌───────────────────────────▼───────────────────────────────────────┐  │
-│  │  并发信号量 (maxConcurrent)                                       │  │
-│  │  提示词组装 (buildContext / buildToolsText)                        │  │
+│  │  会话注册表 (SessionRegistry：指纹识别/会话锁/通道分配)             │  │
+│  │  账号池 (AccountPool：状态机/指数退避/粘性调度/统计落盘) ★v2        │  │
+│  │  并发信号量 (maxConcurrent) + 提示词组装 (buildContext/ToolsText)  │  │
 │  │  SSE 输出 (sseHeaders / sseChunk)                                 │  │
 │  │  WorkBuddy 落盘模式 (本地文件通信)                                 │  │
 │  └───────────────────────────┬───────────────────────────────────────┘  │
@@ -178,7 +179,7 @@ node dsweb-gateway.js --port 5688 --base resources/runtime
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/v1/models` | 返回模型列表（deepseek-chat/reasoner/vision） |
+| GET | `/v1/models` | 返回模型列表（chat/reasoner/search/think-search/expert/expert-reasoner/vision/vision-reasoner） |
 | POST | `/v1/chat/completions` | OpenAI 兼容流式/非流式聊天 |
 | GET | `/login` | 打开有头浏览器窗口登录 |
 | GET | `/login-status` | 查询登录状态 |
@@ -191,38 +192,67 @@ node dsweb-gateway.js --port 5688 --base resources/runtime
 | POST | `/config` | 读写运行时配置 |
 | GET | `/debug` | DOM 诊断信息 |
 
-#### 3.2.2 模型定义
+#### 3.2.2 模型定义（2026-08 页面重构后：三模式入口 + pill 开关映射）
+
+DeepSeek 网页版为三模式入口（快速 / 专家 / 识图）+ 输入框下方 pill 开关：
+
+| 模式入口 | 可选 pill |
+|---|---|
+| quick 快速 | 深度思考、智能搜索（可同开） |
+| expert 专家 | 深度思考 |
+| vision 识图（视图） | 深度思考 |
+
+模型 ID = 模式 × pill 组合（8 种），driver 侧 `applyConfig` 幂等切换
+（模式入口与 pill 均先读状态不一致才点击；search 仅 quick 模式有）：
 
 ```javascript
 MODELS = {
-  'deepseek-chat':    { name: 'DeepSeek 快速', mode: 'quick',  deepThink: false },
-  'deepseek-reasoner': { name: 'DeepSeek 专家', mode: 'expert', deepThink: true  },
-  'deepseek-vision':  { name: 'DeepSeek 识图', mode: 'vision', deepThink: false },
+  'deepseek-chat':            { name: 'DeepSeek 快速（网页版）',          mode: 'quick',  deepThink: false, search: false },
+  'deepseek-reasoner':        { name: 'DeepSeek 深度思考（网页版）',      mode: 'quick',  deepThink: true,  search: false },
+  'deepseek-search':          { name: 'DeepSeek 智能搜索（网页版）',      mode: 'quick',  deepThink: false, search: true  },
+  'deepseek-think-search':    { name: 'DeepSeek 深度思考+搜索（网页版）', mode: 'quick',  deepThink: true,  search: true  },
+  'deepseek-expert':          { name: 'DeepSeek 专家（网页版）',          mode: 'expert', deepThink: false, search: false },
+  'deepseek-expert-reasoner': { name: 'DeepSeek 专家+深度思考（网页版）',  mode: 'expert', deepThink: true,  search: false },
+  'deepseek-vision':          { name: 'DeepSeek 识图（网页版）',          mode: 'vision', deepThink: false, search: false },
+  'deepseek-vision-reasoner': { name: 'DeepSeek 识图+深度思考（网页版）',  mode: 'vision', deepThink: true,  search: false },
 }
 ```
 
+模式入口/pill 未找到（页面改版/区域差异）时，回放该模型的校准录制（`calibKey=model`）兜底。
+
 #### 3.2.3 核心流程
 
-**Chat Completion 处理流程**：
+**Chat Completion 处理流程（v3 会话亲和模型）**：
 ```
-1. 解析请求 payload（model/messages/tools/stream）
-2. 获取并发信号量（acquireSem）
-3. 组装上下文（buildContext）— 只发增量（最后一条消息）
-4. 组装工具提示词（buildToolsText）— 提示工程让模型输出 tool_call
-5. 调用 Driver RPC streamAsk
-6. 建立 SSE 消费者（makeConsumer）
-7. 流式输出:
-   - 首 chunk: delta.role = 'assistant'
-   - 内容 chunk: delta.content（每次 120 字符）
-   - 工具调用 chunk: delta.tool_calls（分段 60 字符）
-   - 结束 chunk: finish_reason = 'stop' | 'tool_calls'
-   - 终止: data: [DONE]
-8. 释放信号量
+1. 解析请求 payload（model/messages/tools/stream；stream=false 走 JSON 非流式）
+2. resolveSession(payload) — 指纹识别逻辑会话：
+   ├─ 指纹 = hash(system + 首条非 runtime-context 的 user 消息)
+   │   full=全文精确 / loose=前 300 字符宽松（抗 ctx 拼接漂移）
+   ├─ 命中已有会话 + epoch 一致 → mode='delta'（只发增量）
+   ├─ 命中但 epoch 失配（driver 重启/profile 切换）→ mode='recovery'（压缩重建）
+   └─ 未命中（首轮/孤儿）→ mode='first' 或 'recovery'，分配专属通道 pageKey
+3. acquireSessionLock(session) — 同会话串行（网页版一个会话无法并行生成）
+4. acquireSem() — 全局生成并发上限（多账号时退化为 1：切 profile 需重启浏览器）
+5. poolPick() — 账号调度：会话粘性 → currentProfile（避免重启）→ lastUsedAt 最旧
+6. askOnce 循环 — buildContext(mode) + buildToolsText → rpc('streamAsk') → 等 stream-end
+   ├─ ok → poolMarkOk（统计落盘）
+   ├─ errorKind=quota/captcha/login → 账号池状态机处理 + 换号 recovery 重试（预算 2 次）
+   └─ 兜底超时 20min（防 driver 卡死锁死会话锁）
+7. 输出：流式 SSE / 非流式 JSON；失败路径 epoch=-1（下轮强制 recovery）
+8. finally：释放信号量 → 会话锁
 ```
 
-**会话管理策略**：
-- `shouldResetChat(payload)`: 如果最后 3 条消息不含 tool 角色 → 新会话（newChat）
-- 否则连续对话（网页版保持历史）
+**三种上下文模式（buildContext）**：
+| mode | 触发 | 发送内容 |
+|------|------|----------|
+| `first` | 新会话首轮 | system + runtime context + 工具协议 + 用户消息（一次性灌入） |
+| `delta` | 后续轮（epoch 一致） | 仅最后一条增量（用户消息/工具结果），网页版自留历史 |
+| `recovery` | driver 重启/切账号/上轮失败 | system + ctx + 最近 10 条压缩对话 + 工具协议（重建） |
+
+**会话/通道生命周期**：
+- 通道分配：复用池 → main → 新建 ch-N；满（maxPages）→ 驱逐闲置 ≥30s 会话
+- 空闲 TTL 10 分钟 → `releaseChannel` 清网页历史后回收 pageKey
+- driver 重启（epoch 代数递增）/ profile 切换（channels-reset 事件）→ 全部会话转 recovery
 
 **WorkBuddy 落盘模式**：
 - 特殊模型 `workbuddy-agent` 走文件通信
@@ -233,9 +263,13 @@ MODELS = {
 
 ```javascript
 state = {
-  headless: false,          // 无头模式
-  maxConcurrent: 2,         // 最大并发数
-  maxTurnsPerChat: 50,      // 每次会话最大轮数
+  headless: false, maxConcurrent: 2, maxTurnsPerChat: 50, maxPages: 4,
+  sessionTtlMs: 10 * 60 * 1000,          // 会话空闲回收
+  accountPool: true, maxAccounts: 3, autoRelogin: true,
+  quotaBackoffBaseMs: 5 * 60 * 1000,     // 指数退避基数
+  quotaBackoffMaxMs: 6 * 60 * 60 * 1000, // 退避封顶 6h
+  quotaConfirmWindowMs: 10 * 60 * 1000,  // quota 二次确认窗口
+  maxAccountSwitchesPerRequest: 2,       // 单请求切换预算
 }
 ```
 
@@ -365,26 +399,24 @@ waitForResponse(state, timeoutMs, stableDelayMs):
 
 #### 3.3.8 反限制引擎 (Anti-Limit Engine)
 
-**限制类型检测**：
+**限制类型检测（detectLimit 模式表，v2 起集成进 streamAsk 轮询）**：
 
 | 类型 | 检测模式 | 处理策略 |
 |------|----------|----------|
-| length（长度限制） | 对话超长/上下文超限 | 压缩上下文 + 迁移到新会话 |
-| quota（配额限制） | 当日次数用完/频率限制 | 账号轮换 / 退避重试 |
-| captcha（验证码） | 人机验证/Cloudflare | 终止任务，通知用户手动处理 |
+| length（长度限制） | 对话超长/上下文超限 | driver 内迁移+摘要重试（extractHistoryDigest → newChat → 注入摘要重发），不上报网关不切账号；3 次用尽报错 |
+| quota（配额限制） | 频率限制/服务器繁忙等动态风控文案 | 结构化 errorKind=quota 上报 → 网关账号池二次确认 → cooling 指数退避 + 换号 recovery 重试 |
+| captcha（验证码） | 人机验证/Cloudflare | errorKind=captcha → 账号 disabled（转人工，/accounts/enable 重启用） |
 
-**上下文压缩 (buildDigest)**：
-- 保留最近 N 条消息（keepRecent=4）
-- 旧消息压缩为 `[ROLE] 摘要 (长度)`
-- 工具结果压缩为 `[TOOL RESULT tool] 首行 (长度)`
+误判防线：仅对**新回复文本 <400 字符**时检测（防正常长回复复述关键词误命中）；
+仅在新回复实际出现（firstSeen）后检测（防把上一轮旧回复当信号）。
 
-**会话迁移流程**：
+**会话迁移流程（reset='auto' 预防性 + length 信号响应式）**：
 ```
-1. 检测到限制信号/超限
-2. 提取当前会话历史摘要
+1. 消息数 > maxTurnsPerChat（预防）或检测到 length 信号（响应）
+2. extractHistoryDigest(pageId) — 最近 15 条消息、每条 150 字压缩
 3. newChat → 创建新会话
-4. 注入 [CONTEXT DIGEST] 消息
-5. 继续原始任务
+4. 注入【之前的对话摘要，请基于此继续】+ 原问题重发
+5. 迁移后 waitReady + applyConfig 幂等重应用 pill
 ```
 
 **账号轮换 (profile rotation)**：
@@ -475,25 +507,27 @@ subPages[]: 子 Agent 独立页面池（用完归还复用）
 
 | 文件 | 说明 |
 |------|------|
-| `driver.js` | driver.js 的运行时副本（首次启动自动生成） |
-| `calibration.json` | 模型校准数据（内置 deepseek-reasoner 专家模式） |
+| `driver.js` | 单一浏览器引擎源码（位于 `resources/driver.js`，网关运行时直接执行；**并非** runtime 副本，无自动生成机制） |
+| `calibration.json` | 模型校准数据（内置 deepseek-reasoner 快速+深度思考） |
 
 ---
 
-### 3.5 tests/test-parser-all.js — 解析器回归测试
+### 3.5 tests/ — 单元测试套件（8 个文件，269 项断言）
 
-**测试覆盖 54 个场景**，分为 8 大类：
+全部纯离线（vm 沙箱加载网关纯函数 / mock rpc / fake DOM），无浏览器依赖：
 
-| 类别 | 场景数 | 覆盖内容 |
-|------|--------|----------|
-| A. 格式变体 | 10 | tool_call/```json/```/XML/平铺 JSON/OpenAI 风格 |
-| B. 参数层陷阱 | 7 | 反斜杠/换行转义/中文/嵌套对象/数组/空参数 |
-| C. 匹配层 | 10 | 已知 name/schema 推断/纯参数推断/歧义消除 |
-| D. 防误判 | 4 | 天气 JSON/代码示例/回复结尾数据/多 JSON |
-| E. 特殊 | 6 | 参数值含`}`/数字参数/下划线工具名/连续 tool_call/XML 属性/null 参数 |
-| F. 参数别名 | 4 | path→file_path/cmd→command/file→file_path/filepath→file_path |
-| G. 参考实现容错 | 9 | args 容器/parameters 容器/input 容器/尾逗号/未加引号 key/Python 格式 |
-| H. 安全网检测 | 4 | looksLikeToolCall 辅助检测 |
+| 测试文件 | 断言数 | 覆盖内容 |
+|----------|--------|----------|
+| `test-parser-all.js` | 54 | 工具调用解析器 8 大类（格式变体/参数陷阱/schema 推断/防误判/别名/容错） |
+| `test-account-pool.js` | 61 | 账号池状态机/指数退避/调度/落盘/切换重试集成/detectLimit 模式表/并发退化 |
+| `test-audit-fixes.js` | 26 | 历史审计修复回归（超时保护/delta 语义/channels-reset/非流式/断开停止等 9 项） |
+| `test-runtime-context.js` | 25 | runtime-context 识别（approval ask/never 变体）/指纹抗漂移/ctx 兜底 |
+| `test-model-modes.js` | 25 | 模型 pill 映射/幂等切换/校准回退 |
+| `test-tool-prompt.js` | 24 | 工具提示词组装/预算降级/真实工具示例 |
+| `test-thinking-mode.js` | 19 | 思考模式流提取（思考中不退出防截断） |
+| `test-completeness.js` | 35 | 完备性修复（SSE 流悬挂/兜底超时/epoch 失配/length 迁移/协议异常） |
+
+运行：`node tests/<file>.js`（测试直接读 `resources/driver.js` 单一源码，改完即测，无需同步）。
 
 ---
 
@@ -523,35 +557,41 @@ DSH pi-ai Provider (dsweb)
     ▼
 Gateway (dsweb-gateway.js)
     │
-    ├─ 1. 解析 payload
-    ├─ 2. acquireSem() 获取并发槽位
-    ├─ 3. buildContext(payload) — 只取最后一条消息
-    ├─ 4. buildToolsText(payload.tools) — 生成工具调用提示词
-    ├─ 5. shouldResetChat(payload) — 判断是否新会话
-    ├─ 6. rpc('streamAsk', { question, mode, deepThink, toolsText, ... })
+    ├─ 1. 解析 payload（stream=false → 非流式 JSON）
+    ├─ 2. resolveSession(payload) — 指纹识别会话 → mode = first/delta/recovery
+    ├─ 3. acquireSessionLock() — 同会话串行
+    ├─ 4. acquireSem() 获取并发槽位
+    ├─ 5. poolPick() — 账号调度（粘性 → currentProfile → 最旧）
+    ├─ 6. buildContext(mode) + buildToolsText(tools)
+    ├─ 7. rpc('streamAsk', { question, pageKey, profile, reset, ... })
     │
     ▼
 Driver (driver.js)
     │
-    ├─ 7. ensurePage(profile) — 获取/创建页面
-    ├─ 8. ensureLoggedIn(pageId) — 检查登录状态
-    ├─ 9. 会话管理:
-    │   ├─ reset=true → newChat + 校准
-    │   ├─ reset='auto' + 超限 → 迁移 + 摘要注入
-    │   └─ 其他 → 连续对话
-    ├─ 10. applyCalibration(pageId, calibKey) — 模型切换
-    ├─ 11. sendMessage(pageId, payload) — 输入 + 发送
-    ├─ 12. 轮询 extractLast 等待回复
-    ├─ 13. 安全网重试（最多 2 次）
-    ├─ 14. parseToolCalls(finalText, tools) — 解析工具调用
+    ├─ 8. ensureChannelPage(pageKey, profile) — 会话亲和通道
+    │   └─ profile 失配 → 重启浏览器 + channels-reset → 网关全部会话转 recovery
+    ├─ 9. ensureLoggedIn(pageId) — 检查登录状态（失效 → errorKind=login）
+    ├─ 10. 会话管理:
+    │   ├─ reset=true（first/recovery）→ newChat + 校准
+    │   ├─ reset='auto'（delta）→ 消息数超限 → 迁移 + 摘要注入
+    │   └─ length 信号 → 迁移 + 摘要重试（最多 2 次）
+    ├─ 11. applyConfig(pageId) — pill 幂等切换（深度思考/搜索）
+    ├─ 12. sendMessage(pageId, payload) — 输入 + 发送
+    ├─ 13. 轮询（Promise.all 并行：extractLast/generating/thinking）
+    │   ├─ stream-delta 事件 → 网关转发（伪流式）
+    │   ├─ detectLimit 命中 → errorKind=quota/captcha 上报
+    │   └─ 新回复未出现 → timeout 报错（不返回旧回复）
+    ├─ 14. 安全网重试（最多 2 次）
+    ├─ 15. parseToolCalls(finalText, tools) — 解析工具调用
     │
     ▼
 Gateway (stream-end event)
     │
-    ├─ 15. 有 toolCalls → 构造 SSE tool_calls chunk
-    ├─ 16. 无 toolCalls → 构造 SSE content chunk
-    ├─ 17. 发送 [DONE] 标记
-    ├─ 18. release() 释放信号量
+    ├─ 16. ok → poolMarkOk（账号统计落盘）+ SSE 输出
+    ├─ 17. errorKind → 账号池状态机 → 换号 recovery 重试（预算 2 次）
+    ├─ 18. 有 toolCalls → SSE tool_calls chunk；否则 content chunk
+    ├─ 19. 发送 [DONE] 标记
+    ├─ 20. finally: 释放信号量 → 会话锁；失败路径 epoch=-1
     │
     ▼
 DSH pi-ai Provider
@@ -604,8 +644,13 @@ dsweb:
   baseURL: http://127.0.0.1:5688/v1/
   models:
     - { id: deepseek-chat, name: DeepSeek 快速 }
-    - { id: deepseek-reasoner, name: DeepSeek 专家 }
+    - { id: deepseek-reasoner, name: DeepSeek 深度思考 }
+    - { id: deepseek-search, name: DeepSeek 智能搜索 }
+    - { id: deepseek-think-search, name: DeepSeek 深度思考+搜索 }
+    - { id: deepseek-expert, name: DeepSeek 专家 }
+    - { id: deepseek-expert-reasoner, name: DeepSeek 专家+深度思考 }
     - { id: deepseek-vision, name: DeepSeek 识图 }
+    - { id: deepseek-vision-reasoner, name: DeepSeek 识图+深度思考 }
 ```
 
 **credentials.yaml**：
@@ -620,8 +665,14 @@ MOCK_LLM_KEY: sk-mock-any-value
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
 | `headless` | false | bool | 无头模式（变更需重启网关） |
-| `maxConcurrent` | 2 | 1-5 | 最大并发请求数 |
-| `maxTurnsPerChat` | 50 | 2-500 | 每次会话最大轮数（超限迁移） |
+| `maxConcurrent` | 2 | 1-5 | 最大并发请求数（多账号时实际退化为 1） |
+| `maxTurnsPerChat` | 50 | 2-500 | 每次会话最大轮数（超限迁移+摘要） |
+| `maxPages` | 4 | 1-8 | 并发通道（浏览器 tab）数上限 |
+| `accountPool` | true | bool | 账号池开关（false = v1 旁路模式） |
+| `maxAccounts` | 3 | 1-8 | 账号数上限（内存预算） |
+| `autoRelogin` | true | bool | 会话失效自动弹登录窗口 |
+| `quotaBackoffBaseMs` | 300000 | 1min-1h | 指数退避基数 |
+| `quotaBackoffMaxMs` | 21600000 | 30min-24h | 退避封顶（6h） |
 
 ### 5.3 Driver 配置 (DEFAULTS)
 
@@ -754,11 +805,17 @@ TOOLS.new_tool = {
 │   ├── driver.js                # 浏览器引擎（~2500 行）
 │   ├── package.json             # CommonJS 声明
 │   └── runtime/
-│       ├── driver.js            # 运行时 driver 副本
 │       └── calibration.json     # 模型校准数据
-├── tests/
+├── tests/                       # 纯离线测试套件（8 文件 / 269 断言）
 │   ├── package.json             # CommonJS 声明
-│   └── test-parser-all.js       # 解析器回归测试（54 场景）
+│   ├── test-parser-all.js       # 解析器回归测试（54 断言）
+│   ├── test-account-pool.js     # 账号池状态机测试（61 断言）
+│   ├── test-audit-fixes.js      # 历史审计修复回归（26 断言）
+│   ├── test-runtime-context.js  # runtime-context 识别（25 断言）
+│   ├── test-model-modes.js      # 模型 pill 映射（25 断言）
+│   ├── test-tool-prompt.js      # 工具提示词组装（24 断言）
+│   ├── test-thinking-mode.js    # 思考模式流提取（19 断言）
+│   └── test-completeness.js     # 完备性修复回归（35 断言）
 ├── cordis.patch.yml             # Bundle 配置补丁
 ├── package.json                 # 主包配置
 ├── README.md                    # 中文文档

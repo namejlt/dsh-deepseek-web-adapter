@@ -40,7 +40,7 @@ DSH 插件应遵循明确的分层架构，每层职责单一：
 | Host | lib/index.js | apply() 启动网关，ctx.effect() 卸载回收 |
 | Logic | resources/dsweb-gateway.js | HTTP API、并发控制、提示词组装 |
 | Logic | resources/driver.js | 浏览器控制、工具解析、反限制 |
-| Data | resources/runtime/ | 校准数据、driver 运行时副本 |
+| Data | resources/runtime/ | 本地运行时数据（登录态 profiles、账号池状态、校准数据、日志） |
 
 ### 1.2 单一职责
 
@@ -586,8 +586,7 @@ dsh-deepseek-web-adapter/
 │   ├── dsweb-gateway.js      # HTTP 网关（OpenAI 兼容 API）
 │   ├── driver.js             # 浏览器引擎（CDP + 工具解析）
 │   ├── package.json          # CommonJS 声明
-│   └── runtime/              # 运行时数据
-│       ├── driver.js         # driver 运行时副本
+│   └── runtime/              # 本地运行时数据（浏览器 profile / 账号池 / 校准 / 日志）
 │       └── calibration.json  # 模型校准数据
 ├── tests/
 │   └── test-parser-all.js    # 54 场景回归测试

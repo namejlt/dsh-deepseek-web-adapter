@@ -1,5 +1,7 @@
 # Runtime / local data — never commit
 resources/runtime/profiles/
+resources/runtime/accounts.json
+resources/runtime/calibration.json
 resources/runtime/*.log
 resources/runtime/tools.log
 resources/mock-api/

@@ -3,26 +3,36 @@
 > **中文**: [README.md](README.md)
 
 > ⚠️ **Developer Preview**: published by an individual developer, **not extensively tested in the wild**.
-> Verified: login, basic Q&A, Expert-mode switch, single tool call, gateway auto-start/stop.
-> Not fully verified: multi-round tool loops, long-chat migration, sub-agent concurrency, headless mode,
-> vision mode, disconnect recovery. Read [Known limitations](#known-limitations) before use.
+> Verified: login, basic Q&A, mode-pill switching (Deep Think / Smart Search), single tool call, gateway auto-start/stop, account-pool
+> state machine / switching / backoff (61 offline unit tests).
+> Not fully verified: multi-round tool loops, long-chat migration, multi-session concurrency, headless mode,
+> vision mode, disconnect recovery, multi-account switching against live risk control.
+> Read [Known limitations](#known-limitations) before use.
 > Please report issues at [Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues).
 
 Turn **DeepSeek Web (chat.deepseek.com)** into a free, API-key-free LLM provider for DeepSeek Harness (DSH).
 On plugin load, a local gateway (`resources/dsweb-gateway.js` + `driver.js`, one persistent browser) is
 spawned automatically and serves an OpenAI-compatible API. Supports: continuous chat, tool calling,
-model calibration, and concurrent sub-agents.
+model calibration, session-affinity concurrency, and multi-account pooling with quota-triggered switching.
 
 - No API key, no third-party login (just your own DeepSeek account)
 - `dsh plugin add` — one command; the gateway auto-starts/stops
+
+> **v2 core implemented**: multi-account storage · auto re-login · quota-triggered account switching ·
+> dynamic risk-control backoff (exponential + probe recovery) — see [spec/SPEC-v2.md](spec/SPEC-v2.md).
+> Remaining v2 items (one-click setup wizard / per-account browser instances) are still 🚧 planned.
+
+**Docs**: [User guide](docs/user-guide.md) · [Publishing guide](docs/publishing.md) · [Plugin dev tutorial](docs/dsh-plugin-tutorial.md) · [Best practices](docs/dsh-plugin-best-practices.md)
 
 ## Known limitations
 
 | Limitation | Notes |
 |---|---|
 | Beta quality | Not extensively tested in real environments; behavior may be unstable |
+| Multi-account concurrency degrades to serial (P0) | With multiple accounts, concurrency drops to 1 (switching accounts restarts the single browser); single-account keeps full session-affinity concurrency |
+| Dynamic risk control is unpredictable | Fair-use limits have no published numbers or unfreeze times — the gateway only trusts on-page signals, backs off exponentially and probes recovery; it **cannot promise when an account unfreezes** |
 | No client card UI | This package ships host only (auto-launch gateway). **No login/calibration/headless card controls** — open `http://127.0.0.1:5688/login` manually to log in, configure via `curl` to `/config` (see Manual control). Card UI lives in the dev repo (`dsweb-plugin/client-llm.js`); contributions welcome |
-| Requires a real browser | Needs Chrome installed locally; login session is an in-memory cookie — closing the window requires re-login |
+| Requires a real browser | Needs Chrome installed locally; login state is kept in the `runtime/profiles/` browser profile directory — persists across restarts when "Keep me signed in" is ticked; re-login needed after DeepSeek tokens expire |
 | Depends on DeepSeek web UI | UI changes may break selectors (calibration/send/extract); `driver.js` then needs updating |
 | Parser is tolerant, not infallible | 54-case regression covers common formats; exotic malformed model output may still fail |
 
@@ -51,7 +61,8 @@ dsweb:
     models:
       [
         { id: deepseek-chat, name: DeepSeek Fast },
-        { id: deepseek-reasoner, name: DeepSeek Expert },
+        { id: deepseek-reasoner, name: DeepSeek Deep Think },
+        { id: deepseek-search, name: DeepSeek Smart Search },
         { id: deepseek-vision, name: DeepSeek Vision }
       ]
   }
@@ -64,35 +75,85 @@ DSH config hot-reloads — the DeepSeek Web models appear in the model picker im
 
 Open `http://127.0.0.1:5688/login` in a browser and sign in to chat.deepseek.com.
 If a "Keep me signed in / Remember me" option exists, tick it — the session persists across restarts.
+On session expiry the gateway auto-opens a login window (`autoRelogin`, on by default, one window at a time)
+and retries the original request in recovery mode once login completes.
+
+Additional accounts: `http://127.0.0.1:5688/login?profile=acc2` (each account gets its own browser profile;
+login windows time out after 5 minutes; completion is auto-detected via `/login-status`).
 
 ## Usage
 
-Pick **DeepSeek Web** (Fast / Expert / Vision) in the DSH model picker.
+Pick **DeepSeek Web** (Fast / Deep Think / Smart Search / Vision) in the DSH model picker.
+Mode mapping matches the 2026-08 page redesign (model selector removed, replaced by pills under the input box, switched idempotently):
+Fast, Fast + Deep Think, Fast + Smart Search, Vision + Deep Think.
 
 | Capability | Notes |
 |---|---|
 | Continuous chat | Web page keeps history; auto-migrates (summary + new session) beyond the length limit (default 50 turns, configurable) |
 | Tool calling | Model emits a `tool_call` code block → gateway parses it (54-case hardened parser) → DSH executes |
-| Model calibration | `deepseek-reasoner` → Expert mode (calibration data bundled; can be re-recorded) |
-| Sub-agent concurrency | Concurrent requests use separate pages (parallel windows) |
+| Mode switching | Idempotent pill toggling (reads state first, clicks only on mismatch); falls back to recorded calibration when pills are not found |
+| Session-affinity concurrency | Fingerprinted sessions get dedicated browser channels; same session serial, different sessions parallel, idle channels recycled |
+| Multi-account storage | Each account has its own browser profile dir (persisted cookies), managed via the `/accounts` API (v2, implemented) |
+| Auto re-login | On session expiry the gateway opens a login window (mutually exclusive), then retries on the same account in recovery mode (v2, implemented) |
+| Quota-triggered switching | Dynamic risk control: exponential backoff (5min × 2ⁿ, capped 6h) + probe recovery; on quota, switches accounts and rebuilds context from compressed history (v2, implemented) |
 
 ## Manual control
 
 ```bash
 # Check gateway status
 curl http://127.0.0.1:5688/v1/models
+# Runtime status (login / sessions / channels / account pool / config)
+curl http://127.0.0.1:5688/health
+# Login status (completion is auto-detected)
+curl http://127.0.0.1:5688/login-status
+# Tune runtime config (parameters below)
+curl -X POST http://127.0.0.1:5688/config -H 'Content-Type: application/json' -d '{"maxConcurrent": 3}'
+# Model calibration (fallback recording for when mode pills are missing: record → collect → save)
+curl http://127.0.0.1:5688/calibrate/list     # stored calibration data
+curl http://127.0.0.1:5688/calibrate/record   # start recording (headed window + click capture)
+# DOM inspection (model-selector troubleshooting)
+curl http://127.0.0.1:5688/debug
 # Restart the gateway (removing the plugin stops it; re-adding auto-starts it)
 dsh plugin --profile web remove dsh-deepseek-web-adapter && dsh plugin --profile web add dsh-deepseek-web-adapter
 ```
+
+`/config` tunables (POST JSON, takes effect immediately):
+
+| Parameter | Range (default) | Notes |
+|---|---|---|
+| `headless` | bool (false) | Headless mode (changing it requires a gateway restart + re-login) |
+| `maxConcurrent` | 1-5 (2) | Global concurrent-generation cap |
+| `maxPages` | 1-8 (4) | Browser channel cap (evicts the longest-idle session when full) |
+| `maxTurnsPerChat` | 2-500 (50) | Max turns per web chat (auto-migrates + summarizes beyond it) |
+| `accountPool` | bool (true) | Account-pool switch (false = always use default, v1 behavior) |
+| `maxAccounts` | 1-8 (3) | Account count cap |
+| `autoRelogin` | bool (true) | Auto-open a login window on session expiry and retry |
+| `quotaBackoffBaseMs` | 60s-1h (5min) | Risk-control exponential-backoff base |
+| `quotaBackoffMaxMs` | 30min-24h (6h) | Risk-control exponential-backoff cap |
+
+Account management (v2, implemented):
+
+```bash
+curl -X POST http://127.0.0.1:5688/accounts/add -d '{"name": "acc2"}'      # add an account (opens a login window, 5-min timeout)
+curl http://127.0.0.1:5688/accounts                                        # account states (backoff / stats)
+curl -X POST http://127.0.0.1:5688/accounts/disable -d '{"name": "acc2"}'  # disable
+curl -X POST http://127.0.0.1:5688/accounts/enable -d '{"name": "acc2"}'   # enable (requires login verification to resume)
+curl -X POST http://127.0.0.1:5688/accounts/remove -d '{"name": "acc2", "confirm": true}'  # remove (profile dir kept)
+```
+
+🚧 Still planned: `GET /setup` one-click config wizard (see [SPEC-v2](spec/SPEC-v2.md)).
 
 ## Structure
 
 ```
 lib/index.js          # host: auto-launches the gateway on load, recycles it on unload
 resources/
-  dsweb-gateway.js    # core gateway (OpenAI API + login + calibration + concurrency + migration + tool parsing)
-  driver.js           # browser engine (single persistent page)
-  runtime/            # runtime (driver copy + calibration data; profile auto-created on first run)
+  dsweb-gateway.js    # core gateway (OpenAI API + login + calibration + session affinity + account pool + tool parsing)
+  driver.js           # browser engine (persistent Chrome + channel management + limit detection)
+  runtime/            # runtime (driver copy + calibration data + accounts.json + profiles/ per-account dirs)
+spec/
+  SPEC.md             # v1 dev spec (current behavior baseline)
+  SPEC-v2.md          # v2 spec (multi-account / auto login / quota switching — core implemented)
 cordis.patch.yml      # bundle config patch
 ```
 
@@ -107,7 +168,14 @@ DeepSeek Web has no native function calling — the gateway uses prompt engineer
 `tool_call` JSON, then converts it to standard `tool_calls` via a multi-layer tolerant parser
 (nested JSON, parameter aliases, single-backslash Windows paths, trailing commas, unquoted keys,
 retry safety net) for DSH to execute. Tool results feed back into the web page and the model continues.
-Regression suite: 54 scenarios (see `tests/` in the dev repo).
+
+Fair-use risk control on the web app has **no published quota numbers or unfreeze schedule**, so the
+gateway never guesses numbers: limit signals are detected only from on-page text (`detectLimit` pattern
+table, covering dynamic wordings such as "服务器繁忙"), and a suspect account is only confirmed after a
+second hit inside a 10-minute window. Confirmed accounts cool down with exponential backoff
+(5min × 2ⁿ, capped at 6h) and recover via a real probing request. On quota mid-request the gateway
+switches to another account (budget: 2 switches per request) and rebuilds context from compressed history.
+Regression suites: 54 parser scenarios + 61 account-pool scenarios (`tests/`).
 
 ## Development / maintenance
 
@@ -121,16 +189,17 @@ git clone https://github.com/huermi/dsh-deepseek-web-adapter.git
 # 2. No third-party runtime deps (Node 18+ and Chrome only)
 # 3. Run the gateway locally for debugging
 node resources/dsweb-gateway.js --port 5688 --base resources/runtime
-# 4. Run the parser regression suite (mandatory after touching driver.js)
-node tests/test-parser-all.js    # expect 54/54 pass
+# 4. Run the regression suites (mandatory after touching driver.js / dsweb-gateway.js)
+node tests/test-parser-all.js      # expect 54/54 pass
+node tests/test-account-pool.js    # expect 61/61 pass
 ```
 
 **Dev repo** (card UI, auto-launch host, full regression suite): see the `dsweb-plugin/` directory or
 discuss in [Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues).
 
 Key maintenance points:
-- `resources/driver.js` — browser engine + tool-call parser (update when DeepSeek web UI changes)
-- `resources/dsweb-gateway.js` — gateway (OpenAI API / login / calibration / concurrency / migration)
+- `resources/driver.js` — browser engine + tool-call parser + limit detection (update when DeepSeek web UI changes; **single source of truth**, the gateway executes this file directly at runtime — no copy to sync)
+- `resources/dsweb-gateway.js` — gateway (OpenAI API / login / calibration / concurrency / account pool / migration)
 - `lib/index.js` — plugin host (launches gateway on load, recycles on unload)
 
 ## License

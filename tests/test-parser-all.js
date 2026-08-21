@@ -47,6 +47,17 @@ function check(desc, text, expected, opts) {
     failures.push({ desc, expected, got: gotName, detail: JSON.stringify(got).slice(0, 160) });
   }
 }
+/* 用自定义工具集校验（模拟「web_search 不在已授权工具列表」的真实场景） */
+function checkWith(desc, text, expected, customTools) {
+  const got = parseToolCalls(text, customTools);
+  const gotName = got.length ? got[0].name : '';
+  const ok = gotName === expected;
+  if (ok) { pass++; }
+  else {
+    fail++;
+    failures.push({ desc, expected, got: gotName, detail: JSON.stringify(got).slice(0, 160) });
+  }
+}
 
 /* ============ A. 格式变体 ============ */
 check('A1 <tool_call> 完整+嵌套', '<tool_call>\n{"name": "write", "arguments": {"file_path": "C:\\Users\\hp\\Desktop\\a.txt", "content": "你好"}}\n</tool_call>', 'write');
@@ -67,7 +78,7 @@ check('B3 含换行转义', '<tool_call>{"name": "write", "arguments": {"file_pa
 check('B4 中文内容', '<tool_call>{"name": "write", "arguments": {"file_path": "a.txt", "content": "你好世界"}}</tool_call>', 'write');
 check('B5 嵌套对象参数', '<tool_call>{"name": "cordis_define", "arguments": {"plugin": {"kind": "new"}, "name": "test", "purpose": "x"}}</tool_call>', 'cordis_define');
 check('B6 数组参数', '<tool_call>{"name": "todo_write", "arguments": {"todos": [{"content": "a"}, {"content": "b"}]}}</tool_call>', 'todo_write');
-check('B7 空参数', '<tool_call>{"name": "get_goal"}</tool_call>', 'get_goal');
+check('B7 空参数(已知工具仍解析)', '<tool_call>{"name": "exit_plan_mode"}</tool_call>', 'exit_plan_mode');
 
 /* ============ C. 匹配层 ============ */
 check('C1 name 在列表用 name', '<tool_call>{"name": "pwsh", "arguments": {"command": "echo hi"}}</tool_call>', 'pwsh');
@@ -79,7 +90,16 @@ check('C6 command→pwsh', '{"command": "ls"}', 'pwsh');
 check('C7 query→web_search', '{"query": "什么是 AGI"}', 'web_search');
 check('C8 objective→create_goal', '{"objective": "研究 JEPA"}', 'create_goal');
 check('C9 pattern+path→glob(典型)', '{"pattern": "TODO", "path": "src/"}', 'glob');
-check('C10 无 properties 工具不崩', '{"name": "get_goal"}', 'get_goal');
+check('C10 未知工具名不转发(不崩溃)', '{"name": "get_goal"}', '');
+/* ============ C'. 防无效工具转发（修复：对话阻塞/工具循环） ============ */
+check('C11 幻觉工具名不转发', '{"name": "fantasy_tool", "arguments": {"x": 1}}', '');
+check('C13 纯参数但无匹配 schema 不转发', '{"foo": 1, "bar": 2}', '');
+/* 真实场景：模型在「智能搜索」模式下被工具提示词影响输出 web_search，
+ * 但 web_search 不在 DSH 已授权工具集 → 必须拒转发，否则触发
+ * 「无效工具→报错→回传→再调」死循环（对话阻塞）。 */
+const noWebTools = tools.filter((t) => (t.function || t).name !== 'web_search');
+checkWith('C12 web_search 不在授权列表则拒', '<tool_call>{"name": "web_search", "arguments": {"queries": ["南京 天气 2026-08-21"]}}</tool_call>', '', noWebTools);
+checkWith('C12b 未知名+无匹配 schema 拒', '{"name": "search_web", "arguments": {"queries": ["x"]}}', '', noWebTools);
 
 /* ============ D. 防误判 ============ */
 check('D1 天气 JSON', '今天的天气是 {"temp": 25, "humidity": 60}', '');
