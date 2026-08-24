@@ -154,10 +154,10 @@ const THINK = ['深度思考', 'DeepThink', 'Deep Think', '深度推理'];
 }
 
 /* ---------- 3. 网关 MODELS 映射（对齐最新页面三模式八组合） ---------- */
-const mMatch = GW_SRC.match(/const MODELS = \{[\s\S]*?\n\};/);
-check('3a MODELS 定义存在', !!mMatch);
+const { MODELS } = require('../resources/provider-registry');
+const mMatch = !!MODELS;
+check('3a MODELS 由 provider registry 提供', mMatch);
 if (mMatch) {
-  const MODELS = eval('(' + mMatch[0].replace('const MODELS = ', '').replace(/;\s*$/, '') + ')');
   check('3b deepseek-chat = 快速无开关', MODELS['deepseek-chat'].mode === 'quick' && MODELS['deepseek-chat'].deepThink === false && MODELS['deepseek-chat'].search === false, JSON.stringify(MODELS['deepseek-chat']));
   /* 深度思考是快速模式的 pill 选项（V3 增强 CoT），reasoner = 快速 + 深度思考；
    * 与 SPEC.md / README / 用户描述一致（三模式均可选深度思考）。 */
@@ -170,8 +170,8 @@ if (mMatch) {
   /* 专家模式可选深度思考：expert-reasoner = 专家入口 + 开启 深度思考 pill；
    * 与模型名"专家+深度思考"及用户描述一致。 */
   check('3f2 deepseek-expert-reasoner = 专家 + 深度思考（expert 入口，deepThink=true）', MODELS['deepseek-expert-reasoner'] && MODELS['deepseek-expert-reasoner'].mode === 'expert' && MODELS['deepseek-expert-reasoner'].deepThink === true, JSON.stringify(MODELS['deepseek-expert-reasoner']));
-  check('3g 模型总数 = 8（quick×4 / expert×2 / vision×2）', Object.keys(MODELS).length === 8, 'count=' + Object.keys(MODELS).length);
-  check('3h expert/vision 模型均不带 search（页面无此 pill）', Object.values(MODELS).every((m) => m.mode === 'quick' || m.search === false));
+  check('3g registry 保留 8 个 DeepSeek 模型（总公开模型 13 个）', Object.keys(MODELS).filter((id) => id.startsWith('deepseek-')).length === 8 && Object.keys(MODELS).length === 13, 'count=' + Object.keys(MODELS).length);
+  check('3h DeepSeek expert/vision 模型均不带 search（页面无此 pill）', Object.values(MODELS).filter((m) => m.providerId === 'deepseek').every((m) => m.mode === 'quick' || m.search === false));
 }
 
 /* ---------- 4. 调用链源码断言 ---------- */

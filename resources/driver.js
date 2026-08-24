@@ -14,6 +14,36 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
+const { defaultProfile } = require('./provider-registry');
+const PROVIDER_ADAPTERS = Object.freeze({
+  deepseek: require('./providers/deepseek'),
+  chatgpt: require('./providers/chatgpt'),
+  qwen: require('./providers/qwen'),
+});
+
+class ProviderDriverError extends Error {
+  constructor(kind, message) { super(message); this.name = 'ProviderDriverError'; this.kind = kind; }
+}
+function resolveProviderAdapter(providerId) {
+  const id = providerId || 'deepseek';
+  const adapter = PROVIDER_ADAPTERS[id];
+  if (!adapter) throw new Error('unknown provider: ' + id);
+  return adapter;
+}
+function profileKey(providerId, requestedProfile) {
+  const id = resolveProviderAdapter(providerId).id;
+  const requested = String(requestedProfile || '').trim();
+  if (!requested) return defaultProfile(id);
+  if (id === 'deepseek' && requested === 'default') return 'default'; // legacy explicit profile
+  if (requested.startsWith(id + '-')) return requested;
+  return id + '-' + requested;
+}
+function channelKey(providerId, pageKey) {
+  return resolveProviderAdapter(providerId).id + ':' + String(pageKey || 'main');
+}
+function providerUrl(providerId) { return resolveProviderAdapter(providerId).siteUrl; }
+function providerError(kind, message) { return new ProviderDriverError(kind, message); }
+function isDeepSeekProvider(providerId) { return (providerId || 'deepseek') === 'deepseek'; }
 
 const VERSION = '1.1.0';
 const DS_URL = 'https://chat.deepseek.com/';
@@ -83,10 +113,11 @@ function readLine(buf) {
   return { line, rest };
 }
 
-const RUN_ONCE = process.argv[2] === '--run';
+const IS_MAIN = require.main === module;
+const RUN_ONCE = IS_MAIN && process.argv[2] === '--run';
 
 let stdinBuf = Buffer.alloc(0);
-if (!RUN_ONCE) {
+if (IS_MAIN && !RUN_ONCE) {
   process.stdin.on('data', (chunk) => {
     stdinBuf = Buffer.concat([stdinBuf, chunk]);
     for (;;) {
@@ -108,9 +139,11 @@ if (!RUN_ONCE) {
   });
   process.stdin.on('end', () => { shutdown(0); });
 }
-process.on('SIGTERM', () => shutdown(0));
-process.on('SIGINT', () => shutdown(0));
-process.on('uncaughtException', (e) => { logErr('uncaught', e.stack || e.message); });
+if (IS_MAIN) {
+  process.on('SIGTERM', () => shutdown(0));
+  process.on('SIGINT', () => shutdown(0));
+  process.on('uncaughtException', (e) => { logErr('uncaught', e.stack || e.message); });
+}
 
 /** 进程关闭：强杀浏览器与调试窗口子进程后退出（SIGTERM/SIGINT/stdin end 触发）。 */
 async function shutdown(code) {
@@ -963,7 +996,16 @@ const EXPR = {
 /* ------------------------------------------------------------------ */
 /** 检查页面登录状态（返回 loginState 表达式结果：needsLogin/hasChatInput/url 等）。
  * 只检测不处理——登录引导由上层（网关 /login 或 streamAsk errorKind=login 路径）负责。 */
-async function ensureLoggedIn(pageId) {
+async function ensureLoggedIn(pageId, providerId) {
+  if (!isDeepSeekProvider(providerId)) {
+    const adapter = resolveProviderAdapter(providerId);
+    await waitReady(pageId, 30000);
+    const challenge = await evalJs(pageId, adapter.expressions.detectChallenge).catch(() => false);
+    if (challenge) return { needsLogin: false, hasChatInput: false, challenge: true, url: providerUrl(providerId), bodySnippet: 'provider challenge detected' };
+    const needsLogin = await evalJs(pageId, adapter.expressions.detectLogin).catch(() => true);
+    const composer = await evalJs(pageId, adapter.expressions.findComposer).catch(() => ({ found: false }));
+    return { needsLogin: !!needsLogin, hasChatInput: !!(composer && composer.found), challenge: false, url: providerUrl(providerId), bodySnippet: '' };
+  }
   await waitReady(pageId, 30000);
   const st = await evalJs(pageId, EXPR.loginState);
   if (st.needsLogin || !st.hasChatInput) {
@@ -2325,15 +2367,17 @@ handlers.stop = async (params) => {
  * 2s 轮询 loginState，期间推送 login-progress 事件；超时（默认 5min）返回未完成。
  * @param {object} params { profile, timeoutMs } */
 handlers.login = async (params) => {
-  const profileName = (params && params.profile) || 'default';
+  const providerId = (params && params.providerId) || 'deepseek';
+  const profileName = profileKey(providerId, params && params.profile);
   const timeoutMs = (params && params.timeoutMs) || 300000;
   /* 单页常驻：登录与发消息用同一页面（对照 deepseek-browser-agent 的 _ensureLoggedIn：
    * 打开页面 → 检测未登录 → 用户在同一窗口手动登录 → 自动轮询直到登录成功）。 */
-  const pageId = await ensurePage({ name: profileName, headless: false });
-  try { await navigate(pageId, DS_URL); } catch (e) { log('login navigate failed', e.message); }
+  const pageId = await ensurePage({ name: profileName, headless: false }, providerId);
+  try { await navigate(pageId, providerUrl(providerId)); } catch (e) { log('login navigate failed', e.message); }
   const start = Date.now();
   for (;;) {
-    const st = await ensureLoggedIn(pageId);
+    const st = await ensureLoggedIn(pageId, providerId);
+    if (st.challenge) return { ok: false, loggedIn: false, errorKind: 'challenge_required', url: st.url, message: 'provider challenge required' };
     if (!st.needsLogin && st.hasChatInput) {
       return { ok: true, loggedIn: true, url: st.url, message: 'logged in on profile "' + profileName + '"' };
     }
@@ -2346,14 +2390,15 @@ handlers.login = async (params) => {
 };
 
 handlers.inspect = async (params) => {
-  const pageId = params && params.taskId ? (tasks.get(params.taskId) || {}).pageId : null;
-  const pid = pageId || ([...browser.pages.keys()][0]);
-  if (!pid) throw new Error('no page available - start a task or login first');
-  const info = await evalJs(pid, EXPR.domDebug);
-  const buttons = await evalJs(pid, EXPR.buttons);
-  const login = await evalJs(pid, EXPR.loginState);
-  const badge = await evalJs(pid, EXPR.modelBadge);
-  return { dom: info, buttons: buttons.slice(0, 60), login, modelBadge: badge, channels: [...channels.keys()], freePages: subPages.length, lastStreamSummary };
+  const providerId = (params && params.providerId) || 'deepseek';
+  const adapter = resolveProviderAdapter(providerId);
+  const taskPage = params && params.taskId ? (tasks.get(params.taskId) || {}).pageId : null;
+  const pid = taskPage || ([...browser.pages.keys()][0]) || await ensurePage({ name: profileKey(adapter.id, params && params.profile), headless: true }, adapter.id);
+  const info = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.domDebug) : { url: providerUrl(adapter.id), providerId: adapter.id };
+  const buttons = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.buttons) : [];
+  const login = await ensureLoggedIn(pid, adapter.id);
+  const badge = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.modelBadge) : { text: '', tag: '' };
+  return { providerId: adapter.id, dom: info, buttons: buttons.slice(0, 60), login, modelBadge: badge, channels: [...channels.keys()], freePages: subPages.length, lastStreamSummary };
 };
 
 /* ------------------------------------------------------------------ */
@@ -2406,7 +2451,10 @@ let thePageHealthFails = 0;
  * 优先复用空闲页面池（subPages），池空则新开 tab 并导航到 DeepSeek。
  * P0 单浏览器模型：目标 profile 与当前浏览器不同 → 重启浏览器切换账号（3-8s）；
  * 重启后所有旧 pageId 失效 → 清空通道/页面池（网关侧 recovery 机制会重建上下文）。 */
-async function ensureChannelPage(pageKey, profile) {
+async function ensureChannelPage(pageKey, profile, providerId) {
+  const id = resolveProviderAdapter(providerId).id;
+  const siteUrl = providerUrl(id);
+  const key = channelKey(id, pageKey);
   const wantProfile = (profile && profile.name) || 'default';
   if (browser.profile && browser.profile.name !== wantProfile) {
     log('profile 切换: ' + browser.profile.name + ' → ' + wantProfile + '（重启浏览器）');
@@ -2415,24 +2463,30 @@ async function ensureChannelPage(pageKey, profile) {
     subPages.length = 0;
     channels.clear();
   }
-  if (pageKey === 'main') return ensurePage(profile || { name: 'default', headless: false });
-  let ch = channels.get(pageKey);
+  if (pageKey === 'main' && id === 'deepseek') return ensurePage(profile || { name: 'default', headless: false }, id);
+  let ch = channels.get(key);
   if (ch && pageInfo(ch.pageId)) {
     /* 健康检查：页面可能已崩溃/关闭 → 重建 */
     try { await evalJs(ch.pageId, '1'); return ch.pageId; } catch (e) { /* fallthrough: rebuild */ }
   }
   const pageId = subPages.pop() || await newPage();
-  try { await navigate(pageId, DS_URL); } catch (e) { log('ensureChannelPage navigate warn', e.message); }
+  try { await navigate(pageId, siteUrl); } catch (e) { log('ensureChannelPage navigate warn', e.message); }
   try { await waitReady(pageId, 30000); } catch (e) { /* ignore */ }
-  channels.set(pageKey, { pageId });
-  log('channel ' + pageKey + ' ready: ' + pageId);
+  channels.set(key, { pageId, providerId: id });
+  log('channel ' + key + ' ready: ' + pageId);
   return pageId;
 }
 
 /** 确保主 Agent 常驻页面（thePage）可用（任务模式用）：
  * 健康检查（evalJs('1')）连续 2 次失败 → 重建；否则复用。
  * 新建流程：开 tab → 导航 DeepSeek → 复核 URL 确实到达（防 about:blank 误判未登录）。 */
-async function ensurePage(profile) {
+async function ensurePage(profile, providerId) {
+  const id = resolveProviderAdapter(providerId).id;
+  const siteUrl = providerUrl(id);
+  if (browser.profile && profile && browser.profile.name !== profile.name) {
+    await launchBrowser(profile);
+    thePage = null; subPages.length = 0; channels.clear();
+  }
   if (thePage && pageInfo(thePage)) {
     /* 健康检查：页面可能看似存在但已崩溃（OOM/Navigation），连续 evalJs 失败则重建 */
     try {
@@ -2455,17 +2509,17 @@ async function ensurePage(profile) {
   thePageHealthFails = 0;
   await ensureBrowser(profile || { name: 'default', headless: false });
   thePage = await newPage();
-  try { await navigate(thePage, DS_URL); } catch (e) { log('ensurePage navigate warn', e.message); }
+  try { await navigate(thePage, siteUrl); } catch (e) { log('ensurePage navigate warn', e.message); }
   await sleep(3000);
   try { await waitReady(thePage, 30000); } catch (e) { /* ignore */ }
-  /* 验证是否成功导航到 DeepSeek（避免页面在 about:blank 导致误判未登录） */
-  const urlOk = await evalJs(thePage, `(() => {
+  /* 保留 DeepSeek 原有导航校验；其他 provider 由 adapter 输入框检测确认。 */
+  const urlOk = id !== 'deepseek' ? true : await evalJs(thePage, `(() => {
     const u = window.location.href;
     return u.startsWith(${JSON.stringify(DS_URL)}) || u.includes('chat.deepseek.com') || u.includes('chat.deepseek');
   })()`).catch(() => false);
   if (!urlOk) {
     log('ensurePage: page not at deepseek, retrying navigation');
-    try { await navigate(thePage, DS_URL); } catch (e) { log('ensurePage retry navigate warn', e.message); }
+    try { await navigate(thePage, siteUrl); } catch (e) { log('ensurePage retry navigate warn', e.message); }
     await sleep(3000);
   }
   await sleep(1500);
@@ -2856,6 +2910,99 @@ function extractBalancedObjects(t) {
   return out;
 }
 
+/** Non-DeepSeek provider path. DeepSeek continues through the calibrated EXPR path below. */
+async function adapterSignals(pageId, adapter) {
+  const [challenge, needsLogin, limit] = await Promise.all([
+    evalJs(pageId, adapter.expressions.detectChallenge).catch(() => false),
+    evalJs(pageId, adapter.expressions.detectLogin).catch(() => false),
+    evalJs(pageId, adapter.expressions.detectLimit).catch(() => null),
+  ]);
+  if (challenge) throw providerError('challenge_required', adapter.id + ' requires a browser challenge to be completed');
+  if (needsLogin) throw providerError('login_required', adapter.id + ' login required');
+  if (limit) throw providerError('quota', adapter.id + ' rate limited');
+}
+
+async function sendAdapterMessage(pageId, adapter, text) {
+  const filled = await evalJs(pageId, '(' + adapter.expressions.fillPrompt + ')(' + JSON.stringify(String(text)) + ')');
+  if (!filled) throw providerError('dom_unavailable', adapter.id + ' composer not found');
+  const sent = await evalJs(pageId, adapter.expressions.clickSend);
+  if (!sent) throw providerError('dom_unavailable', adapter.id + ' send button not found');
+}
+
+async function openAdapterNewChat(pageId, adapter) {
+  const opened = await evalJs(pageId, adapter.expressions.openNewChat).catch(() => false);
+  if (!opened) throw providerError('dom_unavailable', adapter.id + ' new-chat control unavailable');
+  await sleep(1200);
+  await waitReady(pageId, 30000);
+}
+
+async function streamAdapterAsk(params, adapter, profile) {
+  const streamId = 's' + (++streamSeqs.n);
+  const hasChannel = !!(params && params.pageKey);
+  streamActive++;
+  let pageId = null;
+  try {
+    if (hasChannel) pageId = await ensureChannelPage(params.pageKey, profile, adapter.id);
+    else pageId = await ensurePage(profile, adapter.id);
+  } catch (e) {
+    streamActive--;
+    const kind = e && e.kind ? e.kind : 'unavailable';
+    emitEvent('stream-end', { streamId, ok: false, errorKind: kind, error: String(e.message || e) });
+    return { streamId };
+  }
+  const state = { pageId, stopped: false };
+  streamStates.set(streamId, state);
+  (async () => {
+    try {
+      const login = await ensureLoggedIn(pageId, adapter.id);
+      if (login.challenge) throw providerError('challenge_required', adapter.id + ' requires a browser challenge to be completed');
+      if (login.needsLogin || !login.hasChatInput) throw providerError('login_required', adapter.id + ' login required');
+      if (params && params.reset === true) await openAdapterNewChat(pageId, adapter);
+      const model = (params && params.model) || {};
+      const mode = await evalJs(pageId, '(' + adapter.expressions.applyMode + ')(' + JSON.stringify({
+        thinking: model.mode === 'thinking' || model.thinking === true,
+        search: model.search === true,
+      }) + ')');
+      if (!mode || mode.ok !== true) throw providerError('mode_unavailable', adapter.id + ' mode unavailable: ' + ((mode && mode.mode) || 'requested'));
+      await sendAdapterMessage(pageId, adapter, params.question);
+      const timeoutMs = (params && params.timeoutMs) || 240000;
+      const started = Date.now();
+      let lastText = '';
+      let lastChange = Date.now();
+      let sawText = false;
+      for (;;) {
+        if (state.stopped) throw providerError('unavailable', 'stream stopped');
+        await adapterSignals(pageId, adapter);
+        const latest = await evalJs(pageId, adapter.expressions.extractLatest).catch(() => null);
+        if (!latest || typeof latest.text !== 'string') throw providerError('dom_unavailable', adapter.id + ' response DOM unavailable');
+        const text = latest.text;
+        if (text && text !== lastText) {
+          const delta = text.startsWith(lastText) ? text.slice(lastText.length) : text;
+          if (delta) emitEvent('stream-delta', { streamId, delta });
+          lastText = text;
+          lastChange = Date.now();
+          sawText = true;
+        }
+        const generating = await evalJs(pageId, adapter.expressions.detectGenerating).catch(() => true);
+        if (sawText && !generating && Date.now() - lastChange >= 1200) break;
+        if (Date.now() - started > timeoutMs) throw providerError('unavailable', adapter.id + ' response timed out');
+        await sleep(350);
+      }
+      updateLastStreamSummary({ streamId, profile: profile.name, pageKey: (params && params.pageKey) || null, pageId, finishBy: 'adapter', ok: true, resultLen: lastText.length });
+      emitEvent('stream-end', { streamId, ok: true, result: lastText });
+    } catch (e) {
+      const kind = e && e.kind ? e.kind : 'dom_unavailable';
+      updateLastStreamSummary({ streamId, profile: profile.name, pageKey: (params && params.pageKey) || null, pageId, finishBy: 'exception', ok: false, errorKind: kind, error: String(e.message || e) });
+      emitEvent('stream-end', { streamId, ok: false, errorKind: kind, error: String(e.message || e) });
+    } finally {
+      streamStates.delete(streamId);
+      streamActive--;
+    }
+  })();
+  return { streamId };
+}
+
+
 /* 检测文本"看起来像工具调用但没被解析"（参考 deepseek-browser-agent agent.js 安全网）：
  * 文本含 tool_call 标记 / "name"/"tool" 键 / 代码块函数调用 / 已知工具名 → 应触发解析重试 */
 function looksLikeToolCall(text, tools) {
@@ -2893,10 +3040,14 @@ function looksLikeToolCall(text, tools) {
  *   headless, calibKey, maxTurnsPerChat, timeoutMs, tools }
  * @returns {Promise<{streamId: string}>} 流标识（结果走事件，不走 RPC 返回值）
  */
+
 handlers.streamAsk = async (params) => {
   const question = params && params.question;
   if (!question || !String(question).trim()) throw new Error('question required');
-  const profile = { name: (params && params.profile) || 'default', headless: params && params.headless !== undefined ? !!params.headless : false };
+  const providerId = (params && params.providerId) || 'deepseek';
+  const adapter = resolveProviderAdapter(providerId);
+  const profile = { name: profileKey(adapter.id, params && params.profile), headless: params && params.headless !== undefined ? !!params.headless : false };
+  if (adapter.id !== 'deepseek') return streamAdapterAsk(params, adapter, profile);
   const streamId = 's' + (++streamSeqs.n);
   /* 页面分配（并发最佳实践：会话亲和）：
    * 1. 带 pageKey（网关会话注册表分配）→ 专属通道页面——同一会话固定同一 tab，历史保持
@@ -2907,13 +3058,13 @@ handlers.streamAsk = async (params) => {
   let pageId = null;
   try {
     if (hasChannel) {
-      pageId = await ensureChannelPage(params.pageKey, profile);
+      pageId = await ensureChannelPage(params.pageKey, profile, adapter.id);
     } else if (!isConcurrent) {
-      pageId = await ensurePage(profile);
+      pageId = await ensurePage(profile, adapter.id);
     } else {
       pageId = subPages.pop() || await newPage();
-      try { await navigate(pageId, DS_URL); } catch (e) { /* 子页面导航失败时由登录检测兜底 */ }
-      try { await ensureLoggedIn(pageId); } catch (e) { /* 子页面登录态与主共享 */ }
+      try { await navigate(pageId, providerUrl(adapter.id)); } catch (e) { /* 子页面导航失败时由登录检测兜底 */ }
+      try { await ensureLoggedIn(pageId, adapter.id); } catch (e) { /* 子页面登录态与主共享 */ }
     }
   } catch (e) {
     streamActive--;
@@ -2924,11 +3075,11 @@ handlers.streamAsk = async (params) => {
   streamStates.set(streamId, st);
   (async () => {
     try {
-      let login = await ensureLoggedIn(pageId);
+      let login = await ensureLoggedIn(pageId, adapter.id);
       /* 页面可能还在加载（重建后）→ 等待重试，避免误判未登录 */
       for (let i = 0; i < 3 && (login.needsLogin || !login.hasChatInput); i++) {
         await sleep(2000);
-        login = await ensureLoggedIn(pageId);
+        login = await ensureLoggedIn(pageId, adapter.id);
       }
       if (login.needsLogin || !login.hasChatInput) {
         emitEvent('stream-end', { streamId, ok: false, errorKind: 'login', error: 'login required: 页面已关闭或未登录。请打开 http://127.0.0.1:5688/login 重新登录（建议勾选保持登录），登录后页面会保持常驻。 url=' + (login.url || '?') + ' body=' + (login.bodySnippet || '').slice(0, 80) });
@@ -3488,6 +3639,7 @@ handlers.streamAsk = async (params) => {
     } catch (e) {
       /* 登录失效的结构化信号（网关据此走自动登录/切换流程） */
       const isLogin = String(e && e.message || '').startsWith('login required');
+      const errorKind = e && e.kind ? e.kind : (isLogin ? 'login' : undefined);
       updateLastStreamSummary({
         streamId,
         profile: profile.name,
@@ -3496,7 +3648,7 @@ handlers.streamAsk = async (params) => {
         attempt: 0,
         finishBy: 'exception',
         ok: false,
-        errorKind: isLogin ? 'login' : undefined,
+        errorKind,
         error: e.message,
         genSeen: false,
         thinking: false,
@@ -3511,7 +3663,7 @@ handlers.streamAsk = async (params) => {
         lastChangeAgoMs: null,
         thinkIdleMs: null,
       });
-      emitEvent('stream-end', { streamId, ok: false, errorKind: isLogin ? 'login' : undefined, error: e.message });
+      emitEvent('stream-end', { streamId, ok: false, errorKind, error: e.message });
     } finally {
       streamStates.delete(streamId);
       streamActive--;
@@ -3538,15 +3690,17 @@ handlers.streamStop = async (params) => {
  * main 通道常驻只清历史；其他通道解绑后页面归还空闲池（池满则关闭 tab 控制资源）。 */
 handlers.releaseChannel = async (params) => {
   const key = params && params.pageKey;
+  const providerId = (params && params.providerId) || 'deepseek';
+  const identity = channelKey(providerId, key);
   if (!key) return { released: false };
-  if (key === 'main') {
+  if (key === 'main' && providerId === 'deepseek') {
     if (thePage && pageInfo(thePage)) {
       try { await newChat(thePage); } catch (e) { /* ignore */ }
     }
     return { released: true, main: true };
   }
-  const ch = channels.get(key);
-  channels.delete(key);
+  const ch = channels.get(identity);
+  channels.delete(identity);
   if (ch && pageInfo(ch.pageId)) {
     try { await newChat(ch.pageId); } catch (e) { /* ignore */ }
     if (subPages.length < 2) subPages.push(ch.pageId);
@@ -3724,6 +3878,10 @@ if (RUN_ONCE) {
   return;
 }
 
-if (CFG.chromePath) log('using chrome path', CFG.chromePath);
-log('driver ready', VERSION, 'base=' + CFG.baseDir, 'profiles=' + JSON.stringify(CFG.profiles));
-emitEvent('ready', { version: VERSION, baseDir: CFG.baseDir, pid: process.pid });
+if (IS_MAIN) {
+  if (CFG.chromePath) log('using chrome path', CFG.chromePath);
+  log('driver ready', VERSION, 'base=' + CFG.baseDir, 'profiles=' + JSON.stringify(CFG.profiles));
+  emitEvent('ready', { version: VERSION, baseDir: CFG.baseDir, pid: process.pid });
+}
+
+module.exports = { profileKey, channelKey, resolveProviderAdapter, providerUrl, ProviderDriverError };

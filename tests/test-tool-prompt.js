@@ -23,12 +23,13 @@ function check(name, cond, detail) {
 
 /* ---------- 沙箱加载网关纯函数 ---------- */
 function loadGateway(exports) {
-  const cut = GW_SRC.indexOf('server.listen(');
-  if (cut < 0) throw new Error('server.listen not found');
+  const cut = GW_SRC.indexOf('\nif (require.main === module) {');
+  if (cut < 0) throw new Error('gateway bootstrap guard not found');
   const code = GW_SRC.slice(0, cut) + `
 ;globalThis.__x = { ${exports} };`;
   const sandbox = {
     require: (m) => {
+      if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },
