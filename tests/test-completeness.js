@@ -29,6 +29,18 @@ function check(name, cond, detail) {
   else { fail++; console.log('FAIL ' + name + (detail ? ' | ' + detail : '')); }
 }
 
+/* Provider-runtime source inventory: adapters are loaded by a later driver task. */
+const PROVIDER_RUNTIME_SOURCES = [
+  'resources/provider-registry.js',
+  'resources/providers/deepseek.js',
+  'resources/providers/chatgpt.js',
+  'resources/providers/qwen.js',
+];
+const missingProviderRuntimeSources = PROVIDER_RUNTIME_SOURCES.filter((file) => !fs.existsSync(path.join(ROOT, file)));
+check('Provider runtime source inventory contains registry and all adapters',
+  missingProviderRuntimeSources.length === 0,
+  missingProviderRuntimeSources.join(', '));
+
 /* ---------- 沙箱加载网关（截断到 server.listen 前，导出内部绑定） ---------- */
 function makeGateway(tmpBase) {
   const cut = GW_SRC.indexOf('server.listen(');
