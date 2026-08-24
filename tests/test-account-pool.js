@@ -66,6 +66,7 @@ function makeRpcMock(gw, script, loginResult) {
         const c = d.consumers.get(streamId);
         if (!c) return;
         const resp = script.length ? script.shift() : { ok: true, result: '' };
+        for (const event of resp.events || []) c.push(event.delta, event.kind);
         c.end(resp);
       }, 5);
       return { streamId };
@@ -283,6 +284,50 @@ const PAYLOAD_FIRST = {
     await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
     check('2e1 captcha 账号 → disabled（转人工）', gw.pool.accounts.get('default').state === 'disabled');
     check('2e2 SSE 报错（无可用切换）', sseText(res).includes('风控受限'));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  {
+    /* 2h 跨分片工具标记不能先以 content 泄漏；普通 Markdown 仍完整输出一次 */
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-stream-prefix-'));
+    const gw = makeGateway(tmp);
+    makeRpcMock(gw, [
+      {
+        events: [
+          { delta: '`' },
+          { delta: '``tool_call\n{\"name\":\"write\",\"args\":{\"file_path\":\"a.txt\",\"content\":\"hi\"}}\n```' },
+        ],
+        ok: true,
+        result: '```tool_call\n{\"name\":\"write\",\"args\":{\"file_path\":\"a.txt\",\"content\":\"hi\"}}\n```',
+        toolCalls: [{ name: 'write', arguments: { file_path: 'a.txt', content: 'hi' } }],
+      },
+      {
+        events: [{ delta: '`' }, { delta: '``javascript\nconst x = 1;\n```' }],
+        ok: true,
+        result: '```javascript\nconst x = 1;\n```',
+      },
+      {
+        events: [
+          { delta: '<tool_call>\n' },
+          { delta: '{\"name\":\"write\",\"args\":{\"file_path\":\"b.txt\",\"content\":\"ok\"}}\n</tool_call>' },
+        ],
+        ok: true,
+        result: '<tool_call>\n{\"name\":\"write\",\"args\":{\"file_path\":\"b.txt\",\"content\":\"ok\"}}\n</tool_call>',
+        toolCalls: [{ name: 'write', arguments: { file_path: 'b.txt', content: 'ok' } }],
+      },
+    ]);
+    const toolRes = makeResMock();
+    await gw.handleChatCompletion({}, toolRes, PAYLOAD_FIRST);
+    const toolText = sseText(toolRes);
+    check('2h1 跨分片工具标记仅输出 tool_calls', /\"tool_calls\"/.test(toolText) && !/\"content\":\"`/.test(toolText), toolText);
+    const markdownRes = makeResMock();
+    await gw.handleChatCompletion({}, markdownRes, PAYLOAD_FIRST);
+    const markdownText = sseText(markdownRes);
+    const codeOccurrences = (markdownText.match(/const x = 1/g) || []).length;
+    check('2h2 普通 Markdown 前缀完整且只输出一次', codeOccurrences === 1 && markdownText.includes('```javascript'), markdownText);
+    const xmlRes = makeResMock();
+    await gw.handleChatCompletion({}, xmlRes, PAYLOAD_FIRST);
+    const xmlText = sseText(xmlRes);
+    check('2h3 跨分片 XML 工具标记仅输出 tool_calls', /\"tool_calls\"/.test(xmlText) && !/\"content\":\"<tool_call/.test(xmlText), xmlText);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
   {

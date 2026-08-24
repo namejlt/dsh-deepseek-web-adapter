@@ -1038,6 +1038,23 @@ function looksLikeToolCallText(t, tools) {
   }
   return false;
 }
+/** 判断短缓冲是否仍可能拼成支持的工具调用标记。
+ * 只在首个分片尚不完整时短暂延迟，避免将 `` ` `` / `<` / `tool_`
+ * 等前缀先作为 content 发出，后续又以 tool_calls 结束同一轮。 */
+function isPossibleToolCallPrefix(text) {
+  const s = String(text || '').trim().toLowerCase();
+  if (!s || s.length > 96) return false;
+  const prefixes = [
+    '`', '``', '```', '```t', '```to', '```too', '```tool', '```tool_', '```tool_c', '```tool_ca', '```tool_cal',
+    '```j', '```js', '```jso',
+    '<', '<t', '<to', '<too', '<tool', '<tool_', '<tool_c', '<tool_ca', '<tool_cal', '<tool_call', '<tool_call>', '<tool_calls', '<tool_calls>',
+    '<i', '<in', '<inv', '<invo', '<invok', '<invoke',
+    't', 'to', 'too', 'tool', 'tool_', 'tool_c', 'tool_ca', 'tool_cal', 'tool_call',
+    '{', '[',
+  ];
+  return prefixes.includes(s);
+}
+
 /** 校验 OpenAI chat/completions 请求。必须在 SSE/driver 之前执行，
  * 以便调用方收到明确的 HTTP JSON 错误，而不是半截流或浏览器副作用。 */
 function validateChatPayload(payload) {
@@ -1249,6 +1266,9 @@ async function handleChatCompletion(req, res, payload) {
                     silentStart = Date.now();
                     emitCurrentDelta = false;
                     log('toolMode → silent (toolBuf[:80]=' + toolBuf.slice(0, 80).replace(/\n/g, '\\n') + ')');
+                  } else if (isPossibleToolCallPrefix(toolBuf)) {
+                    /* 标记可能被拆在多个 delta 中；继续缓冲，不能先泄漏 content。 */
+                    emitCurrentDelta = false;
                   } else {
                     toolMode = 'stream';
                     log('toolMode → stream (toolBuf len=' + toolBuf.length + ')');
