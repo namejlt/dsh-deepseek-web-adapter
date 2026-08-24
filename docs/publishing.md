@@ -1,4 +1,4 @@
-# 插件发布与分发指南
+# Beta 多站点 Web-to-OpenAI 网关：插件发布与分发指南
 
 > 如何把 dsh-deepseek-web-adapter 发布出去，让别人一条命令装上。发布前请先读 [第 3 节：发布安全](#3-发布安全必读)。
 
@@ -127,13 +127,29 @@ node --check lib/index.js
 node --check resources/dsweb-gateway.js
 node --check resources/driver.js
 
-# 回归测试（54 解析场景 + 61 账号池场景）
-node tests/test-parser-all.js      # 期望 54/54
-node tests/test-account-pool.js    # 期望 61/61
+# 既有回归
+node tests/test-parser-all.js
+node tests/test-account-pool.js
+node tests/test-completeness.js
+
+# 多站点 provider 离线测试（registry / driver / gateway 路由）
+node tests/test-provider-registry.js
+node tests/test-driver-providers.js
+node tests/test-gateway-providers.js
 
 # 打包清单验证（确认无凭据泄漏，见第 3 节）
 npm pack --dry-run
 ```
+
+### 4.2.1 多站点 Beta 的已认证手工 smoke test（发布前必做）
+
+离线 provider tests 不能证明真实网页登录态、挑战页或页面交互可用。发布前，在**已认证/已登录**的本机 profile 中逐项手工验收；完成前不得声称“live verified”：
+
+1. 分别打开并完成登录：`/login?provider=deepseek`、`/login?provider=chatgpt`、`/login?provider=qwen`。
+2. 用 `GET /v1/models` 确认包含 `chatgpt-auto`、`chatgpt-thinking`、`qwen-chat`、`qwen-thinking`、`qwen-search`。
+3. 每个 provider 至少验证一条短文本、一段代码请求和一个 SSE 流完成；确认 profile/cookie 没有跨 provider 复用。
+4. 验证 Qwen 无法切换 thinking/search 时返回 `mode_unavailable`；验证 ChatGPT challenge 返回需要人工操作的 provider 错误，而不是 DOM 错误。不要自动解题或绕过 challenge。
+5. 在发布记录中写明测试日期、已验收 provider、登录账号类型（不要写 cookie/账号标识）与未验收项。
 
 ### 4.3 发布
 
@@ -197,7 +213,7 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ```bash
 # 1. 改动完成，回归全绿
-node tests/test-parser-all.js && node tests/test-account-pool.js
+node tests/test-parser-all.js && node tests/test-account-pool.js && node tests/test-completeness.js && node tests/test-provider-registry.js && node tests/test-driver-providers.js && node tests/test-gateway-providers.js
 
 # 2. 语义化版本（SemVer）：
 #    补丁 z：bug 修复（1.0.0 → 1.0.1）
@@ -225,7 +241,7 @@ dsh plugin --profile web update
 ## 8. 发布检查清单
 
 - [ ] `npm view <name>` 确认包名可用（或已属于你）
-- [ ] 回归测试全绿：`test-parser-all.js` 54/54、`test-account-pool.js` 61/61
+- [ ] 回归与 provider 测试全绿：`test-parser-all.js`、`test-account-pool.js`、`test-completeness.js`、`test-provider-registry.js`、`test-driver-providers.js`、`test-gateway-providers.js`
 - [ ] `node --check` 三个主文件语法通过
 - [ ] `resources/driver.js` 为唯一 driver 源码，网关 `DRIVER_PATH` 直接指向它（`resources/runtime/driver.js` 副本已移除，无需同步）
 - [ ] `npm pack --dry-run` 清单中**无** `profiles/`、`*.log`、`accounts.json`
@@ -233,4 +249,4 @@ dsh plugin --profile web update
 - [ ] `cordis.patch.yml` 的 `name` 与 package.json 一致
 - [ ] README（中英）安装命令与实际包名一致
 - [ ] 版本号符合 SemVer
-- [ ] 发布后真实环境验证：`dsh plugin add` → 登录 → 对话 → 工具调用
+- [ ] 已认证手工 smoke test：分别登录 DeepSeek/ChatGPT/Qwen → 模型列表 → 文本/代码/SSE；记录未验收项，未完成时不得宣称 live verified

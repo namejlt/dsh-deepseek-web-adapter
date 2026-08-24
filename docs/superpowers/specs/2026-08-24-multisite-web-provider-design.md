@@ -1,8 +1,8 @@
-# 多站点 Web Provider 适配设计
+# Beta 多站点 Web-to-OpenAI Provider 适配设计（实施记录）
 
 **日期：** 2026-08-24  
-**状态：** 已获方案确认，待书面规格审阅  
-**范围：** 在保持现有 DeepSeek Web 适配行为和 OpenAI 兼容 API 不变的前提下，新增 ChatGPT Web 与 Qwen Web provider。
+**状态：** 已实现（代码与离线测试）；待真实已登录账号的手工验收。**不宣称已完成 live verified / 在线真实环境验证。**
+**范围：** 在保持现有 DeepSeek Web 适配行为和 OpenAI 兼容 API 不变的前提下，已实现 ChatGPT Web 与 Qwen Web provider；本记录同时定义发布前的手工验收边界。
 
 ## 1. 背景
 
@@ -91,7 +91,7 @@ adapter 只能描述目标页面与返回标准化状态，不能复制 SSE、�
 - 默认 profile 名称为 `deepseek-default`、`chatgpt-default`、`qwen-default`；兼容旧 DeepSeek `default` profile 的迁移/回退路径。
 - `/login` 与 `/login-status` 接受可选 `provider` 参数；省略时默认 DeepSeek，以保持现有入口。
 - `/health`、配置和管理输出包含每个 provider 的可用性、已选模型和登录/挑战状态。
-- 挑战被识别后，网关应返回 OpenAI 风格的 provider 错误，并指向对应 `/login?provider=...` 手动完成登录；不得自动规避挑战。
+- 挑战被识别后，网关应返回 OpenAI 风格、**需要手动操作**的 `challenge_required` / `provider_challenge_required` 错误，并指向对应 `/login?provider=...` 完成登录；它必须与 `provider_dom_changed` / `dom_unavailable` 等 DOM 错误区分，且不得自动规避挑战。
 
 ## 6. 工具调用、错误与流式输出
 
@@ -113,7 +113,7 @@ adapter 只能描述目标页面与返回标准化状态，不能复制 SSE、�
 
 执行仓库所有 `tests/test-*.js`。新增测试必须先以缺少 registry/adapter/路由实现的原因失败，再写最小实现使其通过。
 
-### 7.3 手工验证
+### 7.3 待完成的真实已登录手工验收
 
 在用户已完成各站手动登录的 profile 上，分别发送短文本、代码生成、tool-call 提示请求；验证流式文本、结束判定、模型列表、provider 隔离、登录失效和 ChatGPT challenge 提示。手工登录与挑战交互不自动化。
 

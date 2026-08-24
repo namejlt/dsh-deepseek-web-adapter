@@ -1,6 +1,6 @@
-# dsh-deepseek-web-adapter 使用教程
+# dsh-deepseek-web-adapter：Beta 多站点 Web-to-OpenAI 网关使用教程
 
-> 把 **DeepSeek 网页版（chat.deepseek.com）** 变成 DSH 的免 API Key 模型提供方。
+> 把已登录的 **DeepSeek、ChatGPT 与 Qwen 网页版** 接到 DSH 的本地 **Beta Web-to-OpenAI** 网关。多站点实现已落地并有离线测试，真实已登录账号的手工验收仍待完成；本文不宣称已完成在线验证。
 > 本文档面向**使用者**；插件开发请看 [dsh-plugin-tutorial.md](dsh-plugin-tutorial.md) 与 [dsh-plugin-best-practices.md](dsh-plugin-best-practices.md)，发布请看 [publishing.md](publishing.md)。
 
 ---
@@ -10,8 +10,8 @@
 1. [它是什么，怎么工作的](#1-它是什么怎么工作的)
 2. [环境要求](#2-环境要求)
 3. [五分钟上手](#3-五分钟上手)
-4. [八个模型怎么选](#4-八个模型怎么选)
-5. [多账号与限流自动切换](#5-多账号与限流自动切换)
+4. [支持的模型与 Beta 边界](#4-支持的模型与-beta-边界)
+5. [DeepSeek 多账号与限流自动切换](#5-deepseek-多账号与限流自动切换)
 6. [日常运维（API 速查）](#6-日常运维api-速查)
 7. [故障排查 FAQ](#7-故障排查-faq)
 8. [卸载与数据清理](#8-卸载与数据清理)
@@ -20,32 +20,24 @@
 
 ## 1. 它是什么，怎么工作的
 
-DeepSeek 网页版免费但没提供 API。本插件在你电脑上启动一个本地网关，用真实浏览器驱动网页版，对外伪装成标准的 OpenAI 兼容接口——DSH 以为自己在调一个普通模型，实际上回答来自网页版。
+这是一个本地 **Beta 多站点 Web-to-OpenAI 网关**：DSH 调用标准 OpenAI 兼容接口，本机网关再以独立 Chrome profile 驱动你已手工登录的 DeepSeek、ChatGPT 或 Qwen 网页版。
 
 ```
-DSH ──OpenAI 兼容 API──▶ 本地网关(:5688) ──stdio RPC──▶ driver ──CDP──▶ Chrome ──▶ chat.deepseek.com
+DSH ──OpenAI 兼容 API──▶ 本地网关(:5688) ──stdio RPC──▶ driver ──CDP──▶ Chrome profiles ──▶ DeepSeek / ChatGPT / Qwen Web
 ```
 
-插件加载时网关自动拉起，卸载时自动回收，全程无需手动管理进程。
+插件加载时网关自动拉起，卸载时自动回收；provider 路由、profile 隔离与离线测试已经实现，但**真实已登录账号的手工验收尚未完成**。
 
-**能力一览：**
+**Beta 能力边界（务必了解）：**
 
-| 能力 | 说明 |
+| 项目 | 当前承诺 |
 |---|---|
-| 连续对话 | 网页版历史保持；超过轮数上限（默认 50）自动摘要迁移新会话 |
-| 工具调用 | 网页版无原生 function calling，网关用提示工程 + 54 场景容错解析桥接，DSH 原生执行 |
-| 会话亲和并发 | 指纹识别会话 → 专属浏览器通道；同会话串行、异会话并行 |
-| 多账号池 | 每账号独立浏览器 profile，账号状态落盘（`accounts.json`，不含凭据） |
-| 限流自动切换 | 网页版公平使用风控受限时，指数退避冷却 + 自动切换账号 + 压缩重建上下文 |
-| 自动登录 | 会话失效自动弹登录窗口，完成后自动重试原请求 |
+| 支持 | 文本、代码块、基础 SSE、既有文本工具调用协议 |
+| 不支持 | 附件、图像或其他多模态输入；网页原生工具卡片、trace、iframe、native artifacts（原生产物）语义 |
+| 挑战 | 不自动求解或绕过 CAPTCHA、Cloudflare、Turnstile 或其他 challenge |
+| 隔离 | provider 间独立 profile / cookie / 会话，不能跨站复用 |
 
-**安全边界（务必了解）：**
-
-- 登录态保存在本机 `resources/runtime/profiles/` 浏览器目录，插件不上传任何数据
-- `accounts.json` 只记录账号名/状态/统计，不含密码或 cookie
-- 使用网页版驱动方式访问，请自行评估并遵守 DeepSeek 服务条款；账号风控/封禁风险自担
-
----
+**安全边界：**登录态仅保存在本机 `resources/runtime/profiles/`；请只使用有权使用的账号，并自行遵守各站服务条款。
 
 ## 2. 环境要求
 
@@ -77,7 +69,7 @@ dsh plugin --profile web add github:你的用户名/dsh-deepseek-web-adapter
 ```yaml
 dsweb:
   {
-    displayName: DeepSeek 网页版 (免 API),
+    displayName: Beta 多站点 Web-to-OpenAI (免 API),
     apiKeyEnv: MOCK_LLM_KEY,
     api: openai-completions,
     baseURL: http://127.0.0.1:5688/v1/,
@@ -90,7 +82,12 @@ dsweb:
         { id: deepseek-expert, name: DeepSeek 专家 },
         { id: deepseek-expert-reasoner, name: DeepSeek 专家+深度思考 },
         { id: deepseek-vision, name: DeepSeek 识图 },
-        { id: deepseek-vision-reasoner, name: DeepSeek 识图+深度思考 }
+        { id: deepseek-vision-reasoner, name: DeepSeek 识图+深度思考 },
+        { id: chatgpt-auto, name: ChatGPT 自动（Beta） },
+        { id: chatgpt-thinking, name: ChatGPT 思考（Beta） },
+        { id: qwen-chat, name: Qwen 对话（Beta） },
+        { id: qwen-thinking, name: Qwen 思考（Beta） },
+        { id: qwen-search, name: Qwen 搜索（Beta） }
       ]
   }
 ```
@@ -101,56 +98,39 @@ dsweb:
 MOCK_LLM_KEY: sk-mock-any-value
 ```
 
-DSH 配置热加载，模型选择器会立即出现「DeepSeek 网页版」。
+DSH 配置热加载，模型选择器会立即出现 DeepSeek 既有模型与 ChatGPT/Qwen Beta 模型。
 
-### 第 3 步：登录 DeepSeek
+### 第 3 步：分别手工登录三个 provider
 
-浏览器打开：
+在本机 Chrome 中分别完成登录；每条链接打开的 profile 都独立：
 
+```text
+http://127.0.0.1:5688/login?provider=deepseek   # deepseek-default
+http://127.0.0.1:5688/login?provider=chatgpt    # chatgpt-default
+http://127.0.0.1:5688/login?provider=qwen       # qwen-default
 ```
-http://127.0.0.1:5688/login
-```
 
-会弹出 Chrome 窗口，在其中登录 chat.deepseek.com。
+省略 `provider` 的 `/login` 仍默认 DeepSeek，以兼容旧用法。不要复制或共享三个 provider 的 profile 目录。
 
-> **务必勾选"保持登录 / 记住我"**——登录态持久保存在浏览器 profile 目录，关窗口、重启电脑都不丢（直到 DeepSeek 令牌过期）。
-
-登录是否完成会自动检测，也可手动查：`http://127.0.0.1:5688/login-status`。
+ChatGPT 若出现 Cloudflare、Turnstile 或其他 challenge，网关返回需要**手动操作**的 `challenge_required`/`provider_challenge_required` 错误；它与 DOM 选择器错误不同，网关不会自动解题或绕过。Qwen thinking/search 不可用时返回 `mode_unavailable`，不会静默改用错误模式。
 
 ### 第 4 步：开始使用
 
-DSH 模型选择器选 **DeepSeek 网页版**（快速/深度思考/智能搜索/专家/识图等 8 种组合），像普通模型一样对话即可。工具调用（读文件、执行命令等）由 DSH 原生执行，无需额外配置。
+在 DSH 模型选择器中选择 **Beta 多站点 Web-to-OpenAI** 下的模型即可。DeepSeek 保持既有能力；ChatGPT/Qwen 只承诺文本、代码块与基础 SSE。工具调用（读文件、执行命令等）仍由 DSH 原生执行，无需额外配置。
 
 ---
 
-## 4. 八个模型怎么选
+## 4. 支持的模型与 Beta 边界
 
-模式映射对齐 2026-08 页面改版——网页版为**三模式入口**（快速 / 专家 / 识图）+ 输入框下方 pill 开关，网关按模型幂等切换（先读模式/开关状态，不一致才点击）：
+| Provider | 模型 ID | Beta 行为 |
+|---|---|---|
+| DeepSeek | 既有 `deepseek-*` 八种组合 | 保持已有快速/思考/搜索/专家/识图能力 |
+| ChatGPT | `chatgpt-auto`、`chatgpt-thinking` | 文本、代码块、基础 SSE；thinking 仅在可靠控件可用时启用 |
+| Qwen | `qwen-chat`、`qwen-thinking`、`qwen-search` | 文本、代码块、基础 SSE；模式开关不可用时返回 `mode_unavailable` |
 
-| 模式入口 | 可选 pill | 模型 ID | 名称 | 适用 |
-|---|---|---|---|---|
-| 快速 | — | `deepseek-chat` | DeepSeek 快速 | 日常问答、轻量任务，响应最快 |
-| 快速 | 深度思考 | `deepseek-reasoner` | DeepSeek 深度思考 | 复杂推理、代码架构，质量高但更慢 |
-| 快速 | 智能搜索 | `deepseek-search` | DeepSeek 智能搜索 | 需要联网查资料、时效性问题 |
-| 快速 | 深度思考+智能搜索 | `deepseek-think-search` | DeepSeek 深度思考+搜索 | 复杂问题且需联网查证 |
-| 专家 | — | `deepseek-expert` | DeepSeek 专家 | 专家能力（页面专家模式） |
-| 专家 | 深度思考 | `deepseek-expert-reasoner` | DeepSeek 专家+深度思考 | 专家模式下的深度推理 |
-| 识图 | — | `deepseek-vision` | DeepSeek 识图 | 图片理解 |
-| 识图 | 深度思考 | `deepseek-vision-reasoner` | DeepSeek 识图+深度思考 | 图片深度分析 |
+请不要把该 Beta 通道用于附件、多模态输入、网页原生 artifact、iframe/web-dev 产物或挑战求解。ChatGPT challenge 必须由人在浏览器中完成；错误会明确提示手动登录路径，而不是伪装成 DOM 问题。
 
-pill 开关由驱动自动操作，无需手动干预。若网页版再次改版导致 pill 找不到（日志出现 `pill not found`），可用**校准功能**录制兜底点击路径：
-
-```bash
-curl http://127.0.0.1:5688/calibrate/record   # 弹有头窗口，按提示点击模型切换处
-# 点击完成后：
-curl -X POST http://127.0.0.1:5688/calibrate/collect -d '{"pageId": "<record 返回的 ID>"}'
-curl -X POST http://127.0.0.1:5688/calibrate/save -d '{"key": "deepseek-reasoner", "clicks": "<collect 结果>"}'
-curl -X POST http://127.0.0.1:5688/calibrate/close -d '{"pageId": "<同上>"}'
-```
-
----
-
-## 5. 多账号与限流自动切换
+## 5. DeepSeek 多账号与限流自动切换
 
 ### 5.1 为什么需要多账号
 
