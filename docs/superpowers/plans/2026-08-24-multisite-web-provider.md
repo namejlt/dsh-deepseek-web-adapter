@@ -15,7 +15,6 @@
 **Files:**
 - Create: `resources/provider-registry.js`
 - Create: `tests/test-provider-registry.js`
-- Modify: `tests/test-completeness.js:18-41, 685-732`
 
 - [ ] **Step 1: Write the failing registry contract test**
 
@@ -41,7 +40,7 @@ assert.strictEqual(registry.defaultProfile('deepseek'), 'deepseek-default');
 console.log('provider registry: PASS');
 ```
 
-Add a completeness assertion that `resources/provider-registry.js` and all three adapter paths are expected runtime source files, so an accidental partial implementation fails the existing source inventory audit.
+The runtime-source inventory is updated in Task 2, once all three adapter modules exist; keep this task independently executable.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -91,15 +90,15 @@ module.exports = { PROVIDERS, MODELS, resolveModel, listModels, getProvider, def
 Run:
 
 ```bash
-node tests/test-provider-registry.js && node tests/test-completeness.js
+node tests/test-provider-registry.js
 ```
 
-Expected: `provider registry: PASS` and the completeness suite reports no missing runtime source paths.
+Expected: `provider registry: PASS`.
 
 - [ ] **Step 5: Commit the registry slice**
 
 ```bash
-git add resources/provider-registry.js tests/test-provider-registry.js tests/test-completeness.js
+git add resources/provider-registry.js tests/test-provider-registry.js
 git commit -m "feat: add web provider registry"
 ```
 
@@ -110,6 +109,7 @@ git commit -m "feat: add web provider registry"
 - Create: `resources/providers/chatgpt.js`
 - Create: `resources/providers/qwen.js`
 - Create: `tests/test-provider-adapters.js`
+- Modify: `tests/test-completeness.js:18-41, 685-732`
 
 - [ ] **Step 1: Write failing adapter tests against fake DOMs**
 
@@ -130,14 +130,14 @@ assert.strictEqual(run(qwen.expressions.applyMode({ thinking: false, search: tru
 assert.strictEqual(run(qwen.expressions.detectLimit(), qwenLimitDom), 'rate_limited');
 ```
 
-The fake DOM must expose only `querySelector`, `querySelectorAll`, `closest`, `matches`, `click`, `disabled`, `hidden`, `textContent`, and `innerText`. Do not rely on a browser or a live website.
+The fake DOM must expose only `querySelector`, `querySelectorAll`, `closest`, `matches`, `click`, `disabled`, `hidden`, `textContent`, and `innerText`. Do not rely on a browser or a live website. Add the registry plus all three adapter paths to `tests/test-completeness.js` only after the adapter files have been created.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run:
 
 ```bash
-node tests/test-provider-adapters.js
+node tests/test-provider-adapters.js && node tests/test-completeness.js
 ```
 
 Expected: failure because the `resources/providers/*` modules do not exist.
@@ -178,15 +178,15 @@ Add comments only where they explain an invariant: ChatGPT's generic selectors a
 Run:
 
 ```bash
-node tests/test-provider-adapters.js
+node tests/test-provider-adapters.js && node tests/test-completeness.js
 ```
 
-Expected: every fake-DOM scenario passes without launching Chrome.
+Expected: every fake-DOM scenario and the runtime-source inventory pass without launching Chrome.
 
 - [ ] **Step 5: Commit the adapter slice**
 
 ```bash
-git add resources/providers tests/test-provider-adapters.js
+git add resources/providers tests/test-provider-adapters.js tests/test-completeness.js
 git commit -m "feat: add ChatGPT and Qwen page adapters"
 ```
 
