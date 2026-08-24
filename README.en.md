@@ -19,8 +19,8 @@ model calibration, session-affinity concurrency, and multi-account pooling with 
 - `dsh plugin add` — one command; the gateway auto-starts/stops
 
 > **v2 core implemented**: multi-account storage · auto re-login · quota-triggered account switching ·
-> dynamic risk-control backoff (exponential + probe recovery) — see [spec/SPEC-v2.md](spec/SPEC-v2.md).
-> Remaining v2 items (one-click setup wizard / per-account browser instances) are still 🚧 planned.
+> dynamic risk-control backoff (exponential + probe recovery) · `/setup` onboarding and built-in plugin management UI — see [spec/SPEC-v2.md](spec/SPEC-v2.md).
+> Remaining v2 items (per-account browser instances) are still 🚧 planned.
 
 **Docs**: [User guide](docs/user-guide.md) · [Publishing guide](docs/publishing.md) · [Plugin dev tutorial](docs/dsh-plugin-tutorial.md) · [Best practices](docs/dsh-plugin-best-practices.md)
 
@@ -31,7 +31,7 @@ model calibration, session-affinity concurrency, and multi-account pooling with 
 | Beta quality | Not extensively tested in real environments; behavior may be unstable |
 | Multi-account concurrency degrades to serial (P0) | With multiple accounts, concurrency drops to 1 (switching accounts restarts the single browser); single-account keeps full session-affinity concurrency |
 | Dynamic risk control is unpredictable | Fair-use limits have no published numbers or unfreeze times — the gateway only trusts on-page signals, backs off exponentially and probes recovery; it **cannot promise when an account unfreezes** |
-| No client card UI | This package ships host only (auto-launch gateway). **No login/calibration/headless card controls** — open `http://127.0.0.1:5688/login` manually to log in, configure via `curl` to `/config` (see Manual control). Card UI lives in the dev repo (`dsweb-plugin/client-llm.js`); contributions welcome |
+| Built-in plugin management UI | This package now ships its own management frontend at `http://127.0.0.1:5688/`: onboarding, quick login, status checks, account checks, config management, and diagnostics. A future native DSH settings card can reuse the same JSON interfaces (`/setup`, `/health`, `/accounts`, `/config`) |
 | Requires a real browser | Needs Chrome installed locally; login state is kept in the `runtime/profiles/` browser profile directory — persists across restarts when "Keep me signed in" is ticked; re-login needed after DeepSeek tokens expire |
 | Depends on DeepSeek web UI | UI changes may break selectors (calibration/send/extract); `driver.js` then needs updating |
 | Parser is tolerant, not infallible | 54-case regression covers common formats; exotic malformed model output may still fail |
@@ -46,6 +46,8 @@ dsh plugin --profile web add github:your-name/dsh-deepseek-web-adapter
 
 On load, the gateway starts automatically (3–8s; see the DSH terminal log:
 `DeepSeek 网页版网关已监听 5688`).
+
+After install, open `http://127.0.0.1:5688/` for the built-in **plugin management page** with cards for onboarding, quick login, runtime status, account management, config editing, and diagnostics.
 
 ## Configure the DSH provider
 
@@ -63,7 +65,11 @@ dsweb:
         { id: deepseek-chat, name: DeepSeek Fast },
         { id: deepseek-reasoner, name: DeepSeek Deep Think },
         { id: deepseek-search, name: DeepSeek Smart Search },
-        { id: deepseek-vision, name: DeepSeek Vision }
+        { id: deepseek-think-search, name: DeepSeek Deep Think + Search },
+        { id: deepseek-expert, name: DeepSeek Expert },
+        { id: deepseek-expert-reasoner, name: DeepSeek Expert + Deep Think },
+        { id: deepseek-vision, name: DeepSeek Vision },
+        { id: deepseek-vision-reasoner, name: DeepSeek Vision + Deep Think }
       ]
   }
 ```
@@ -73,7 +79,8 @@ DSH config hot-reloads — the DeepSeek Web models appear in the model picker im
 
 ## Login
 
-Open `http://127.0.0.1:5688/login` in a browser and sign in to chat.deepseek.com.
+Recommended: open `http://127.0.0.1:5688/` first and use the quick-login card.
+You can also open `http://127.0.0.1:5688/login` in a browser and sign in to chat.deepseek.com.
 If a "Keep me signed in / Remember me" option exists, tick it — the session persists across restarts.
 On session expiry the gateway auto-opens a login window (`autoRelogin`, on by default, one window at a time)
 and retries the original request in recovery mode once login completes.
@@ -83,9 +90,13 @@ login windows time out after 5 minutes; completion is auto-detected via `/login-
 
 ## Usage
 
-Pick **DeepSeek Web** (Fast / Deep Think / Smart Search / Vision) in the DSH model picker.
-Mode mapping matches the 2026-08 page redesign (model selector removed, replaced by pills under the input box, switched idempotently):
-Fast, Fast + Deep Think, Fast + Smart Search, Vision + Deep Think.
+Pick **DeepSeek Web** in the DSH model picker. The current mapping follows the 2026-08 page redesign: three mode entries (quick / expert / vision) plus idempotent pills under the input box.
+
+| Page mode | Optional pills | Model IDs |
+|---|---|---|
+| Quick | Deep Think, Smart Search (can both be on) | `deepseek-chat` / `deepseek-reasoner` / `deepseek-search` / `deepseek-think-search` |
+| Expert | Deep Think | `deepseek-expert` / `deepseek-expert-reasoner` |
+| Vision | Deep Think | `deepseek-vision` / `deepseek-vision-reasoner` |
 
 | Capability | Notes |
 |---|---|
@@ -100,6 +111,10 @@ Fast, Fast + Deep Think, Fast + Smart Search, Vision + Deep Think.
 ## Manual control
 
 ```bash
+# Open the plugin management page (recommended)
+open http://127.0.0.1:5688/
+# Fetch onboarding JSON (designed to be reusable by a future native DSH settings card)
+curl http://127.0.0.1:5688/setup
 # Check gateway status
 curl http://127.0.0.1:5688/v1/models
 # Runtime status (login / sessions / channels / account pool / config)
@@ -141,7 +156,7 @@ curl -X POST http://127.0.0.1:5688/accounts/enable -d '{"name": "acc2"}'   # ena
 curl -X POST http://127.0.0.1:5688/accounts/remove -d '{"name": "acc2", "confirm": true}'  # remove (profile dir kept)
 ```
 
-🚧 Still planned: `GET /setup` one-click config wizard (see [SPEC-v2](spec/SPEC-v2.md)).
+✅ Implemented: `GET /setup` onboarding JSON and `GET /` built-in plugin management UI (card-style HTML page).
 
 ## Structure
 
@@ -194,8 +209,7 @@ node tests/test-parser-all.js      # expect 54/54 pass
 node tests/test-account-pool.js    # expect 61/61 pass
 ```
 
-**Dev repo** (card UI, auto-launch host, full regression suite): see the `dsweb-plugin/` directory or
-discuss in [Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues).
+**This repo now contains a directly usable plugin management frontend** (`/`) and reusable JSON interfaces (`/setup`, `/health`, `/accounts`, `/config`). If you later want a native DSH settings card, build it on top of these interfaces.
 
 Key maintenance points:
 - `resources/driver.js` — browser engine + tool-call parser + limit detection (update when DeepSeek web UI changes; **single source of truth**, the gateway executes this file directly at runtime — no copy to sync)

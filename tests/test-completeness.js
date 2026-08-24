@@ -34,7 +34,7 @@ function makeGateway(tmpBase) {
   const cut = GW_SRC.indexOf('server.listen(');
   if (cut < 0) throw new Error('server.listen not found');
   const code = GW_SRC.slice(0, cut) + `
-;globalThis.__x = { handleChatCompletion, buildToolsText, sessions, state, pool, poolAdd, poolMarkOk, poolMarkQuota };`;
+;globalThis.__x = { handleChatCompletion, buildToolsText, buildHealthPayload, sessions, state, pool, poolAdd, poolMarkOk, poolMarkQuota };`;
   const sandbox = {
     require: (m) => {
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
@@ -54,17 +54,25 @@ function makeGateway(tmpBase) {
 /* ---------- mock res：模拟真实 Node 的 headersSent 行为（二次 writeHead 抛错） ---------- */
 function makeResMock() {
   return {
-    headersSent: false, writeHeadCount: 0,
+    headersSent: false, writeHeadCount: 0, statusCode: null,
     setHeader() {},
-    writeHead() {
+    writeHead(code) {
       if (this.headersSent) throw new Error('ERR_HTTP_HEADERS_SENT (mock: headers already sent)');
       this.headersSent = true;
       this.writeHeadCount++;
+      this.statusCode = code;
     },
     chunks: [], write(c) { this.chunks.push(String(c)); }, end(c) { if (c !== undefined) this.chunks.push(String(c)); this.ended = true; },
   };
 }
 function sseText(res) { return res.chunks.join(''); }
+function parseSseEvents(res) {
+  return res.chunks.join('').split('\n\n').map((s) => s.trim()).filter(Boolean).map((frame) => {
+    const body = frame.replace(/^data:\s*/, '');
+    if (body === '[DONE]') return { done: true };
+    try { return { json: JSON.parse(body) }; } catch (e) { return { raw: body }; }
+  });
+}
 
 /* ---------- mock rpc：script = 每次 streamAsk 的 stream-end 结果序列；
  * rpcThrow = 让 rpc 直接 reject（模拟 streamAsk RPC 超时/driver 崩溃） ---------- */
@@ -207,6 +215,77 @@ const PAYLOAD_DELTA_ASSISTANT_TAIL = {
     check('F5 会话数不变（同会话复用，未新建）', gw.sessions.size === 1, 'size=' + gw.sessions.size);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-f2-'));
+    const gw = makeGateway(tmp);
+    const { calls } = makeRpcMock(gw, [
+      { ok: true, result: '```tool_call\n{"name":"web_search","args":{"queries":["上海天气 2026-08-22"]}}\n```', toolCalls: [{ name: 'web_search', arguments: '{"query":"上海天气 2026-08-22"}' }] },
+      { ok: true, result: '上海明天天气晴。' },
+    ]);
+    const res1 = makeResMock();
+    await gw.handleChatCompletion({}, res1, PAYLOAD_FIRST);
+    const res2 = makeResMock();
+    await gw.handleChatCompletion({}, res2, {
+      model: 'deepseek-chat', stream: true,
+      messages: [
+        { role: 'system', content: '你是测试助手' },
+        { role: 'user', content: 'Current runtime context:\n- cwd: /tmp\n- DSH file policy: full auto\n- Approval policy: auto' },
+        { role: 'user', content: '读一下文件' },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'web_search', arguments: '{"query":"上海天气 2026-08-22"}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: '晴，28C' },
+      ],
+    });
+    const asks = calls.filter((c) => c.method === 'streamAsk');
+    check('F6 工具循环第二轮仍命中同会话 delta（reset=auto）', asks.length === 2 && asks[1].params.reset === 'auto', JSON.stringify(asks.map((a) => a.params.reset)));
+    check('F7 工具循环第二轮不走 recovery 压缩历史', asks.length === 2 && !/网页会话中断/.test(asks[1].params.question || ''), asks[1] && asks[1].params && asks[1].params.question);
+    check('F8 工具循环第二轮增量为 tool 结果，不重复首轮上下文', asks.length === 2 && /^\[工具结果\]\n晴，28C/.test(asks[1].params.question || ''), asks[1] && asks[1].params && asks[1].params.question);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-f3-'));
+    const gw = makeGateway(tmp);
+    const { d } = makeRpcMock(gw, []);
+    const sb = gw.__sandbox;
+    let askSeq = 0;
+    sb.rpc = async (method, params) => {
+      if (method === 'streamAsk') {
+        const streamId = 's-f3-' + (++askSeq);
+        setTimeout(() => {
+          const c = d.consumers.get(streamId);
+          if (!c) return;
+          if (askSeq === 1) {
+            c.end({ ok: true, result: '```tool_call\n{"name":"web_search","args":{"queries":["上海天气 2026-08-22"]}}\n```', toolCalls: [{ name: 'web_search', arguments: '{"query":"上海天气 2026-08-22"}' }] });
+          } else {
+            c.push('上海');
+            c.push('明天天气晴。');
+            c.end({ ok: true, result: '上海明天天气晴。' });
+          }
+        }, 5);
+        return { streamId };
+      }
+      return { ok: true };
+    };
+    const res1 = makeResMock();
+    await gw.handleChatCompletion({}, res1, PAYLOAD_FIRST);
+    const res2 = makeResMock();
+    await gw.handleChatCompletion({}, res2, {
+      model: 'deepseek-chat', stream: true,
+      messages: [
+        { role: 'system', content: '你是测试助手' },
+        { role: 'user', content: 'Current runtime context:\n- cwd: /tmp\n- DSH file policy: full auto\n- Approval policy: auto' },
+        { role: 'user', content: '读一下文件' },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'web_search', arguments: '{"query":"上海天气 2026-08-22"}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: '晴，28C' },
+      ],
+    });
+    const ev2 = parseSseEvents(res2);
+    const content2 = ev2.filter((e) => e.json && e.json.choices[0].delta.content).map((e) => e.json.choices[0].delta.content).join('');
+    const finish2 = ev2.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('F9 工具循环最终正文顺序输出完整', content2 === '上海明天天气晴。', JSON.stringify(ev2));
+    check('F10 工具循环最终正文以 stop 收尾', finish2.length === 1 && finish2[0] === 'stop', JSON.stringify(finish2));
+    check('F11 工具循环最终正文发送 [DONE] 且连接结束', ev2.filter((e) => e.done).length === 1 && ev2[ev2.length - 1].done === true && res2.ended === true, JSON.stringify(ev2.slice(-3)) + ' ended=' + res2.ended);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 
   /* ========== G. 非流式异常路径 ========== */
   console.log('== G. 非流式异常路径 ==');
@@ -217,8 +296,302 @@ const PAYLOAD_DELTA_ASSISTANT_TAIL = {
     const res = makeResMock();
     await gw.handleChatCompletion({}, res, Object.assign({}, PAYLOAD_FIRST, { stream: false }));
     const text = sseText(res);
-    check('G1 非流式 + rpc 异常 → JSON 响应含 [错误]', text.includes('[错误]') && text.includes('rpc timeout'));
+    let obj = null; try { obj = JSON.parse(text); } catch (e) { /* ignore */ }
+    check('G1 非流式 + rpc 异常 → 502 + OpenAI error JSON', res.statusCode === 502 && obj && obj.error && obj.error.type === 'api_error' && String(obj.error.message).includes('rpc timeout'), text);
     check('G2 非流式不发送 SSE 头（writeHead 恰 1 次且无 [DONE]）', res.writeHeadCount === 1 && !text.includes('[DONE]'));
+    check('G3 非流式异常不再伪装成 assistant content', !(obj && obj.choices), text);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-g2-'));
+    const gw = makeGateway(tmp);
+    const a = gw.pool.accounts.get('default');
+    a.state = 'cooling'; a.cooldownUntil = Date.now() + 600000;
+    makeRpcMock(gw, []);
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, Object.assign({}, PAYLOAD_FIRST, { stream: false }));
+    const text = sseText(res);
+    let obj = null; try { obj = JSON.parse(text); } catch (e) { /* ignore */ }
+    check('G4 无可用账号且都在 cooling → 429 rate_limit_error', res.statusCode === 429 && obj && obj.error && obj.error.type === 'rate_limit_error' && obj.error.code === 'all_accounts_cooling', text);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-g3-'));
+    const gw = makeGateway(tmp);
+    const a = gw.pool.accounts.get('default');
+    a.state = 'needs_login';
+    makeRpcMock(gw, []);
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, Object.assign({}, PAYLOAD_FIRST, { stream: false }));
+    const text = sseText(res);
+    let obj = null; try { obj = JSON.parse(text); } catch (e) { /* ignore */ }
+    check('G5 无可用账号且需登录 → 401 authentication_error', res.statusCode === 401 && obj && obj.error && obj.error.type === 'authentication_error' && obj.error.code === 'no_available_account', text);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  /* ========== S. 真实 SSE 顺序契约 ========== */
+  console.log('== S. 真实 SSE 顺序契约 ==');
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-s1-'));
+    const gw = makeGateway(tmp);
+    const { d } = makeRpcMock(gw, []);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method, params) => {
+      if (method === 'streamAsk') {
+        const streamId = 's-seq-1';
+        setTimeout(() => {
+          const c = d.consumers.get(streamId);
+          if (!c) return;
+          c.push('思考A', 'thinking');
+          c.push('思考B', 'thinking');
+          c.push('你好');
+          c.push('，世界');
+          c.end({ ok: true, result: '你好，世界' });
+        }, 5);
+        return { streamId };
+      }
+      return { ok: true };
+    };
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
+    const ev = parseSseEvents(res);
+    const role = ev[0] && ev[0].json && ev[0].json.choices[0].delta.role;
+    const reasoning = ev.filter((e) => e.json && e.json.choices[0].delta.reasoning_content).map((e) => e.json.choices[0].delta.reasoning_content).join('');
+    const reasoningMirror = ev.filter((e) => e.json && e.json.choices[0].delta.reasoning).map((e) => e.json.choices[0].delta.reasoning).join('');
+    const content = ev.filter((e) => e.json && e.json.choices[0].delta.content).map((e) => e.json.choices[0].delta.content).join('');
+    const finish = ev.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('S1 首个 SSE chunk 为 assistant role', role === 'assistant', JSON.stringify(ev[0]));
+    check('S2 reasoning_content 已屏蔽，不再输出思考流', reasoning === '', JSON.stringify(ev));
+    check('S3 reasoning 镜像字段已屏蔽', reasoningMirror === '', JSON.stringify(ev));
+    check('S4 content 顺序输出完整', content === '你好，世界', JSON.stringify(ev));
+    check('S5 finish_reason=stop 且只出现一次', finish.length === 1 && finish[0] === 'stop', JSON.stringify(finish));
+    check('S6 [DONE] 最后且只出现一次', ev.filter((e) => e.done).length === 1 && ev[ev.length - 1].done === true, JSON.stringify(ev.slice(-2)));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-s2-'));
+    const gw = makeGateway(tmp);
+    const { d } = makeRpcMock(gw, []);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method, params) => {
+      if (method === 'streamAsk') {
+        const streamId = 's-seq-2';
+        setTimeout(() => {
+          const c = d.consumers.get(streamId);
+          if (!c) return;
+          c.push('思考中', 'thinking');
+          c.push('```tool_call\n{"name":"read_file"');
+          c.push(',"arguments":{"path":"/tmp/a.txt"}}\n```');
+          c.end({ ok: true, result: '```tool_call\n{"name":"read_file","arguments":{"path":"/tmp/a.txt"}}\n```', toolCalls: [{ name: 'read_file', arguments: '{"path":"/tmp/a.txt"}' }] });
+        }, 5);
+        return { streamId };
+      }
+      return { ok: true };
+    };
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
+    const ev = parseSseEvents(res);
+    const content = ev.filter((e) => e.json && e.json.choices[0].delta.content).map((e) => e.json.choices[0].delta.content).join('');
+    const reasoning = ev.filter((e) => e.json && e.json.choices[0].delta.reasoning_content).map((e) => e.json.choices[0].delta.reasoning_content).join('');
+    const toolHeaders = ev.filter((e) => e.json && e.json.choices[0].delta.tool_calls && e.json.choices[0].delta.tool_calls[0].id).length;
+    const toolArgChunks = ev.filter((e) => e.json && e.json.choices[0].delta.tool_calls && e.json.choices[0].delta.tool_calls[0].function && typeof e.json.choices[0].delta.tool_calls[0].function.arguments === 'string' && !e.json.choices[0].delta.tool_calls[0].id).length;
+    const finish = ev.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('S7 thinking 后接 tool_calls 时 reasoning 仍屏蔽', reasoning === '', JSON.stringify(ev));
+    check('S8 工具 JSON 不泄漏到 content', content === '', JSON.stringify(ev));
+    check('S9 tool_calls header 和 arguments chunk 都发出', toolHeaders === 1 && toolArgChunks >= 1, JSON.stringify(ev));
+    check('S10 finish_reason=tool_calls 且 [DONE] 收尾', finish.length === 1 && finish[0] === 'tool_calls' && ev[ev.length - 1].done === true, JSON.stringify(ev.slice(-3)));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-s3-'));
+    const gw = makeGateway(tmp);
+    const { d } = makeRpcMock(gw, []);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method, params) => {
+      if (method === 'streamAsk') {
+        const streamId = 's-seq-3';
+        setTimeout(() => {
+          const c = d.consumers.get(streamId);
+          if (!c) return;
+          c.push('长思考片段A', 'thinking');
+          c.push('长思考片段B', 'thinking');
+          c.push('处世让一步为高。');
+          c.end({ ok: true, result: '处世让一步为高。' });
+        }, 5);
+        return { streamId };
+      }
+      return { ok: true };
+    };
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
+    const ev = parseSseEvents(res);
+    const reasoning = ev.filter((e) => e.json && e.json.choices[0].delta.reasoning_content).map((e) => e.json.choices[0].delta.reasoning_content).join('');
+    const content = ev.filter((e) => e.json && e.json.choices[0].delta.content).map((e) => e.json.choices[0].delta.content).join('');
+    const finish = ev.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('S11 think 模式短最终正文正常进入 content', content === '处世让一步为高。', JSON.stringify(ev));
+    check('S12 think 内容不泄漏进最终 content', content.indexOf('长思考片段') < 0, content);
+    check('S13 reasoning 屏蔽后仅 content 存在且 stop 收尾', reasoning === '' && finish.length === 1 && finish[0] === 'stop' && ev[ev.length - 1].done === true, JSON.stringify(ev.slice(-3)));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-s4-'));
+    const gw = makeGateway(tmp);
+    const { d } = makeRpcMock(gw, []);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method, params) => {
+      if (method === 'streamAsk') {
+        const streamId = 's-seq-4';
+        setTimeout(() => {
+          const c = d.consumers.get(streamId);
+          if (!c) return;
+          c.push('长思考内容一', 'thinking');
+          c.push('长思考内容二', 'thinking');
+          c.push('正文第一段');
+          c.push('，正文第二段');
+          c.end({ ok: true, result: '正文第一段，正文第二段' });
+        }, 5);
+        return { streamId };
+      }
+      return { ok: true };
+    };
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
+    const ev = parseSseEvents(res);
+    const content = ev.filter((e) => e.json && e.json.choices[0].delta.content).map((e) => e.json.choices[0].delta.content).join('');
+    const finish = ev.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('S14 think 面板残留场景下正文完整输出', content === '正文第一段，正文第二段', JSON.stringify(ev));
+    check('S15 think 面板残留场景下请求正常 stop 结束，不阻塞', finish.length === 1 && finish[0] === 'stop' && ev[ev.length - 1].done === true, JSON.stringify(ev.slice(-3)));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  {
+    check('S16 driver 工具安全网：looksLikeToolCall 现在接收 tools 上下文', /function looksLikeToolCall\(text, tools\)/.test(DRV_SRC));
+    check('S17 driver 工具安全网：解析失败但 toolIntent 仍命中时不会直接 stop', /const toolIntent = looksLikeToolCall\(finalText, params\.tools\);/.test(DRV_SRC) && /if \(toolCalls\.length \|\| !toolIntent\) break;/.test(DRV_SRC), 'driver retry guard missing');
+  }
+
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-s6-'));
+    const gw = makeGateway(tmp);
+    const { d } = makeRpcMock(gw, []);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method, params) => {
+      if (method === 'streamAsk') {
+        const streamId = 's-seq-6';
+        setTimeout(() => {
+          const c = d.consumers.get(streamId);
+          if (!c) return;
+          c.end({ ok: true, result: '```tool_call\n{"name":"web_search","args":{"queries":["上海天气 今天 实时"]}}\n```', toolCalls: [{ name: 'web_search', arguments: '{"query":"上海天气 今天 实时"}' }] });
+        }, 5);
+        return { streamId };
+      }
+      return { ok: true };
+    };
+    const payload = Object.assign({}, PAYLOAD_FIRST, {
+      tools: [{ type: 'function', function: { name: 'web_search', parameters: { properties: { query: {} } } } }],
+    });
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, payload);
+    const ev = parseSseEvents(res);
+    const toolChunks = ev.filter((e) => e.json && e.json.choices[0].delta.tool_calls);
+    const argText = toolChunks.map((e) => {
+      const tc = e.json.choices[0].delta.tool_calls[0];
+      return (tc.function && tc.function.arguments) || '';
+    }).join('');
+    const finish = ev.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('S18 web_search 工具调用最终走 tool_calls', finish.length === 1 && finish[0] === 'tool_calls', JSON.stringify(ev));
+    check('S19 web_search 参数在 gateway 输出中为规范化后的 query', argText.includes('"query":"上海天气 今天 实时"') && !argText.includes('queries'), argText);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-s7-'));
+    const gw = makeGateway(tmp);
+    const { d } = makeRpcMock(gw, []);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method, params) => {
+      if (method === 'streamAsk') {
+        const streamId = 's-seq-7';
+        setTimeout(() => {
+          const c = d.consumers.get(streamId);
+          if (!c) return;
+          c.end({ ok: true, result: '<tool_calls>\n<invoke name="web_search">\n<parameter name="queries">["上海 近三天 天气预报 2026-08-22"]</parameter>\n</invoke>\n</tool_calls>', toolCalls: [{ name: 'web_search', arguments: '{"query":"上海 近三天 天气预报 2026-08-22"}' }] });
+        }, 5);
+        return { streamId };
+      }
+      return { ok: true };
+    };
+    const payload = Object.assign({}, PAYLOAD_FIRST, {
+      tools: [{ type: 'function', function: { name: 'web_search', parameters: { properties: { query: {} } } } }],
+    });
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, payload);
+    const ev = parseSseEvents(res);
+    const toolChunks = ev.filter((e) => e.json && e.json.choices[0].delta.tool_calls);
+    const argText = toolChunks.map((e) => {
+      const tc = e.json.choices[0].delta.tool_calls[0];
+      return (tc.function && tc.function.arguments) || '';
+    }).join('');
+    const finish = ev.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('S20 XML tool_calls 最终走 tool_calls 而不是 stop', finish.length === 1 && finish[0] === 'tool_calls', JSON.stringify(ev));
+    check('S21 XML tool_calls 参数在 gateway 输出中为规范化后的 query', argText.includes('"query":"上海 近三天 天气预报 2026-08-22"') && !argText.includes('queries'), argText);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  /* ========== J. health/debug 暴露最近一次完成快照 ========== */
+  console.log('== J. health/debug 完成快照 ==');
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-j-'));
+    const gw = makeGateway(tmp);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method) => {
+      if (method === 'inspect') {
+        return {
+          login: { needsLogin: false, hasChatInput: true, url: 'https://chat.deepseek.com/' },
+          lastStreamSummary: {
+            finishBy: 'doneSignal',
+            thinkStalled: true,
+            genSeen: true,
+            thinking: true,
+            searching: false,
+            resultLen: 24,
+          },
+        };
+      }
+      return { ok: true };
+    };
+    const health = await gw.buildHealthPayload();
+    check('J1 health.driver.lastStreamSummary 暴露最近一次完成快照', !!(health.driver && health.driver.lastStreamSummary && health.driver.lastStreamSummary.finishBy === 'doneSignal' && health.driver.lastStreamSummary.thinkStalled === true), JSON.stringify(health.driver));
+    check('J1b health.driver.lastStream 生成可读摘要与细节', !!(health.driver && health.driver.lastStream && typeof health.driver.lastStream.text === 'string' && health.driver.lastStream.text.includes('检测到完成信号') && typeof health.driver.lastStream.detail === 'string' && health.driver.lastStream.detail.includes('finishBy=doneSignal')), JSON.stringify(health.driver && health.driver.lastStream));
+    check('J1c 健康摘要为正常完成生成 ok/warn/bad kind', health.driver.lastStream && health.driver.lastStream.kind === 'warn', JSON.stringify(health.driver && health.driver.lastStream));
+    check('J2 health 继续复用 inspect.login 作为登录态', health.login && health.login.needsLogin === false && health.summary && health.summary.login === 'logged_in', JSON.stringify(health.login));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-j2-'));
+    const gw = makeGateway(tmp);
+    const sb = gw.__sandbox;
+    sb.rpc = async (method) => {
+      if (method === 'inspect') {
+        return {
+          login: { needsLogin: false, hasChatInput: true, url: 'https://chat.deepseek.com/' },
+          lastStreamSummary: {
+            finishBy: 'timeoutNoFirstSeen',
+            ok: false,
+            error: 'timeout: 等待 240s 未见新回复',
+            genSeen: false,
+            thinking: false,
+            searching: false,
+            resultLen: 0,
+          },
+        };
+      }
+      return { ok: true };
+    };
+    const health = await gw.buildHealthPayload();
+    check('J3 最近失败摘要会标记 bad 并生成人类可读文本', !!(health.driver && health.driver.lastStream && health.driver.lastStream.kind === 'bad' && health.driver.lastStream.text.includes('超时且未见首段输出')), JSON.stringify(health.driver && health.driver.lastStream));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 

@@ -239,7 +239,15 @@ function makeConsumer(d, streamId) {
   const c = {
     q: [], w: [], ended: false, endInfo: null,
     push(delta, kind) { if (this.ended) return; const w = this.w.shift(); if (w) w({ delta, kind }); else this.q.push({ delta, kind }); },
-    end(info) { if (this.ended) return; this.ended = true; this.endInfo = info; const w = this.w.shift(); if (w) w(info); },
+    end(info) {
+      if (this.ended) return;
+      this.ended = true;
+      this.endInfo = info;
+      while (this.w.length) {
+        const w = this.w.shift();
+        if (w) w(info);
+      }
+    },
     next() { if (this.q.length) return Promise.resolve(this.q.shift()); if (this.ended) return Promise.resolve(this.endInfo || { ok: false }); return new Promise((r) => this.w.push(r)); },
   };
   d.consumers.set(streamId, c);
@@ -552,18 +560,21 @@ function hashText(s) {
 function sessionFingerprint(payload) {
   const msgs = payload.messages || [];
   const { sysText } = extractBaseline(msgs);
-  let firstUser = '';
+  const inputs = [];
   for (const m of msgs) {
-    if (m.role !== 'user') continue;
+    if (m.role === 'assistant') break;
+    if (m.role !== 'user' && m.role !== 'tool') continue;
     const text = blockText(m.content);
     if (!text || isRuntimeContext(text)) continue;
     if (text.indexOf('Current runtime context') === 0) continue; /* ctx 失配兜底：防指纹漂移 */
-    firstUser = text;
-    break;
+    const tag = m.role === 'tool' ? '[工具结果]' : '[用户]';
+    inputs.push(tag + '\n' + text);
+    if (inputs.length >= 3) break; /* 取首批有效输入：比只看首条 user 稳定，仍控制成本 */
   }
+  const basis = inputs.join('\n\n');
   return {
-    full: hashText(sysText + '\x00' + firstUser),
-    loose: hashText(sysText + '\x00' + firstUser.slice(0, 300)),
+    full: hashText(sysText + '\x00' + basis),
+    loose: hashText(sysText + '\x00' + basis.slice(0, 600)),
   };
 }
 
@@ -713,7 +724,11 @@ function clipText(text, max, tag) {
  */
 function isNewConversation(payload) {
   const msgs = payload.messages || [];
-  return !msgs.some((m) => m.role === 'assistant');
+  return !msgs.some((m) => {
+    if (m.role !== 'assistant') return false;
+    const text = blockText(m.content);
+    return !!text || (Array.isArray(m.tool_calls) && m.tool_calls.length > 0);
+  });
 }
 
 /** 从 messages 中提取 system/developer 提示词与 runtime context（首轮/重建时注入网页版用）。 */
@@ -953,22 +968,53 @@ function sseChunk(res, obj) { res.write('data: ' + JSON.stringify(obj) + '\n\n')
  * 1. 仅当文本以 ```tool_call 或 ```json 开头时才判定（模型被提示工程约束只输出这两种格式）
  * 2. 裸 JSON（不以代码块开头）仅在同时含 name+args 且不含散文特征时判定
  * 3. 排除代码块内的 JSON 示例（前面有文字说明的） */
-function looksLikeToolCallText(t) {
+function looksLikeToolCallText(t, tools) {
   const s = String(t || '').trim();
   if (!s) return false;
-  if (/tool_call/i.test(s)) return true;
-  if (/^<tool_call>function/.test(s)) return true;
-  /* ```tool_call 代码块：最明确的工具调用信号 */
+  function matchToolByParamsStrict(j) {
+    if (!tools || !Array.isArray(tools) || !j || typeof j !== 'object' || Array.isArray(j)) return null;
+    const keys = Object.keys(j).filter((k) => k !== 'name' && k !== 'arguments' && k !== 'function' && k !== 'tool');
+    if (!keys.length) return null;
+    const PARAM_ALIAS = { path: 'file_path', file: 'file_path', filepath: 'file_path', filename: 'file_path', cmd: 'command', code: 'command', script: 'command', text: 'content', data: 'content', body: 'content' };
+    let best = null, bestScore = 0, tied = false;
+    for (const tool of tools) {
+      const fn = tool.function || tool;
+      if (!fn || !fn.name) continue;
+      const props = (fn.parameters && fn.parameters.properties) || {};
+      const propKeys = Object.keys(props);
+      if (!propKeys.length) continue;
+      let score = 0, hit = 0, miss = 0;
+      for (const k of keys) {
+        if (propKeys.includes(k)) { score += 2; hit++; }
+        else if (propKeys.includes(PARAM_ALIAS[k] || '')) { score += 2; hit++; }
+        else { score -= 1.5; miss++; }
+      }
+      if (miss > hit) continue;
+      if (keys.length > 1 && miss > 0) continue;
+      score += (hit / propKeys.length) * 2;
+      if (hit > 0 && score > bestScore) { bestScore = score; best = fn.name; tied = false; }
+      else if (hit > 0 && score === bestScore && score > 0 && best && best !== fn.name) tied = true;
+    }
+    if (tied) return null;
+    return bestScore >= 2 ? best : null;
+  }
   if (/^```tool_call/i.test(s)) return true;
-  /* ```json 代码块：含 name+args 特征时判定为工具调用 */
+  if (/^<tool_calls>/i.test(s) || /^<invoke\b/i.test(s)) return true;
+  if (/^<tool_call>\s*\{/.test(s) || /^<tool_call>function/.test(s)) return true;
+  /* 裸 tool_call 标记：只在回复起始位置命中，避免把解释性散文误判成工具调用 */
+  if (/^tool_call\b/i.test(s)) return true;
+  /* ```json 代码块：必须是代码块起始且含 name+args 特征，防正文里引用 JSON 示例 */
   if (/^```json/i.test(s)) {
     const body = s.replace(/^```json\s*\n?/i, '');
     if (/"name"\s*:/.test(body.slice(0, 500)) && (/"args"\s*:/.test(body.slice(0, 500)) || /"arguments"\s*:/.test(body.slice(0, 500)))) return true;
+    try {
+      const obj = JSON.parse(body.replace(/```\s*$/m, '').trim());
+      if (matchToolByParamsStrict(obj)) return true;
+    } catch (e) { /* ignore */ }
     return false;
   }
   /* 无代码块的裸 JSON：仅当同时含 name+args 且无散文特征时判定。
-   * 散文特征（句号/换行+文字/Markdown 标题）= 模型在解释中引用 JSON 示例，
-   * 不是工具调用。这是 silent 卡死的主要误判来源。 */
+   * 对纯参数 JSON，仅在唯一匹配到已授权工具时才命中，避免误把普通 JSON 静默吞掉。 */
   if (s.startsWith('{')) {
     const head = s.slice(0, 300);
     const hasName = /"name"\s*:/.test(head);
@@ -980,12 +1026,14 @@ function looksLikeToolCallText(t) {
     try {
       const obj = JSON.parse(s.length > 2000 ? s.slice(0, 2000) + '}' : s);
       if (obj && (obj.tool !== undefined || obj.function !== undefined)) return true;
+      if (matchToolByParamsStrict(obj)) return true;
     } catch (e) { /* incomplete JSON, already checked above */ }
   }
   if (s.startsWith('[')) {
     try {
       const arr = JSON.parse(s.length > 2000 ? s.slice(0, 2000) + ']' : s);
       if (Array.isArray(arr) && arr.length > 0 && arr[0] && (arr[0].name !== undefined || arr[0].tool !== undefined)) return true;
+      if (Array.isArray(arr) && arr.length === 1 && arr[0] && matchToolByParamsStrict(arr[0])) return true;
     } catch (e) { /* ignore */ }
   }
   return false;
@@ -1011,14 +1059,11 @@ async function handleChatCompletion(req, res, payload) {
   const sendChunk = (obj) => sseChunk(res, obj);
   /* 输出抽象：流式边收集边推送；非流式只收集，最后一次性 JSON 返回 */
   const out = { text: '', tools: [] };
-  /* v3 真流式状态（askOnce 每轮重置；finish 闭包读取 accThinking——必须在 finish
-   * 定义前声明，防"无可用账号"等提前 finish 路径触发 TDZ）：
-   * - accThinking：思考累计（reasoning_content，DeepSeek 官方 API 字段）
+  /* v3 真流式状态（askOnce 每轮重置）：
    * - accContent：本轮正文累计（终态前缀对齐补尾的基准）
    * - toolMode：buffer=攒首段判工具 / stream=正文直通 / silent=像工具 JSON 静默累计
    *   （网页版工具调用是提示工程 JSON 文本，外泄进 content 会污染 DSH 显示）
    * - toolBuf：buffer 模式的首段缓冲 */
-  let accThinking = '';
   let accContent = '';
   let toolMode = 'buffer';
   let toolBuf = '';
@@ -1048,11 +1093,26 @@ async function handleChatCompletion(req, res, payload) {
     } else {
       sendJson(res, {
         id: cid, object: 'chat.completion', created, model,
-        /* reasoning_content：思考全文（DeepSeek 官方 API 字段，与流式 delta.reasoning_content 对应） */
-        choices: [{ index: 0, message: { role: 'assistant', content: out.text || null, reasoning_content: accThinking || undefined, tool_calls: out.tools.length ? out.tools : undefined }, finish_reason: reason }],
+        choices: [{ index: 0, message: { role: 'assistant', content: out.text || null, tool_calls: out.tools.length ? out.tools : undefined }, finish_reason: reason }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       });
     }
+  };
+  const apiError = (status, type, message, code) => ({
+    error: {
+      message: String(message || 'unknown error'),
+      type: type || 'api_error',
+      code: code || undefined,
+    },
+  });
+  const failJson = (status, type, message, code) => {
+    if (wantStream) {
+      emitText('[错误] ' + String(message || 'unknown'));
+      finish('stop');
+      return;
+    }
+    finished = true;
+    sendJson(res, apiError(status, type, message, code), status);
   };
   /* 客户端断开（DSH 取消/超时）：停止 driver 侧生成，别让浏览器空转 4 分钟。
    * 防御：非 http req（测试 fake）无 on 方法时跳过 */
@@ -1079,9 +1139,7 @@ async function handleChatCompletion(req, res, payload) {
         sseHeaders(res);
         sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
       }
-      emitText('[并发已满] 当前 DeepSeek 网页版并发上限为 ' + limit + '，请求排队超过 ' + Math.round(SEM_WAIT_TIMEOUT_MS / 1000) + 's 仍未获得生成槽位。可能原因：其他对话正在跑长任务（智能搜索+深度思考/工具循环）或 driver 卡住。可稍后重试，或通过 POST /config 调大 maxConcurrent（注意：多账号下会退化为 1）。');
-      finish('stop');
-      return;
+      return failJson(429, 'rate_limit_error', '[并发已满] 当前 DeepSeek 网页版并发上限为 ' + limit + '，请求排队超过 ' + Math.round(SEM_WAIT_TIMEOUT_MS / 1000) + 's 仍未获得生成槽位。可能原因：其他对话正在跑长任务（智能搜索+深度思考/工具循环）或 driver 卡住。可稍后重试，或通过 POST /config 调大 maxConcurrent（注意：多账号下会退化为 1）。', 'concurrency_full');
     }
     /* 会话解析（并发核心：指纹识别 → 专属通道绑定）。
      * mode: first=新会话首轮 / delta=增量（网页版历史保持） / recovery=压缩重建 */
@@ -1105,9 +1163,7 @@ async function handleChatCompletion(req, res, payload) {
       /* 本次未向 driver 发送任何内容：通道页面不存在，下轮必须走 recovery 重建
        * （否则 delta 增量发进 ensureChannelPage 新建的空白页，模型文不对题） */
       session0.epoch = -1;
-      emitText(msg);
-      finish('stop');
-      return;
+      return failJson(er ? 429 : 401, er ? 'rate_limit_error' : 'authentication_error', msg, er ? 'all_accounts_cooling' : 'no_available_account');
     }
     session.acctName = acct.name;
     log('账号: ' + acct.name + (acct.state === 'probing' ? '（probing 探测）' : '') + ' mode=' + mode);
@@ -1117,7 +1173,7 @@ async function handleChatCompletion(req, res, payload) {
      * → 切号重试不会产生残留文本污染。 */
     const askOnce = async (profileName, askMode) => {
       /* 切号重试轮重置：新一轮从零累计（客户端看到上一轮已流出内容 + 本轮完整流式） */
-      accThinking = ''; accContent = ''; toolMode = 'buffer'; toolBuf = ''; silentStart = 0;
+      accContent = ''; toolMode = 'buffer'; toolBuf = ''; silentStart = 0;
       /* 工具提示词：first/recovery 随首包注入（网页版此时是空白会话），
        * delta 不重复携带——网页版历史里已有首轮的工具说明。
        * 工具块由 buildContext 内嵌到 [用户] 之前（位置优化），不再单独传 driver。 */
@@ -1156,25 +1212,27 @@ async function handleChatCompletion(req, res, payload) {
             evt = { ok: false, error: 'gateway timeout: 等待 driver 流式结果超时（' + Math.round(ASK_WAIT_TIMEOUT_MS / 60000) + 'min，driver 可能已卡死）' };
             break;
           }
-          /* v3 真流式核心：delta 增量实时转发为 SSE chunk（思考→reasoning_content，
-           * 正文→content），不再攒到终态一次性输出（旧实现 delta 被静默丢弃）。 */
+          /* v3 真流式核心：仅正文/工具相关增量对 DSH 可见；thinking 仅供 driver
+           * 内部完成判定使用，在网关层静默，不再转 reasoning_content。 */
           if (evt.delta !== undefined) {
             if (evt.kind === 'thinking') {
-              accThinking += evt.delta;
-              if (wantStream) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning_content: evt.delta }, finish_reason: null }] });
+              continue;
             } else {
               accContent += evt.delta;
               if (wantStream) {
+                let emitCurrentDelta = true;
                 if (toolMode === 'buffer') {
                   toolBuf += evt.delta;
-                  if (looksLikeToolCallText(toolBuf) && toolBuf.length < 400) {
+                  if (looksLikeToolCallText(toolBuf, payload.tools) && toolBuf.length < 400) {
                     toolMode = 'silent';
                     silentStart = Date.now();
+                    emitCurrentDelta = false;
                     log('toolMode → silent (toolBuf[:80]=' + toolBuf.slice(0, 80).replace(/\n/g, '\\n') + ')');
                   } else {
                     toolMode = 'stream';
                     log('toolMode → stream (toolBuf len=' + toolBuf.length + ')');
                     if (toolBuf) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: toolBuf }, finish_reason: null }] });
+                    emitCurrentDelta = false; /* toolBuf 已含当前 evt.delta，避免首块重复发送 */
                   }
                 } else if (toolMode === 'silent') {
                   /* silent 超时回退：如果 silent 模式持续超过 SILENT_TIMEOUT_MS，
@@ -1184,9 +1242,10 @@ async function handleChatCompletion(req, res, payload) {
                     log('toolMode silent timeout (' + Math.round(SILENT_TIMEOUT_MS / 1000) + 's), fallback → stream (accContentLen=' + accContent.length + ')');
                     toolMode = 'stream';
                     if (accContent) sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: accContent }, finish_reason: null }] });
+                    emitCurrentDelta = false; /* accContent 已含当前 evt.delta，避免回退轮重复发送 */
                   }
                 }
-                if (toolMode === 'stream') {
+                if (toolMode === 'stream' && emitCurrentDelta) {
                   sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: evt.delta }, finish_reason: null }] });
                 }
                 /* silent：工具 JSON 静默累计不转发（accContent 继续累计供终态对齐判断） */
@@ -1286,8 +1345,12 @@ async function handleChatCompletion(req, res, payload) {
     } else {
       /* 请求失败（timeout/受限切换预算用尽等）：通道页面状态未知 → 下轮强制 recovery */
       session0.epoch = -1;
-      emitText('[错误] ' + (evt.error || 'unknown'));
-      finish('stop');
+      const msg = evt.error || 'unknown';
+      const kind = evt.errorKind || '';
+      const status = kind === 'quota' ? 429 : kind === 'login' ? 401 : kind === 'captcha' ? 403 : /^nothing to send/.test(String(msg)) ? 400 : /^timeout:/.test(String(msg)) ? 504 : 502;
+      const type = kind === 'quota' ? 'rate_limit_error' : kind === 'login' ? 'authentication_error' : kind === 'captcha' ? 'permission_error' : /^nothing to send/.test(String(msg)) ? 'invalid_request_error' : /^timeout:/.test(String(msg)) ? 'timeout_error' : 'api_error';
+      const code = kind || (/^nothing to send/.test(String(msg)) ? 'nothing_to_send' : /^timeout:/.test(String(msg)) ? 'driver_timeout' : 'driver_error');
+      return failJson(status, type, msg, code);
     }
   } catch (e) {
     /* 异常路径下会话通道状态未知（rpc 失败/driver 未就绪）→ epoch 置失配，
@@ -1301,8 +1364,7 @@ async function handleChatCompletion(req, res, payload) {
         sseHeaders(res);
         sendChunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
       }
-      emitText('[错误] ' + String(e.message || e));
-      finish('stop');
+      return failJson(wantStream ? 200 : 502, 'api_error', String(e.message || e), 'gateway_exception');
     } catch (e2) { /* ignore */ }
   } finally {
     /* 释放顺序与获取相反：信号量 → 会话锁；同时刷新会话活跃时间 */
@@ -1382,6 +1444,540 @@ async function handleWorkBuddy(req, res, payload) {
   }
 }
 
+
+function gatewayBaseURL() {
+  return 'http://127.0.0.1:' + PORT;
+}
+function gatewayApiBaseURL() {
+  return gatewayBaseURL() + '/v1/';
+}
+function providerModelsYaml() {
+  return Object.entries(MODELS).map(([id, m]) => '        { id: ' + id + ', name: ' + m.name.replace('（网页版）', '') + ' }').join(',\n');
+}
+function providerSnippet() {
+  return [
+    'dsweb:',
+    '  {',
+    '    displayName: DeepSeek 网页版 (免 API),',
+    '    apiKeyEnv: MOCK_LLM_KEY,',
+    '    api: openai-completions,',
+    '    baseURL: ' + gatewayApiBaseURL() + ',',
+    '    models:',
+    '      [',
+    providerModelsYaml(),
+    '      ]',
+    '  }',
+  ].join('\n');
+}
+function credentialsSnippet() {
+  return 'MOCK_LLM_KEY: sk-mock-any-value';
+}
+function htmlEscape(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+function jsonHtml(obj) {
+  return htmlEscape(JSON.stringify(obj, null, 2));
+}
+function fmtDuration(ms) {
+  const n = Math.max(0, Math.floor((ms || 0) / 1000));
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = n % 60;
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm ' + s + 's';
+  return s + 's';
+}
+function fmtAgo(ts) {
+  if (!ts) return '从未';
+  const d = Date.now() - ts;
+  if (d < 0) return '刚刚';
+  return fmtDuration(d) + ' 前';
+}
+function healthSummary(health) {
+  const sessions = health.sessions || {};
+  const driver = health.driver || {};
+  const login = health.login || {};
+  const accounts = health.accounts || {};
+  const cooling = (accounts.accounts || []).filter((a) => a.state === 'cooling').length;
+  const needsLogin = (accounts.accounts || []).filter((a) => a.state === 'needs_login').length;
+  return {
+    gateway: driver.ready ? 'ready' : (driver.running ? 'starting' : 'down'),
+    login: login.needsLogin ? 'needs_login' : 'logged_in',
+    sessions: sessions.count || 0,
+    channels: sessions.channels || 0,
+    freeChannels: sessions.freeChannels || 0,
+    accounts: accounts.total || 0,
+    coolingAccounts: cooling,
+    needsLoginAccounts: needsLogin,
+  };
+}
+function summarizeLastStream(last) {
+  if (!last) return { text: '暂无', detail: '', kind: 'muted' };
+  function finishLabel(finishBy) {
+    switch (finishBy) {
+      case 'doneSignal': return '检测到完成信号';
+      case 'stable1500ms': return '文本稳定后结束';
+      case 'timeout5s': return '5 秒兜底结束';
+      case 'timeout30s': return '30 秒兜底结束';
+      case 'timeoutNoFirstSeen': return '超时且未见首段输出';
+      case 'lengthRetryExhausted': return '对话过长且重试用尽';
+      case 'limitHit': return '触发限流/风控';
+      case 'tool_calls': return '输出工具调用';
+      case 'stop': return '正常结束';
+      case 'exception': return '异常中断';
+      default: return finishBy || (last.ok ? '正常结束' : '失败');
+    }
+  }
+  const parts = [];
+  if (last.at) parts.push(fmtAgo(last.at));
+  parts.push(finishLabel(last.finishBy));
+  if (last.ok === false && last.errorKind) parts.push('错误：' + last.errorKind);
+  if (last.ok === false && !last.errorKind && last.error) parts.push('请求失败');
+  if (last.toolCalls) parts.push('工具 ' + last.toolCalls + ' 次');
+  if (last.resultLen) parts.push('输出 ' + last.resultLen + ' 字');
+  if (last.thinkStalled) parts.push('思考区静止后放行');
+  const detail = [
+    'profile=' + (last.profile || '-'),
+    'pageKey=' + (last.pageKey || '-'),
+    'finishBy=' + (last.finishBy || '-'),
+    'genSeen=' + !!last.genSeen,
+    'thinking=' + !!last.thinking,
+    'searching=' + !!last.searching,
+    'toolCalls=' + (last.toolCalls || 0),
+    'resultLen=' + (last.resultLen || 0),
+    'thinkLen=' + (last.thinkLen || 0),
+    'dedupedLen=' + (last.dedupedLen || 0),
+  ].join(' · ');
+  return { text: parts.join(' · '), detail, kind: last.ok === false ? 'bad' : (last.thinkStalled ? 'warn' : 'ok') };
+}
+function accountActionHint(a) {
+  if (!a) return '';
+  if (a.state === 'needs_login') return '需要重新登录';
+  if (a.state === 'cooling') return '冷却中，等待探测恢复';
+  if (a.state === 'probing') return '已到探测窗口，下一次真实请求会验证是否恢复';
+  if (a.state === 'disabled') return '已禁用，可重新启用后登录';
+  if (a.suspectWindowMs > 0) return '刚出现一次疑似风控信号，调度会暂时绕开';
+  return '可用';
+}
+function buildAccountsPayload() {
+  const desc = poolDescribe();
+  const enriched = desc.accounts.map((a) => Object.assign({}, a, {
+    cooldownRemainText: a.cooldownRemainMs ? fmtDuration(a.cooldownRemainMs) : '',
+    lastUsedAgo: fmtAgo(a.lastUsedAt),
+    actionHint: accountActionHint(a),
+  }));
+  const summary = {
+    active: enriched.filter((a) => a.state === 'active').length,
+    cooling: enriched.filter((a) => a.state === 'cooling').length,
+    probing: enriched.filter((a) => a.state === 'probing').length,
+    needsLogin: enriched.filter((a) => a.state === 'needs_login').length,
+    disabled: enriched.filter((a) => a.state === 'disabled').length,
+  };
+  return {
+    ok: true,
+    enabled: desc.enabled,
+    total: desc.total,
+    accounts: enriched,
+    summary,
+    backoff: { baseMs: state.quotaBackoffBaseMs, maxMs: state.quotaBackoffMaxMs, confirmWindowMs: state.quotaConfirmWindowMs },
+    note: '受限信号只来自页面文案检测（动态风控无固定数值）；恢复=指数退避到期后真实请求探测',
+  };
+}
+async function getLoginSnapshot() {
+  let st = { needsLogin: true };
+  try {
+    const insp = await rpc('inspect', {}, 8000);
+    st = (insp && insp.login) || { needsLogin: true };
+  } catch (e) { /* driver not ready */ }
+  return st;
+}
+async function getInspectSnapshot() {
+  try { return await rpc('inspect', {}, 8000); } catch (e) { return null; }
+}
+async function buildHealthPayload() {
+  const uptime = Math.floor((Date.now() - gatewayStartTime) / 1000);
+  const inspect = await getInspectSnapshot();
+  const login = (inspect && inspect.login) || { needsLogin: true };
+  const accounts = poolDescribe();
+  const payload = {
+    ok: true,
+    uptime,
+    requests: gatewayRequestCount,
+    driver: { running: !!D, ready: !!(D && D.ready), pid: D && D.cp ? D.cp.pid : null, lastStreamSummary: inspect && inspect.lastStreamSummary ? inspect.lastStreamSummary : null },
+    login,
+    accounts,
+    sessions: {
+      count: sessions.size,
+      channels: activeChannelCount(),
+      freeChannels: freePageKeys.length,
+      list: [...sessions.values()].map((s) => ({ id: s.id, pageKey: s.pageKey, busy: s.busy, idleMs: Date.now() - s.lastSeen, account: s.acctName })),
+    },
+    config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages, accountPool: state.accountPool, maxAccounts: state.maxAccounts, autoRelogin: state.autoRelogin, quotaBackoffBaseMs: state.quotaBackoffBaseMs, quotaBackoffMaxMs: state.quotaBackoffMaxMs },
+  };
+  payload.driver.lastStream = summarizeLastStream(payload.driver.lastStreamSummary);
+  payload.summary = healthSummary(payload);
+  return payload;
+}
+function buildSetupPayload(health, accountsPayload) {
+  const accounts = (accountsPayload && accountsPayload.accounts) || [];
+  const summary = (health && health.summary) || {};
+  return {
+    ok: true,
+    gateway: {
+      baseURL: gatewayBaseURL(),
+      apiBaseURL: gatewayApiBaseURL(),
+      port: PORT,
+      running: true,
+    },
+    setup: {
+      providerSnippet: providerSnippet(),
+      credentialsSnippet: credentialsSnippet(),
+      checklist: [
+        { key: 'gateway', label: '网关已启动', done: true, detail: gatewayBaseURL() },
+        { key: 'provider', label: '已在 ~/.dsh/settings.yaml 添加 dsweb provider', done: false, detail: '复制下方 provider 片段到 llm-pi-ai.providers' },
+        { key: 'credentials', label: '已在 ~/.dsh/.credentials.yaml 添加 MOCK_LLM_KEY', done: false, detail: '网关不校验该值，只需存在即可' },
+        { key: 'login', label: 'DeepSeek 已登录', done: summary.login === 'logged_in', detail: summary.login === 'logged_in' ? '当前检查通过' : '请点击“默认账号登录”或登录其它账号' },
+      ],
+      quickLinks: {
+        home: '/',
+        login: '/login',
+        loginStatus: '/login-status',
+        health: '/health',
+        accounts: '/accounts',
+        config: '/config',
+        debug: '/debug',
+      },
+    },
+    cards: {
+      login: {
+        loggedIn: summary.login === 'logged_in',
+        hint: summary.login === 'logged_in' ? '登录态正常，可直接在 DSH 中选用模型。' : '未检测到可用登录态，请先完成浏览器登录。',
+      },
+      runtime: {
+        gateway: summary.gateway,
+        sessions: summary.sessions,
+        channels: summary.channels,
+        freeChannels: summary.freeChannels,
+      },
+      accounts: {
+        total: accounts.length,
+        needsLogin: accounts.filter((a) => a.state === 'needs_login').length,
+        cooling: accounts.filter((a) => a.state === 'cooling').length,
+      },
+    },
+  };
+}
+function sendHtml(res, html) {
+  cors(res);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
+}
+function renderManagementPage(setup) {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DeepSeek 网页版插件管理</title>
+<style>
+:root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --muted:#8b949e; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --link:#58a6ff; }
+* { box-sizing:border-box; }
+body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
+a { color:var(--link); text-decoration:none; }
+a:hover { text-decoration:underline; }
+.wrap { max-width:1280px; margin:0 auto; padding:24px; }
+.hero { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; justify-content:space-between; margin-bottom:20px; }
+.hero h1 { margin:0 0 6px; font-size:28px; }
+.hero p { margin:0; color:var(--muted); }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.18); }
+.card h2 { margin:0 0 10px; font-size:18px; }
+.card h3 { margin:14px 0 8px; font-size:14px; color:var(--muted); }
+.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.stat { display:flex; justify-content:space-between; gap:12px; border-top:1px solid rgba(255,255,255,.06); padding-top:8px; margin-top:8px; }
+.badge { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; background:#21262d; color:var(--text); border:1px solid var(--line); }
+.badge.ok { color:#aff5b4; border-color:rgba(63,185,80,.4); }
+.badge.warn { color:#f2cc60; border-color:rgba(210,153,34,.4); }
+.badge.bad { color:#ffb3ad; border-color:rgba(248,81,73,.4); }
+button, .btn, input, textarea { font:inherit; }
+button, .btn { background:#238636; color:white; border:0; padding:8px 12px; border-radius:10px; cursor:pointer; }
+button.secondary, .btn.secondary { background:#21262d; color:var(--text); border:1px solid var(--line); }
+button.warn { background:#9e6a03; }
+button.bad { background:#da3633; }
+button:disabled { opacity:.6; cursor:not-allowed; }
+pre { overflow:auto; padding:12px; border-radius:12px; background:#0b0f14; border:1px solid var(--line); }
+code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+small, .muted { color:var(--muted); }
+input[type="text"], input[type="number"] { width:100%; background:#0b0f14; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px 10px; }
+label.field { display:block; margin:8px 0; }
+label.field span { display:block; margin-bottom:6px; color:var(--muted); }
+.table { width:100%; border-collapse:collapse; }
+.table th, .table td { text-align:left; vertical-align:top; padding:8px 6px; border-top:1px solid rgba(255,255,255,.08); }
+.table th { color:var(--muted); font-weight:600; }
+.notice { padding:10px 12px; border-radius:12px; background:rgba(88,166,255,.08); border:1px solid rgba(88,166,255,.25); }
+.footer { margin-top:18px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div>
+      <h1>DeepSeek 网页版插件管理</h1>
+      <p>安装完成后，这里就是本插件的统一管理入口：快速登录、状态检查、账户检查、配置管理与诊断。</p>
+    </div>
+    <div class="row">
+      <span id="gatewayBadge" class="badge">网关检查中</span>
+      <span id="loginBadge" class="badge">登录态检查中</span>
+      <a class="btn secondary" href="/health" target="_blank" rel="noreferrer">查看 /health JSON</a>
+    </div>
+  </div>
+  <div id="lastErrorNotice" class="notice" style="display:none; margin-bottom:16px; background:rgba(248,81,73,.10); border-color:rgba(248,81,73,.35);"></div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>安装与接入</h2>
+      <div id="checklist" class="notice">正在读取 setup 信息…</div>
+      <h3>settings.yaml provider 片段</h3>
+      <pre><code>${htmlEscape(setup.setup.providerSnippet)}</code></pre>
+      <h3>.credentials.yaml 片段</h3>
+      <pre><code>${htmlEscape(setup.setup.credentialsSnippet)}</code></pre>
+    </section>
+
+    <section class="card">
+      <h2>快速登录</h2>
+      <p id="loginHint" class="muted">正在检查登录态…</p>
+      <div class="row">
+        <a class="btn" href="/login" target="_blank" rel="noreferrer">默认账号登录</a>
+        <button class="secondary" id="loginOtherBtn">登录其它账号</button>
+        <a class="btn secondary" href="/login-status" target="_blank" rel="noreferrer">查看登录状态 JSON</a>
+      </div>
+      <div class="footer">其它账号登录可直接访问 <code>/login?profile=你的账号名</code>。</div>
+    </section>
+
+    <section class="card">
+      <h2>运行状态</h2>
+      <div class="stat"><span>网关地址</span><code>${htmlEscape(setup.gateway.baseURL)}</code></div>
+      <div class="stat"><span>OpenAI 兼容入口</span><code>${htmlEscape(setup.gateway.apiBaseURL)}</code></div>
+      <div class="stat"><span>请求数</span><span id="requestsText">-</span></div>
+      <div class="stat"><span>运行时长</span><span id="uptimeText">-</span></div>
+      <div class="stat"><span>会话 / 通道 / 空闲通道</span><span id="sessionText">-</span></div>
+      <div class="stat"><span>driver</span><span id="driverText">-</span></div>
+      <div class="stat"><span>最近一次请求</span><span id="lastStreamText" class="badge">-</span></div>
+      <div class="footer" id="lastStreamDetail">-</div>
+    </section>
+
+    <section class="card">
+      <h2>账户检查与管理</h2>
+      <div class="row" style="margin-bottom:10px;">
+        <input id="newAccountName" type="text" placeholder="输入新账号名，例如 acc2" />
+        <button id="addAccountBtn">添加账号</button>
+      </div>
+      <div id="accountSummary" class="muted">正在读取账号池…</div>
+      <div style="overflow:auto; margin-top:10px;">
+        <table class="table" id="accountTable">
+          <thead><tr><th>账号</th><th>状态</th><th>使用情况</th><th>建议</th><th>操作</th></tr></thead>
+          <tbody><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>运行配置</h2>
+      <div class="row"><button id="refreshConfigBtn" class="secondary">刷新配置</button><button id="saveConfigBtn">保存配置</button></div>
+      <label class="field"><span>headless（修改后需重启网关并重新登录）</span><input id="cfgHeadless" type="text" placeholder="true / false" /></label>
+      <label class="field"><span>maxConcurrent</span><input id="cfgConcurrent" type="number" min="1" max="5" /></label>
+      <label class="field"><span>maxPages</span><input id="cfgPages" type="number" min="1" max="8" /></label>
+      <label class="field"><span>maxTurnsPerChat</span><input id="cfgTurns" type="number" min="2" max="500" /></label>
+      <label class="field"><span>accountPool（true / false）</span><input id="cfgAccountPool" type="text" /></label>
+      <label class="field"><span>maxAccounts</span><input id="cfgMaxAccounts" type="number" min="1" max="8" /></label>
+      <label class="field"><span>autoRelogin（true / false）</span><input id="cfgAutoRelogin" type="text" /></label>
+      <label class="field"><span>quotaBackoffBaseMs</span><input id="cfgBackoffBase" type="number" min="60000" /></label>
+      <label class="field"><span>quotaBackoffMaxMs</span><input id="cfgBackoffMax" type="number" min="1800000" /></label>
+      <div id="configNote" class="footer">配置会通过 <code>/config</code> 立即生效。</div>
+    </section>
+
+    <section class="card">
+      <h2>诊断与维护</h2>
+      <div class="row">
+        <a class="btn secondary" href="/debug" target="_blank" rel="noreferrer">DOM 结构诊断</a>
+        <a class="btn secondary" href="/accounts" target="_blank" rel="noreferrer">账号 JSON</a>
+        <a class="btn secondary" href="/config" target="_blank" rel="noreferrer">配置 JSON</a>
+        <a class="btn secondary" href="/calibrate/list" target="_blank" rel="noreferrer">校准列表</a>
+      </div>
+      <div class="footer">
+        常见限制：多账号时并发会退化为串行；需要本机真实 Chrome；DeepSeek 网页改版时可能需要更新选择器或重做校准。
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>接口快照</h2>
+      <p class="muted">便于未来接入 DSH 原生设置卡片：本页面只是插件内前端，卡片数据以 JSON 接口为准。</p>
+      <pre id="snapshotPre"><code>正在加载…</code></pre>
+    </section>
+  </div>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const boolText = (v) => v ? 'true' : 'false';
+  const fmtDuration = (ms) => {
+    const n = Math.max(0, Math.floor((ms || 0) / 1000));
+    const h = Math.floor(n / 3600); const m = Math.floor((n % 3600) / 60); const s = n % 60;
+    if (h) return h + 'h ' + m + 'm';
+    if (m) return m + 'm ' + s + 's';
+    return s + 's';
+  };
+  const api = async (url, init) => {
+    const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, init || {}));
+    const text = await r.text();
+    try { return JSON.parse(text); } catch (e) { throw new Error(text || ('HTTP ' + r.status)); }
+  };
+  const badge = (el, text, kind) => { el.textContent = text; el.className = 'badge ' + (kind || ''); };
+
+  async function refreshAll() {
+    const [setup, health, accounts, config] = await Promise.all([
+      api('/setup'), api('/health'), api('/accounts'), api('/config')
+    ]);
+    renderSetup(setup);
+    renderHealth(health);
+    renderAccounts(accounts);
+    renderConfig(config);
+    $('snapshotPre').innerHTML = '<code>' + escapeHtml(JSON.stringify({ setup, health: { summary: health.summary, config: health.config }, accounts: { summary: accounts.summary, total: accounts.total } }, null, 2)) + '</code>';
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function renderSetup(setup) {
+    badge($('gatewayBadge'), setup.cards.runtime.gateway === 'ready' ? '网关 ready' : '网关启动中', setup.cards.runtime.gateway === 'ready' ? 'ok' : 'warn');
+    badge($('loginBadge'), setup.cards.login.loggedIn ? '已登录' : '未登录', setup.cards.login.loggedIn ? 'ok' : 'warn');
+    $('loginHint').textContent = setup.cards.login.hint;
+    $('checklist').innerHTML = setup.setup.checklist.map((x) => '<div style="margin:6px 0;"><strong>' + (x.done ? '✅' : '⬜️') + ' ' + escapeHtml(x.label) + '</strong><div class="muted">' + escapeHtml(x.detail || '') + '</div></div>').join('');
+  }
+
+  function renderHealth(health) {
+    $('requestsText').textContent = String(health.requests || 0);
+    $('uptimeText').textContent = fmtDuration((health.uptime || 0) * 1000);
+    $('sessionText').textContent = [health.sessions.count || 0, health.sessions.channels || 0, health.sessions.freeChannels || 0].join(' / ');
+    $('driverText').textContent = (health.driver.ready ? 'ready' : (health.driver.running ? 'running' : 'down')) + (health.driver.pid ? ' · pid ' + health.driver.pid : '');
+    const ls = health.driver.lastStream || { text: '暂无', detail: '最近一次请求完成快照会显示在这里', kind: 'muted' };
+    $('lastStreamText').textContent = ls.text || '暂无';
+    $('lastStreamText').className = 'badge ' + (ls.kind || '');
+    $('lastStreamDetail').textContent = ls.detail || '最近一次请求完成快照会显示在这里';
+    const lastError = $('lastErrorNotice');
+    if (ls.kind === 'bad') {
+      lastError.style.display = 'block';
+      lastError.innerHTML = '<strong>最近失败：</strong>' + escapeHtml(ls.text || '请求失败') + '<div class="muted" style="margin-top:6px;">' + escapeHtml(ls.detail || '') + '</div>';
+    } else {
+      lastError.style.display = 'none';
+      lastError.textContent = '';
+    }
+  }
+
+  function renderAccounts(accounts) {
+    $('accountSummary').textContent = '总账号 ' + accounts.total + ' · active ' + accounts.summary.active + ' · cooling ' + accounts.summary.cooling + ' · needs_login ' + accounts.summary.needsLogin + ' · disabled ' + accounts.summary.disabled;
+    const tbody = $('accountTable').querySelector('tbody');
+    tbody.innerHTML = accounts.accounts.map((a) => '<tr>' +
+      '<td><strong>' + escapeHtml(a.name) + '</strong></td>' +
+      '<td>' + escapeHtml(a.state) + (a.cooldownRemainText ? '<div class="muted">剩余 ' + escapeHtml(a.cooldownRemainText) + '</div>' : '') + '</td>' +
+      '<td>请求 ' + (a.requestCount || 0) + '<div class="muted">最近使用 ' + escapeHtml(a.lastUsedAgo || '从未') + '</div></td>' +
+      '<td>' + escapeHtml(a.actionHint || '') + '</td>' +
+      '<td class="row">' +
+        '<a class="btn secondary" target="_blank" rel="noreferrer" href="/login?profile=' + encodeURIComponent(a.name) + '">登录</a>' +
+        (a.state === 'disabled' ? '<button class="secondary" data-enable="' + escapeHtml(a.name) + '">启用</button>' : '<button class="secondary" data-disable="' + escapeHtml(a.name) + '">禁用</button>') +
+        (a.name === 'default' ? '' : '<button class="bad" data-remove="' + escapeHtml(a.name) + '">删除</button>') +
+      '</td>' +
+    '</tr>').join('') || '<tr><td colspan="5" class="muted">暂无账号</td></tr>';
+  }
+
+  function renderConfig(configResp) {
+    const cfg = configResp.config || {};
+    $('cfgHeadless').value = boolText(!!cfg.headless);
+    $('cfgConcurrent').value = cfg.maxConcurrent ?? 2;
+    $('cfgPages').value = cfg.maxPages ?? 4;
+    $('cfgTurns').value = cfg.maxTurnsPerChat ?? 50;
+    $('cfgAccountPool').value = boolText(cfg.accountPool !== false);
+    $('cfgMaxAccounts').value = cfg.maxAccounts ?? 3;
+    $('cfgAutoRelogin').value = boolText(cfg.autoRelogin !== false);
+    $('cfgBackoffBase').value = cfg.quotaBackoffBaseMs ?? 300000;
+    $('cfgBackoffMax').value = cfg.quotaBackoffMaxMs ?? 21600000;
+    $('configNote').textContent = configResp.note || '配置会通过 /config 立即生效。';
+  }
+
+  function parseBool(v) {
+    return /^(1|true|yes|on)$/i.test(String(v).trim());
+  }
+
+  $('saveConfigBtn').addEventListener('click', async () => {
+    const payload = {
+      headless: parseBool($('cfgHeadless').value),
+      maxConcurrent: Number($('cfgConcurrent').value),
+      maxPages: Number($('cfgPages').value),
+      maxTurnsPerChat: Number($('cfgTurns').value),
+      accountPool: parseBool($('cfgAccountPool').value),
+      maxAccounts: Number($('cfgMaxAccounts').value),
+      autoRelogin: parseBool($('cfgAutoRelogin').value),
+      quotaBackoffBaseMs: Number($('cfgBackoffBase').value),
+      quotaBackoffMaxMs: Number($('cfgBackoffMax').value),
+    };
+    const r = await api('/config', { method: 'POST', body: JSON.stringify(payload) });
+    renderConfig(r);
+    await refreshAll();
+  });
+  $('refreshConfigBtn').addEventListener('click', () => refreshAll());
+  $('addAccountBtn').addEventListener('click', async () => {
+    const name = $('newAccountName').value.trim();
+    if (!name) return alert('请先输入账号名');
+    const r = await api('/accounts/add', { method: 'POST', body: JSON.stringify({ name }) });
+    if (!r.ok) return alert(r.error || '添加失败');
+    $('newAccountName').value = '';
+    alert(r.message || '账号已添加');
+    await refreshAll();
+  });
+  $('loginOtherBtn').addEventListener('click', () => {
+    const name = window.prompt('请输入账号名，例如 acc2');
+    if (!name) return;
+    window.open('/login?profile=' + encodeURIComponent(name.trim()), '_blank', 'noopener');
+  });
+  document.addEventListener('click', async (e) => {
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    if (t.dataset.enable) {
+      const r = await api('/accounts/enable', { method: 'POST', body: JSON.stringify({ name: t.dataset.enable }) });
+      if (!r.ok) alert(r.error || '启用失败');
+      await refreshAll();
+    }
+    if (t.dataset.disable) {
+      const r = await api('/accounts/disable', { method: 'POST', body: JSON.stringify({ name: t.dataset.disable }) });
+      if (!r.ok) alert(r.error || '禁用失败');
+      await refreshAll();
+    }
+    if (t.dataset.remove) {
+      if (!window.confirm('确认删除账号 ' + t.dataset.remove + ' 吗？浏览器 profile 目录会保留。')) return;
+      const r = await api('/accounts/remove', { method: 'POST', body: JSON.stringify({ name: t.dataset.remove, confirm: true }) });
+      if (!r.ok) alert(r.error || '删除失败');
+      await refreshAll();
+    }
+  });
+
+  refreshAll().catch((e) => {
+    $('snapshotPre').innerHTML = '<code>' + escapeHtml(String(e && e.message || e)) + '</code>';
+    badge($('gatewayBadge'), '页面加载失败', 'bad');
+  });
+  setInterval(() => refreshAll().catch(() => {}), 15000);
+})();
+</script>
+</body>
+</html>`;
+}
+
+
 /* ---------- HTTP 服务 ---------- */
 /** 设置 CORS 响应头（本机调试场景，放开全部来源）。 */
 function cors(res) {
@@ -1389,10 +1985,10 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
-/** 发送 JSON 响应（200 + CORS）。 */
-function sendJson(res, obj) {
+/** 发送 JSON 响应（默认 200 + CORS）。 */
+function sendJson(res, obj, statusCode) {
   cors(res);
-  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(statusCode || 200, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj));
 }
 /** 读取请求体（字符串），8MB 上限防滥用。 */
@@ -1437,11 +2033,23 @@ const server = http.createServer(async (req, res) => {
       }
       return handleChatCompletion(req, res, payload);
     }
+    if (req.method === 'GET' && p === '/') {
+      gatewayRequestCount++;
+      const health = await buildHealthPayload();
+      const setup = buildSetupPayload(health, buildAccountsPayload());
+      return sendHtml(res, renderManagementPage(setup));
+    }
+    if (req.method === 'GET' && p === '/setup') {
+      gatewayRequestCount++;
+      const health = await buildHealthPayload();
+      const payload = buildSetupPayload(health, buildAccountsPayload());
+      return sendJson(res, payload);
+    }
     /* 登录（支持 ?profile=xxx 指定账号；多账号场景各账号独立登录） */
     if (req.method === 'GET' && (p === '/login')) {
       const profileName = (u.searchParams.get('profile') || 'default').trim();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#17181c;color:#ddd"><h2>DeepSeek 网页版登录（账号: ' + profileName + '）</h2><p>已打开浏览器窗口，请在其中登录 chat.deepseek.com。登录完成后会自动检测。</p><p><a href="/login-status">查看登录状态</a> · <a href="/accounts">账号列表</a></p></body></html>');
+      res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#17181c;color:#ddd"><h2>DeepSeek 网页版登录（账号: ' + profileName + '）</h2><p>已打开浏览器窗口，请在其中登录 chat.deepseek.com。登录完成后会自动检测。</p><p><a href="/">返回插件管理页</a> · <a href="/login-status">查看登录状态</a> · <a href="/accounts">账号列表</a></p></body></html>');
       await ensureDriver();
       poolLogin(profileName, 300000)
         .then((r) => {
@@ -1454,7 +2062,7 @@ const server = http.createServer(async (req, res) => {
     /* 账号池管理（SPEC-v2 §5.7）：多账号保存 / 状态查看 / 启停 */
     if (p === '/accounts' && req.method === 'GET') {
       gatewayRequestCount++;
-      return sendJson(res, { ok: true, ...poolDescribe(), backoff: { baseMs: state.quotaBackoffBaseMs, maxMs: state.quotaBackoffMaxMs, confirmWindowMs: state.quotaConfirmWindowMs }, note: '受限信号只来自页面文案检测（动态风控无固定数值）；恢复=指数退避到期后真实请求探测' });
+      return sendJson(res, buildAccountsPayload());
     }
     if (p === '/accounts/add' && req.method === 'POST') {
       gatewayRequestCount++;
@@ -1487,11 +2095,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && (p === '/login-status')) {
       gatewayRequestCount++;
-      let st = { needsLogin: true };
-      try {
-        const insp = await rpc('inspect', {}, 8000);
-        st = (insp && insp.login) || { needsLogin: true };
-      } catch (e) { /* no page */ }
+      const st = await getLoginSnapshot();
       return sendJson(res, { ok: true, login: st });
     }
     /* 校准 */
@@ -1504,33 +2108,13 @@ const server = http.createServer(async (req, res) => {
     /* 调试：thePage 的 DOM 结构（模型选择器诊断） */
     if (p === '/debug') {
       gatewayRequestCount++;
-      const insp = await rpc('inspect', {}, 10000).catch((e) => ({ error: e.message }));
-      return sendJson(res, { ok: true, inspect: insp });
+      const insp = await getInspectSnapshot();
+      return sendJson(res, { ok: true, inspect: insp || { error: 'driver not ready' } });
     }
     /* 健康检查 */
     if (p === '/health') {
       gatewayRequestCount++;
-      const uptime = Math.floor((Date.now() - gatewayStartTime) / 1000);
-      let login = { needsLogin: true };
-      try {
-        const insp = await rpc('inspect', {}, 8000);
-        login = (insp && insp.login) || { needsLogin: true };
-      } catch (e) { /* driver not ready */ }
-      return sendJson(res, {
-        ok: true,
-        uptime,
-        requests: gatewayRequestCount,
-        driver: { running: !!D, ready: !!(D && D.ready), pid: D && D.cp ? D.cp.pid : null },
-        login,
-        accounts: poolDescribe(),
-        sessions: {
-          count: sessions.size,
-          channels: activeChannelCount(),
-          freeChannels: freePageKeys.length,
-          list: [...sessions.values()].map((s) => ({ id: s.id, pageKey: s.pageKey, busy: s.busy, idleMs: Date.now() - s.lastSeen, account: s.acctName })),
-        },
-        config: { headless: state.headless, maxConcurrent: state.maxConcurrent, maxTurnsPerChat: state.maxTurnsPerChat, maxPages: state.maxPages, accountPool: state.accountPool, maxAccounts: state.maxAccounts, autoRelogin: state.autoRelogin },
-      });
+      return sendJson(res, await buildHealthPayload());
     }
     /* 配置 */
     if (p === '/config') {

@@ -81,7 +81,7 @@ npm view dsh-deepseek-web-adapter   # 404 = 可用；返回包信息 = 已被占
 | `accounts.json` | 账号池状态 | 排除 |
 | `*.log` | 运行日志 | 排除 |
 | `driver.js` | driver 单一源码（`resources/driver.js`，网关运行时直接执行；本地数据经 `DS_WEB_BASE` 落在 `resources/runtime/`） | **必须保留** |
-| `calibration.json` | 内置专家模式校准数据 | **必须保留** |
+| `calibration.json` | 内置模式/开关校准数据 | **必须保留** |
 
 package.json 已按此配置（`!` 为排除模式）：
 

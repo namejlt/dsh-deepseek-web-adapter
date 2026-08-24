@@ -87,8 +87,12 @@ check('H2 close 回调调用 streamStop', /rpc\('streamStop', \{ streamId: curSt
 check('H3 finished 后不再 stop（正常结束不误触发）', /if \(finished \|\| !curStreamId\) return;/.test(GW_SRC));
 
 /* ---------- A/B. streamAsk 轮询逻辑（源码断言 + 行为模拟） ---------- */
-check('A1 超时且未见新文本 → 报错 stream-end(ok:false)', /if \(!firstSeen && !genSeen\) \{\s*\n\s*emitEvent\('stream-end', \{ streamId, ok: false, error: 'timeout:/.test(DRV_SRC));
+check('A1 超时且未见新文本 → 报错 stream-end(ok:false)', /if \(!firstSeen && !genSeen\) \{[\s\S]*?emitEvent\('stream-end', \{ streamId, ok: false, error: 'timeout:/.test(DRV_SRC));
 check('A2 lastText 初始化为空串（不再继承旧回复）', /let lastText = ''; \/\* 本轮新回复的累计文本/.test(DRV_SRC));
+check('A3 attempt 与收尾状态提升到循环外快照，避免 let 作用域泄漏', /let finalAttempt = 0;[\s\S]*?let finalLastText = '';[\s\S]*?for \(let attempt = 0; attempt < 3; attempt\+\+\) \{[\s\S]*?finalAttempt = attempt;/.test(DRV_SRC));
+check('A4 stream-end 诊断快照使用 finalAttempt 而非循环体 attempt', /updateLastStreamSummary\(\{[\s\S]{0,200}attempt: finalAttempt,/.test(DRV_SRC));
+check('A5 未见首段输出时优先重发原问题，而不是立刻报 240s 超时', /let retrySamePayload = false;[\s\S]*?if \(retrySamePayload\) \{[\s\S]*?await sendMessage\(pageId, payload, \{\}\);/.test(DRV_SRC) && /if \(!firstSeen && !genSeen\) \{[\s\S]*?if \(attempt < 2\) \{[\s\S]*?retrySamePayload = true;[\s\S]*?continue;/.test(DRV_SRC));
+check('A6 timeoutNoFirstSeen 文案使用整轮实际等待秒数，不再硬报 timeoutMs 或最后一轮 1s', /const requestStart = Date\.now\(\);/.test(DRV_SRC) && /const waitedSec = Math\.max\(1, Math\.round\(\(Date\.now\(\) - requestStart\) \/ 1000\)\);/.test(DRV_SRC) && !/等待 ' \+ Math\.round\(timeoutMs \/ 1000\) \+ 's 未见新回复/.test(DRV_SRC));
 check('B1 firstSeen 由 deduped && text !== beforeClean 触发（cleanText 基线变化检测 + 去重后正文）', /if \(deduped && !firstSeen && text !== beforeClean\) \{/.test(DRV_SRC));
 check('B2 首个 delta 发新回复全量（去重后）', /emitEvent\('stream-delta', \{ streamId, delta: deduped \}\);/.test(DRV_SRC));
 check('B3 后续 delta 从 sentEnd 切片增量（变长才发增量，去重后偏移追踪）', /const grew = text\.length > lastText\.length;[\s\S]*?deduped\.slice\(sentEnd\)/.test(DRV_SRC));
@@ -150,26 +154,27 @@ check('I1 三项探测 Promise.all 并行', /Promise\.all\(\[\s*\n\s*evalJs\(pag
   check('B6 文本瞬时缩短不回退 lastText（修复后重组=完整）', deltas.join('') === 'abc', JSON.stringify(deltas) + ' last=' + lastText);
 }
 
-/* ---------- V. v3 真流式 + thinking 输出 ---------- */
+/* ---------- V. v3 真流式 + thinking 内部保留、对 DSH 输出屏蔽 ---------- */
 /* driver 侧：思考文本提取 + kind=thinking 增量 + cleanText 基准 */
 check('V1 driver EXPR.extractThinking 定义（思考流提取）', /extractThinking: `\(\(\) => \{/.test(DRV_SRC));
 check('V2 思考增量事件带 kind=thinking', /emitEvent\('stream-delta', \{ streamId, delta: td, kind: 'thinking' \}\)/.test(DRV_SRC));
 check('V3 四项探测并行（含 extractThinking）', /evalJs\(pageId, EXPR\.extractThinking\)\.catch\(\(\) => ''\)/.test(DRV_SRC));
 check('V4 正文 delta 走 cleanText 基准（终态对齐前提）', /const text = cleanText\(textR \|\| ''\);/.test(DRV_SRC));
 check('V5 限流检测先于 delta 发出（切号重试无残留污染）', /emitEvent\('stream-delta', \{ streamId, delta: text \}\);[\s\S]{0,400}?\/\* 受限提示检测（先于 delta 发出\)/.test(DRV_SRC.replace(/[\s\S]*?受限提示检测（先于 delta 发出）[^*]*\*\/[\s\S]*?emitEvent\('stream-delta', \{ streamId, delta: text \}\);/, 'emitEvent(\'stream-delta\', { streamId, delta: text });\n/* 受限提示检测（先于 delta 发出)') === false ? '' : 'emitEvent(\'stream-delta\', { streamId, delta: text });\n/* 受限提示检测（先于 delta 发出)') && /受限提示检测（先于 delta 发出）/.test(DRV_SRC));
-/* 网关侧：delta 实时转发 + reasoning_content + 终态对齐 */
+/* 网关侧：delta 实时转发 + reasoning 屏蔽 + 终态对齐 */
 check('V6 网关实时转发 delta（不再攒到终态）', /if \(evt\.delta !== undefined\) \{/.test(GW_SRC));
-check('V7 thinking delta → reasoning_content chunk', /delta: \{ reasoning_content: evt\.delta \}/.test(GW_SRC));
+check('V7 thinking delta 不再转 reasoning_content chunk', !/delta: \{ reasoning_content: evt\.delta, reasoning: evt\.delta \}/.test(GW_SRC));
+check('V7b 非流式 message 不再带 reasoning_content 与 reasoning', !/reasoning_content: accThinking \|\| undefined, reasoning: accThinking \|\| undefined/.test(GW_SRC));
 check('V8 正文 delta → content chunk（流式直通）', /delta: \{ content: evt\.delta \}/.test(GW_SRC));
-check('V9 工具调用首段静默（JSON 不外泄进 content）', /looksLikeToolCallText\(toolBuf\) && toolBuf\.length < 400/.test(GW_SRC) && /toolMode = 'silent'/.test(GW_SRC));
+check('V9 工具调用首段静默（JSON 不外泄进 content）', /looksLikeToolCallText\(toolBuf, payload\.tools\) && toolBuf\.length < 400/.test(GW_SRC) && /toolMode = 'silent'/.test(GW_SRC));
+check('V9b gateway 工具首段识别支持已授权 schema 感知', /function looksLikeToolCallText\(t, tools\)/.test(GW_SRC) && /matchToolByParamsStrict\(obj\)/.test(GW_SRC));
 check('V10 终态前缀对齐补尾', /while \(i < n && accContent\.charCodeAt\(i\) === result\.charCodeAt\(i\)\) i\+\+;/.test(GW_SRC));
-check('V11 非流式 JSON 含 reasoning_content', /reasoning_content: accThinking \|\| undefined/.test(GW_SRC));
+check('V11 非流式 JSON 不含 reasoning_content', !/reasoning_content: accThinking \|\| undefined/.test(GW_SRC));
 check('V12 consumer.push 支持 kind', /push\(delta, kind\)/.test(GW_SRC));
 
 /* ---------- V 行为模拟：网关流式转发 + 终态对齐 ---------- */
 {
-  /* 模拟网关 askOnce 转发逻辑：delta 序列（含 thinking）→ SSE chunks + 终态对齐
-   * v3a：toolBuf 阈值 = accThinking 已流出 ? 20 : 120（thinking/text 同步） */
+  /* thinking 仍在 driver 内部使用，但网关不再转发给 DSH。 */
   const events = [
     { delta: '思考A', kind: 'thinking' },
     { delta: '思考B', kind: 'thinking' },
@@ -177,26 +182,21 @@ check('V12 consumer.push 支持 kind', /push\(delta, kind\)/.test(GW_SRC));
     { delta: '，世界' },
     { ok: true, result: '你好，世界' },
   ];
-  let accThinking = ''; let accContent = ''; let toolMode = 'buffer'; let toolBuf = '';
+  let accContent = ''; let toolMode = 'buffer'; let toolBuf = '';
   const chunks = []; /* { type, text } */
   for (const evt of events) {
     if (evt.delta !== undefined) {
-      if (evt.kind === 'thinking') { accThinking += evt.delta; chunks.push({ type: 'reasoning', text: evt.delta }); }
-      else {
-        accContent += evt.delta;
-        if (toolMode === 'buffer') {
-          toolBuf += evt.delta;
-          const looksTool = /tool_call/i.test(toolBuf) || /^[{[`]/.test(toolBuf.trim());
-          /* v3a：动态阈值（thinking 已流出 = 20，无思考 = 120）。
-           * 此处已流过"思考A思考B"→ accThinking>0 → 阈值 20，'你好，世界'(4 字)未达 20，
-           * buffer 未判定 → 终态全量补出（与旧代码行为一致，因为文本太短 < 两阈值）*/
-          const threshold = accThinking.length > 0 ? 20 : 120;
-          if (toolBuf.length >= threshold || looksTool) {
-            toolMode = looksTool ? 'silent' : 'stream';
-            if (toolMode === 'stream') chunks.push({ type: 'content', text: toolBuf });
-          }
-        } else if (toolMode === 'stream') chunks.push({ type: 'content', text: evt.delta });
-      }
+      if (evt.kind === 'thinking') continue;
+      accContent += evt.delta;
+      if (toolMode === 'buffer') {
+        toolBuf += evt.delta;
+        const looksTool = /tool_call/i.test(toolBuf) || /^[{[`]/.test(toolBuf.trim());
+        const threshold = 120;
+        if (toolBuf.length >= threshold || looksTool) {
+          toolMode = looksTool ? 'silent' : 'stream';
+          if (toolMode === 'stream') chunks.push({ type: 'content', text: toolBuf });
+        }
+      } else if (toolMode === 'stream') chunks.push({ type: 'content', text: evt.delta });
       continue;
     }
     if (evt.ok !== undefined) {
@@ -208,8 +208,44 @@ check('V12 consumer.push 支持 kind', /push\(delta, kind\)/.test(GW_SRC));
       } else chunks.push({ type: 'content', text: result });
     }
   }
-  check('V13 thinking 增量全量转发（DSH 单独块显示）', chunks.filter((c) => c.type === 'reasoning').map((c) => c.text).join('') === '思考A思考B');
+  check('V13 thinking 增量不再转发到 DSH', chunks.filter((c) => c.type === 'reasoning').length === 0, JSON.stringify(chunks));
   check('V14 正文流式重组完整（无重复）', chunks.filter((c) => c.type === 'content').map((c) => c.text).join('') === '你好，世界', JSON.stringify(chunks));
+}
+{
+  /* V14b 修复网关 buffer→stream 首块重复：flush toolBuf 后同轮不再额外发送 evt.delta */
+  const events = [
+    { delta: '你好' },
+    { delta: '，世界' },
+    { ok: true, result: '你好，世界' },
+  ];
+  let accContent = ''; let toolMode = 'buffer'; let toolBuf = '';
+  const chunks = [];
+  for (const evt of events) {
+    if (evt.delta !== undefined) {
+      accContent += evt.delta;
+      let emitCurrentDelta = true;
+      if (toolMode === 'buffer') {
+        toolBuf += evt.delta;
+        const looksTool = /tool_call/i.test(toolBuf) || /^```tool_call/i.test(toolBuf.trim()) || /^<tool_call>\s*\{/.test(toolBuf.trim()) || /^tool_call\b/i.test(toolBuf.trim());
+        if (looksTool && toolBuf.length < 400) {
+          toolMode = 'silent';
+          emitCurrentDelta = false;
+        } else {
+          toolMode = 'stream';
+          if (toolBuf) chunks.push(toolBuf);
+          emitCurrentDelta = false;
+        }
+      }
+      if (toolMode === 'stream' && emitCurrentDelta) chunks.push(evt.delta);
+      continue;
+    }
+    if (evt.ok && toolMode === 'stream' && accContent) {
+      let i = 0; const n = Math.min(accContent.length, evt.result.length);
+      while (i < n && accContent.charCodeAt(i) === evt.result.charCodeAt(i)) i++;
+      if (i < evt.result.length) chunks.push(evt.result.slice(i));
+    }
+  }
+  check('V14b 首块仅发送一次（修复 buffer→stream 重复）', chunks.join('') === '你好，世界', JSON.stringify(chunks));
 }
 {
   /* V15 工具调用轮：JSON/```tool_call 首段命中 → silent → content 不外泄 */
@@ -235,24 +271,21 @@ check('V12 consumer.push 支持 kind', /push\(delta, kind\)/.test(GW_SRC));
   check('V15 工具 JSON 轮 content 零外泄（silent）', contentChunks.length === 0 && toolMode === 'silent');
 }
 {
-  /* V16 流式同步（v3b 新行为）：正常回答（不以工具特征开头）无论有无 thinking，
-   * 首段立即 stream（不再憋 120 字）。验证「短回复也实时流式」修复。 */
+  /* V16 流式同步：thinking 被屏蔽后不应影响正文是否首段流式。 */
   const ll = (t) => { const s = String(t || '').trim(); if (!s) return false; return /tool_call/i.test(s) || s.startsWith('{') || s.startsWith('[') || s.startsWith('```') || /^<tool_call>/i.test(s); };
   function sim(evts) {
-    let accT = '', accC = '', tM = 'buffer', tB = '';
+    let accC = '', tM = 'buffer', tB = '';
     const out = [];
     for (const e of evts) {
       if (e.delta !== undefined) {
-        if (e.kind === 'thinking') accT += e.delta;
-        else {
-          accC += e.delta;
-          if (tM === 'buffer') {
-            tB += e.delta;
-            /* v3b：疑似工具调用才静默，否则立即流式（不憋 120 字） */
-            if (ll(tB) && tB.length < 400) tM = 'silent';
-            else { tM = 'stream'; if (tB) out.push(tB); }
-          } else if (tM === 'stream') out.push(e.delta);
-        }
+        if (e.kind === 'thinking') continue;
+        accC += e.delta;
+        if (tM === 'buffer') {
+          tB += e.delta;
+          /* v3b：疑似工具调用才静默，否则立即流式（不憋 120 字） */
+          if (ll(tB) && tB.length < 400) tM = 'silent';
+          else { tM = 'stream'; if (tB) out.push(tB); }
+        } else if (tM === 'stream') out.push(e.delta);
       }
     }
     return { toolMode: tM, flushCount: out.length, total: out.join('') };
@@ -271,11 +304,11 @@ check('V12 consumer.push 支持 kind', /push\(delta, kind\)/.test(GW_SRC));
     { delta: bodyText.slice(14) },
     { ok: true, result: bodyText },
   ]);
-  check('V16a 有 thinking + 28字正文 → 立即 stream（首段不憋）', withThink.toolMode === 'stream' && withThink.flushCount >= 1, 'tM=' + withThink.toolMode);
+  check('V16a 有 thinking + 28字正文 → thinking 被屏蔽且正文仍立即 stream', withThink.toolMode === 'stream' && withThink.flushCount >= 1, 'tM=' + withThink.toolMode);
   check('V16b 无 thinking + 28字短回复 → 立即 stream（修复「一起输出」主因）', noThink.toolMode === 'stream' && noThink.flushCount >= 1, 'tM=' + noThink.toolMode);
   check('V16c 短回复首段即流式（首块含正文，无需等 120 字）', noThink.total.indexOf(bodyText.slice(0, 14)) >= 0);
-  check('V16d DSH 界面区分：thinking 走 reasoning_content + 正文走 content（不同字段）',
-    /delta: \{ reasoning_content: evt\.delta \}/.test(GW_SRC) && /delta: \{ content: (toolBuf|evt\.delta) \}/.test(GW_SRC));
+  check('V16d DSH 界面仅输出正文 content，不再桥接 reasoning 字段',
+    !/delta: \{ reasoning_content: evt\.delta, reasoning: evt\.delta \}/.test(GW_SRC) && /delta: \{ content: (toolBuf|evt\.delta) \}/.test(GW_SRC));
 }
 {
   /* V17 SSE 防缓冲：响应头禁用反代缓冲 + 禁用 Nagle，避免多包合并成大块（「一起输出」次因） */
@@ -285,8 +318,8 @@ check('V12 consumer.push 支持 kind', /push\(delta, kind\)/.test(GW_SRC));
     /'Cache-Control': 'no-cache, no-transform'/.test(GW_SRC) || /"Cache-Control": "no-cache, no-transform"/.test(GW_SRC));
   check('V17c SSE socket setNoDelay 禁用 Nagle（逐帧即发）',
     /res\.socket\.setNoDelay\(true\)/.test(GW_SRC));
-  check('V18 reasoning_content 非流式响应中存在（DSH 非流式客户端也能看到思考区）',
-    /reasoning_content: accThinking \|\| undefined/.test(GW_SRC));
+  check('V18 非流式响应不含 reasoning_content（DSH 仅看正文）',
+    !/reasoning_content: accThinking \|\| undefined/.test(GW_SRC));
 }
 
 /* ---------- F. toolsText 限长（已迁移：网关 buildToolsText 智能压缩，driver 不再截断） ---------- */

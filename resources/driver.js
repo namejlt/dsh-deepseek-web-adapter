@@ -623,7 +623,7 @@ const EXPR = {
     /* 仅保留强"正在生成"信号：typing/loading/spinner/dot-pulse/dot-flashing/thinking-indicator
      * 去掉易误判为常驻的 cursor/blink/pulsing（输入框光标、代码块复制按钮等会持续命中，
      * 导致完成后仍判定为 generating → 轮询直到 240s 超时，表现为 dsh 不停止） */
-    const loaderSels = ['[class*="typing"]','[class*="loading"]','[class*="spinner"]','svg[class*="loading"]','svg[class*="spinner"]','[class*="dot-pulse"]','[class*="dot-flashing"]','[class*="thinking-indicator"]'];
+    const loaderSels = ['[class*="typing"]','[class*="spinner"]','svg[class*="spinner"]','[class*="dot-pulse"]','[class*="dot-flashing"]','[class*="thinking-indicator"]','[class*="loading-indicator"]'];
     for (const s of loaderSels) { const el = document.querySelector(s); if (el) { const cs = window.getComputedStyle(el); if (cs.display !== 'none' && cs.visibility !== 'hidden') return true; } }
     return false;
   })()`,
@@ -637,7 +637,16 @@ const EXPR = {
   thinking: `(() => {
     const body = (document.body && document.body.innerText) || '';
     if (/深度思考中|正在深度思考|思考中\\.\\.|Thinking\\.\\./.test(body)) return true;
-    const done = /^(已深度思考|深度思考（已|Thought for)/;
+    const done = /^(已(?:深度)?思考|深度思考（已|Thought for)/;
+    const doneBody = /已(?:深度)?思考（用时|Thought for\s+\d+/;
+    let hasAnswer = false;
+    const answerEls = document.querySelectorAll('.ds-assistant-message-main-content, [class*="assistant-message-main"], .ds-markdown.ds-assistant-message-main-content');
+    for (const ans of answerEls) {
+      const acs = window.getComputedStyle(ans);
+      if (acs.display === 'none' || acs.visibility === 'hidden') continue;
+      const at = (ans.innerText || '').trim();
+      if (at && at.length > 20) { hasAnswer = true; break; }
+    }
     /* 真实思考容器为 .ds-think-content（含 think 但无 thinking 子串），
      * [class*="thinking"] 匹配不到 → 改用 [class*="think"] 同时覆盖
      * ds-think-content / ds-thinking-content / ds-thinking-block */
@@ -648,6 +657,7 @@ const EXPR = {
       if (cs.display === 'none' || cs.visibility === 'hidden') continue;
       const t = (el.innerText || '').trim();
       if (!t) continue;
+      if (hasAnswer && doneBody.test(body)) continue;
       if (done.test(t) && t.length < 80) continue;
       return true;
     }
@@ -661,7 +671,17 @@ const EXPR = {
    * - 多容器命中取最长（嵌套思考容器去重）
    * 返回当前思考全量文本，调用侧与上次快照差分发 kind='thinking' 增量 */
   extractThinking: `(() => {
-    const done = /^(已深度思考|深度思考（已|Thought for)/;
+    const done = /^(已(?:深度)?思考|深度思考（已|Thought for)/;
+    const doneBody = /已(?:深度)?思考（用时|Thought for\s+\d+/;
+    const body = (document.body && document.body.innerText) || '';
+    let hasAnswer = false;
+    const answerEls = document.querySelectorAll('.ds-assistant-message-main-content, [class*="assistant-message-main"], .ds-markdown.ds-assistant-message-main-content');
+    for (const ans of answerEls) {
+      const acs = window.getComputedStyle(ans);
+      if (acs.display === 'none' || acs.visibility === 'hidden') continue;
+      const at = (ans.innerText || '').trim();
+      if (at && at.length > 20) { hasAnswer = true; break; }
+    }
     /* 同 EXPR.thinking：真实思考容器 .ds-think-content 需用 [class*="think"] 才能命中 */
     const els = document.querySelectorAll('[class*="think"], [class*="reasoning"]');
     let best = '';
@@ -671,6 +691,7 @@ const EXPR = {
       if (cs.display === 'none' || cs.visibility === 'hidden') continue;
       const t = (el.innerText || '').trim();
       if (!t || t.length <= best.length) continue;
+      if (hasAnswer && doneBody.test(body)) continue;
       if (done.test(t) && t.length < 80) continue;
       best = t;
     }
@@ -707,7 +728,16 @@ const EXPR = {
    * 用途：轮询完成判定加 !searching——搜索阶段绝不提前退出（防截断正文） */
   searching: `(() => {
     const body = (document.body && document.body.innerText) || '';
-    if (/搜索中[\\.。…]*|联网搜索中|网络搜索中|Searching\\.\\./.test(body)) return true;
+    let hasAnswer = false;
+    const answerEls = document.querySelectorAll('.ds-assistant-message-main-content, [class*="assistant-message-main"], .ds-markdown.ds-assistant-message-main-content');
+    for (const el of answerEls) {
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const t = (el.innerText || '').trim();
+      if (t && t.length > 20) { hasAnswer = true; break; }
+    }
+    if (!hasAnswer && /搜索中[\\.。…]*|联网搜索中|网络搜索中|Searching\\.\\./.test(body)) return true;
+    if (!hasAnswer && /浏览\s*\d+\s*个页面|正在浏览页面|Opening \d+ pages|Browsing \d+ pages/i.test(body)) return true;
     /* 搜索完成态文案模式（完成态不算搜索中，允许完成判定通过）：
      * 1) 短文案以"搜索到"/"已搜索"/"Found"/"Searched"开头（<80字符）
      * 2) 长文案包含"搜索到 N 个网页"模式（搜索结果摘要容器可能很长，
@@ -721,8 +751,8 @@ const EXPR = {
       if (cs.display === 'none' || cs.visibility === 'hidden') continue;
       const t = (el.innerText || '').trim();
       if (!t) continue;
-      if (doneShort.test(t) && t.length < 80) continue;
-      if (doneLong.test(t)) continue;
+      if (doneShort.test(t) && t.length < 80) { if (!hasAnswer) return true; continue; }
+      if (doneLong.test(t)) { if (!hasAnswer) return true; continue; }
       if (t.length <= 8 && /搜索|search/i.test(t)) continue;
       return true;
     }
@@ -2323,7 +2353,7 @@ handlers.inspect = async (params) => {
   const buttons = await evalJs(pid, EXPR.buttons);
   const login = await evalJs(pid, EXPR.loginState);
   const badge = await evalJs(pid, EXPR.modelBadge);
-  return { dom: info, buttons: buttons.slice(0, 60), login, modelBadge: badge, channels: [...channels.keys()], freePages: subPages.length };
+  return { dom: info, buttons: buttons.slice(0, 60), login, modelBadge: badge, channels: [...channels.keys()], freePages: subPages.length, lastStreamSummary };
 };
 
 /* ------------------------------------------------------------------ */
@@ -2331,6 +2361,7 @@ handlers.inspect = async (params) => {
 /* ------------------------------------------------------------------ */
 const streamSeqs = { n: 0 };
 const streamStates = new Map(); // streamId -> { pageId, stopped }
+let lastStreamSummary = null; /* 最近一次 streamAsk 完成快照（调试/health） */
 
 /* 单页常驻（对照 deepseek-browser-agent）：主 agent 用 thePage（连续对话、网页版历史保持）。
  * 子 agent 并发：当有请求正在处理时，新请求用独立页面（多窗口并行，会话隔离）。 */
@@ -2341,6 +2372,33 @@ let streamActive = 0;
 /* 会话通道（并发最佳实践：会话亲和——每个逻辑会话绑定专属页面，网关按指纹分配 pageKey）。
  * channels: pageKey -> { pageId }；页面健康失败自动重建；releaseChannel 清历史归还池。 */
 const channels = new Map();
+
+function updateLastStreamSummary(info) {
+  lastStreamSummary = Object.assign({
+    at: Date.now(),
+    streamId: null,
+    profile: null,
+    pageKey: null,
+    pageId: null,
+    attempt: 0,
+    finishBy: null,
+    ok: null,
+    errorKind: null,
+    error: null,
+    genSeen: false,
+    thinkStalled: false,
+    thinking: false,
+    searching: false,
+    doneActions: false,
+    toolCalls: 0,
+    resultLen: 0,
+    lastTextLen: 0,
+    thinkLen: 0,
+    dedupedLen: 0,
+    lastChangeAgoMs: null,
+    thinkIdleMs: null,
+  }, info || {});
+}
 
 let thePageHealthFails = 0;
 
@@ -2477,6 +2535,19 @@ function parseToolCalls(text, tools) {
   const calls = [];
   const t = String(text || '');
   if (!t) return calls;
+  function buildParseInputs(raw) {
+    const source = String(raw || '');
+    const out = [source];
+    const bodyMark = /(?:^|\n)\s*(?:正文|body)\s*[：:]\s*/gi;
+    let m;
+    let last = null;
+    while ((m = bodyMark.exec(source)) !== null) last = m;
+    if (last) {
+      const body = source.slice(last.index + last[0].length).trim();
+      if (body && body !== source) out.unshift(body);
+    }
+    return out;
+  }
   /* 宽容 JSON 解析（参考 deepseek-browser-agent parser.js）：
    * 1) 网页版渲染 markdown 把 \\ 显示为 \（Windows 路径 \U \h 非法转义）→ 修复单反斜杠
    * 2) attemptJsonFix：修尾逗号 + 补未加引号的 key */
@@ -2494,7 +2565,69 @@ function parseToolCalls(text, tools) {
     path: 'file_path', file: 'file_path', filepath: 'file_path', filename: 'file_path',
     cmd: 'command', code: 'command', script: 'command',
     text: 'content', data: 'content', body: 'content',
+    queries: 'query', querys: 'query', q: 'query',
   };
+  function toolSchemaByName(name) {
+    if (!tools || !Array.isArray(tools) || !name) return null;
+    for (const t of tools) {
+      const fn = t.function || t;
+      if (fn && fn.name === name) return fn;
+    }
+    return null;
+  }
+  function normalizeArgsForTool(name, argsObj) {
+    if (!argsObj || typeof argsObj !== 'object' || Array.isArray(argsObj)) return argsObj;
+    const fn = toolSchemaByName(name);
+    if (!fn) return argsObj;
+    const props = (fn.parameters && fn.parameters.properties) || {};
+    const propKeys = Object.keys(props);
+    if (!propKeys.length) return argsObj;
+    const adaptValue = (key, value) => {
+      const def = props[key] || {};
+      if (Array.isArray(value) && def.type !== 'array') return value.length ? value[0] : '';
+      return value;
+    };
+    const out = {};
+    for (const [k, v] of Object.entries(argsObj)) {
+      if (propKeys.includes(k)) {
+        out[k] = adaptValue(k, v);
+        continue;
+      }
+      const alias = PARAM_ALIAS[k] || '';
+      if (!alias || !propKeys.includes(alias) || out[alias] !== undefined) continue;
+      out[alias] = adaptValue(alias, v);
+    }
+    /* 保留规范参数；当完全无法规范化时回退原对象（保持旧行为）。 */
+    return Object.keys(out).length ? out : argsObj;
+  }
+  function recoverInvokeXmlCalls(text) {
+    const t = String(text || '');
+    if (!/<tool_calls>|<invoke\b/i.test(t)) return [];
+    const out = [];
+    const invokeRe = /<invoke\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/invoke>/gi;
+    let m;
+    while ((m = invokeRe.exec(t)) !== null) {
+      const name = String(m[1] || '').trim();
+      const body = String(m[2] || '');
+      if (!name) continue;
+      const args = {};
+      const paramRe = /<parameter\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/parameter>/gi;
+      let p;
+      while ((p = paramRe.exec(body)) !== null) {
+        const key = String(p[1] || '').trim();
+        const raw = String(p[2] || '').trim();
+        if (!key) continue;
+        let val = raw;
+        try {
+          const parsed = jsonParseTolerant(raw);
+          if (parsed !== null) val = parsed;
+        } catch (e) { /* keep raw text */ }
+        args[key] = val;
+      }
+      if (Object.keys(args).length) out.push({ name, arguments: JSON.stringify(normalizeArgsForTool(name, args)) });
+    }
+    return out;
+  }
   /* 按参数 schema 推断工具名：{"file_path": "...", "content": "..."} → write_file */
   function matchToolByParams(j) {
     if (!tools || !Array.isArray(tools) || !j || typeof j !== 'object') return null;
@@ -2509,18 +2642,69 @@ function parseToolCalls(text, tools) {
       if (!propKeys.length) continue;
       let score = 0;
       let hit = 0;
+      let miss = 0;
       for (const k of keys) {
         if (propKeys.includes(k)) { score += 2; hit++; }                    /* 原样命中 */
         else if (propKeys.includes(PARAM_ALIAS[k] || '')) { score += 2; hit++; }  /* 别名命中 */
-        else score -= 1.5; /* 未知 key 惩罚，防误判 */
+        else { score -= 1.5; miss++; } /* 未知 key 惩罚，防误判 */
       }
       /* 命中率加成：参数更"专一"的工具优先（file_path 单参数 → read_image/read
-       * 而非 edit/write——edit 需 old_string+new_string，write 需 content） */
+       * 而非 edit/write——edit 需 old_string+new_string，write 需 content）。
+       * 关键防线：
+       * 1) 未知 key 多于命中 key时直接视为不匹配；
+       * 2) 当输入本身带多个参数时，不允许用“只命中其中一部分”的工具硬匹配，
+       *    防止 {file_path, content} 在 write 不可用时误落到只认识 file_path 的工具。 */
+      if (miss > hit) continue;
+      if (keys.length > 1 && miss > 0) continue;
       score += (hit / propKeys.length) * 2;
       if (hit > 0 && score > bestScore) { bestScore = score; best = fn.name; }
     }
     /* 至少 1 个参数命中才算工具调用（避免把闲聊里的 JSON 误判为工具） */
     return bestScore >= 2 ? best : null;
+  }
+  function matchToolByParamsStrict(j) {
+    if (!tools || !Array.isArray(tools) || !j || typeof j !== 'object') return null;
+    const keys = Object.keys(j).filter((k) => k !== 'name' && k !== 'arguments' && k !== 'function' && k !== 'tool');
+    if (!keys.length) return null;
+    let best = null, bestScore = 0, tied = false;
+    for (const t of tools) {
+      const fn = t.function || t;
+      if (!fn || !fn.name) continue;
+      const props = (fn.parameters && fn.parameters.properties) || {};
+      const propKeys = Object.keys(props);
+      if (!propKeys.length) continue;
+      let score = 0;
+      let hit = 0;
+      for (const k of keys) {
+        if (propKeys.includes(k)) { score += 2; hit++; }
+        else if (propKeys.includes(PARAM_ALIAS[k] || '')) { score += 2; hit++; }
+        else score -= 1.5;
+      }
+      score += (hit / propKeys.length) * 2;
+      if (hit > 0 && score > bestScore) { bestScore = score; best = fn.name; tied = false; }
+      else if (hit > 0 && score === bestScore && score > 0 && best && best !== fn.name) tied = true;
+    }
+    if (tied) return null;
+    return bestScore >= 2 ? best : null;
+  }
+  function recoverArgsOnlyObject(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    if (Array.isArray(raw)) {
+      if (raw.length !== 1 || !raw[0] || typeof raw[0] !== 'object' || Array.isArray(raw[0])) return null;
+      return raw[0];
+    }
+    if (raw.tool_call && typeof raw.tool_call === 'object') {
+      const tc = raw.tool_call;
+      if (tc.arguments && typeof tc.arguments === 'object' && !Array.isArray(tc.arguments)) return tc.arguments;
+      if (tc.args && typeof tc.args === 'object' && !Array.isArray(tc.args)) return tc.args;
+      if (tc.parameters && typeof tc.parameters === 'object' && !Array.isArray(tc.parameters)) return tc.parameters;
+      if (tc.input && typeof tc.input === 'object' && !Array.isArray(tc.input)) return tc.input;
+    }
+    if (raw.arguments && typeof raw.arguments === 'object' && !Array.isArray(raw.arguments) && !raw.name && !raw.tool && !(raw.function && raw.function.name)) return raw.arguments;
+    if (raw.args && typeof raw.args === 'object' && !Array.isArray(raw.args) && !raw.name && !raw.tool && !(raw.function && raw.function.name)) return raw.args;
+    if (raw.parameters && typeof raw.parameters === 'object' && !Array.isArray(raw.parameters) && !raw.name && !raw.tool && !(raw.function && raw.function.name)) return raw.parameters;
+    if (raw.input && typeof raw.input === 'object' && !Array.isArray(raw.input) && !raw.name && !raw.tool && !(raw.function && raw.function.name)) return raw.input;
+    return null;
   }
   const pushCall = (raw) => {
     /* 展开 tool_call 嵌套包装：{"tool_call": {"name": ..., "arguments": {...}}} */
@@ -2562,65 +2746,86 @@ function parseToolCalls(text, tools) {
       const byParams = matchToolByParams(argsObj);
       if (byParams) finalName = byParams;
     }
+    if (!finalName) {
+      const recovered = recoverArgsOnlyObject(j);
+      if (recovered) {
+        const byRecovered = matchToolByParamsStrict(recovered);
+        if (byRecovered) {
+          finalName = byRecovered;
+          argsObj = recovered;
+        }
+      }
+    }
     if (finalName) {
+      const normArgs = normalizeArgsForTool(finalName, argsObj || {});
       calls.push({
         name: finalName,
-        arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(argsObj || {}),
+        arguments: typeof rawArgs === 'string' ? JSON.stringify(normArgs) : JSON.stringify(normArgs || {}),
       });
     }
     return calls.length > 0;
   };
-  const patterns = [
-    { re: /tool_call\s*\n?\s*(\{[\s\S]*\})/gi, g: 1 },
-    { re: /```(?:tool_call|json)\s*\n([\s\S]*?)```/gi, g: 1 },
-    /* 无语言标注代码块（模型可能只输出 ``` 不写 json） */
-    { re: /```\s*\n([\s\S]*?)```/gi, g: 1 },
-    /* 贪婪匹配到最后一个 }：arguments 是嵌套对象时非贪婪会在内层 } 截断 */
-    { re: /<tool_call>\s*(\{[\s\S]*\})(?:\s*<\/tool_call>|\s*$)/gi, g: 1 },
-  ];
-  outer:
-  for (const { re, g } of patterns) {
-    let m;
-    while ((m = re.exec(t)) !== null) {
-      try {
-        const j = jsonParseTolerant(String(m[g] || m[0]).trim());
-        if (j && typeof j === 'object' && !Array.isArray(j)) {
-          if (pushCall(j)) break outer;
-        }
-      } catch (e) { /* keep scanning */ }
-    }
-  }
-  if (!calls.length) {
-    /* scavenger: 平衡括号提取所有完整 JSON 对象（正确处理嵌套——正则非贪婪会在内层 } 截断），
-     * 从后往前扫描——有 name 的直接用，只有参数的按 schema 推断工具名 */
-    const objs = extractBalancedObjects(t);
-    for (let i = objs.length - 1; i >= 0; i--) {
-      try {
-        const j = jsonParseTolerant(objs[i]);
-        if (j && typeof j === 'object' && !Array.isArray(j)) {
-          if (pushCall(j)) break;
-        }
-      } catch (e) { /* ignore */ }
-    }
-  }
-  if (!calls.length) {
-    /* 兜底：Python 风格函数调用（参考实现 Strategy 6）：```write_file(path="a.txt", content="hi")``` */
-    const funcMatch = t.match(/```\w*\s*([\w_]+)\(([^)]*)\)\s*```/);
-    if (funcMatch) {
-      const fname = funcMatch[1];
-      const argsRaw = funcMatch[2];
-      const args = {};
-      const argRe = /(\w+)\s*=\s*(?:"([^"]*?)"|'([^']*?)'|(\d+(?:\.\d+)?)|(\btrue\b|\bfalse\b))/g;
+  function parseFromText(sourceText) {
+    const patterns = [
+      { re: /tool_call\s*\n?\s*(\{[\s\S]*\})/gi, g: 1 },
+      { re: /```(?:tool_call|json)\s*\n([\s\S]*?)```/gi, g: 1 },
+      /* 无语言标注代码块（模型可能只输出 ``` 不写 json） */
+      { re: /```\s*\n([\s\S]*?)```/gi, g: 1 },
+      /* 贪婪匹配到最后一个 }：arguments 是嵌套对象时非贪婪会在内层 } 截断 */
+      { re: /<tool_call>\s*(\{[\s\S]*\})(?:\s*<\/tool_call>|\s*$)/gi, g: 1 },
+    ];
+    outer:
+    for (const { re, g } of patterns) {
       let m;
-      while ((m = argRe.exec(argsRaw)) !== null) {
-        const key = m[1];
-        if (m[2] !== undefined) args[key] = m[2];
-        else if (m[3] !== undefined) args[key] = m[3];
-        else if (m[4] !== undefined) args[key] = parseFloat(m[4]);
-        else if (m[5] !== undefined) args[key] = m[5] === 'true';
+      while ((m = re.exec(sourceText)) !== null) {
+        try {
+          const j = jsonParseTolerant(String(m[g] || m[0]).trim());
+          if (j && typeof j === 'object') {
+            if (!Array.isArray(j) && pushCall(j)) break outer;
+          }
+        } catch (e) { /* keep scanning */ }
       }
-      if (fname && Object.keys(args).length) calls.push({ name: fname, arguments: JSON.stringify(args) });
     }
+    if (!calls.length) {
+      /* scavenger: 平衡括号提取所有完整 JSON 对象（正确处理嵌套——正则非贪婪会在内层 } 截断），
+       * 从后往前扫描——有 name 的直接用，只有参数的按 schema 推断工具名 */
+      const objs = extractBalancedObjects(sourceText);
+      for (let i = objs.length - 1; i >= 0; i--) {
+        try {
+          const j = jsonParseTolerant(objs[i]);
+          if (j && typeof j === 'object' && !Array.isArray(j)) {
+            if (pushCall(j)) break;
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }
+    if (!calls.length) {
+      const xmlCalls = recoverInvokeXmlCalls(sourceText);
+      if (xmlCalls.length) calls.push(...xmlCalls);
+    }
+    if (!calls.length) {
+      /* 兜底：Python 风格函数调用（参考实现 Strategy 6）：```write_file(path="a.txt", content="hi")``` */
+      const funcMatch = sourceText.match(/```\w*\s*([\w_]+)\(([^)]*)\)\s*```/);
+      if (funcMatch) {
+        const fname = funcMatch[1];
+        const argsRaw = funcMatch[2];
+        const args = {};
+        const argRe = /(\w+)\s*=\s*(?:"([^"]*?)"|'([^']*?)'|(\d+(?:\.\d+)?)|(\btrue\b|\bfalse\b))/g;
+        let m;
+        while ((m = argRe.exec(argsRaw)) !== null) {
+          const key = m[1];
+          if (m[2] !== undefined) args[key] = m[2];
+          else if (m[3] !== undefined) args[key] = m[3];
+          else if (m[4] !== undefined) args[key] = parseFloat(m[4]);
+          else if (m[5] !== undefined) args[key] = m[5] === 'true';
+        }
+        if (fname && Object.keys(args).length) calls.push({ name: fname, arguments: JSON.stringify(args) });
+      }
+    }
+  }
+  for (const sourceText of buildParseInputs(t)) {
+    parseFromText(sourceText);
+    if (calls.length) break;
   }
   return calls;
 }
@@ -2653,12 +2858,25 @@ function extractBalancedObjects(t) {
 
 /* 检测文本"看起来像工具调用但没被解析"（参考 deepseek-browser-agent agent.js 安全网）：
  * 文本含 tool_call 标记 / "name"/"tool" 键 / 代码块函数调用 / 已知工具名 → 应触发解析重试 */
-function looksLikeToolCall(text) {
-  const t = String(text || '').slice(0, 1500);
-  if (/tool_call|<tool_call>/i.test(t)) return true;
+function looksLikeToolCall(text, tools) {
+  const t = String(text || '').slice(0, 2000);
+  if (/tool_call|<tool_call>|<tool_calls>|<invoke\b/i.test(t)) return true;
+  if (/^[\s\S]{0,120}```(?:tool_call|json)?/i.test(t)) return true;
   if (/["'](?:name|tool|function)["']\s*:\s*["'][\w_]+["']/.test(t)) return true;
   if (/```\w*\s*[\w_]+\s*\(/.test(t)) return true;
   if (/(?:write_file|read_file|run_command|list_directory|pwsh|subagent|web_search)\b/.test(t)) return true;
+  if (Array.isArray(tools) && tools.length) {
+    for (const tool of tools) {
+      const fn = tool.function || tool;
+      if (!fn || !fn.name) continue;
+      const name = String(fn.name);
+      if (new RegExp('\\b' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b').test(t)) return true;
+      const props = (fn.parameters && fn.parameters.properties) || {};
+      const keys = Object.keys(props);
+      const hit = keys.filter((k) => new RegExp('["\']' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '["\']\\s*:').test(t)).length;
+      if (keys.length && hit >= Math.min(2, keys.length)) return true;
+    }
+  }
   return false;
 }
 
@@ -2782,9 +3000,24 @@ handlers.streamAsk = async (params) => {
        * 不把受限文案当正常回答发给 DSH。 */
       let limitHit = null;
       let lengthHit = false; /* 对话过长信号（SPEC-v2 §5.3）：走迁移+摘要重试，不上报网关不切账号 */
+      let finalAttempt = 0;
+      let finalLastText = '';
+      let finalThinkSent = '';
+      let finalThinkLastChange = 0;
+      let finalLastChange = 0;
+      let finalGenSeen = false;
+      let finalLastDoneReason = null;
+      let finalLastDoneState = { thinking: false, searching: false, doneActions: false, thinkStalled: false, dedupedLen: 0 };
+      let retrySamePayload = false;
+      const requestStart = Date.now();
       for (let attempt = 0; attempt < 3; attempt++) {
+        finalAttempt = attempt;
         if (attempt > 0) {
-          if (lengthHit) {
+          if (retrySamePayload) {
+            log('streamAsk 未见新回复 → 重发原问题重试 ' + attempt + '/2');
+            retrySamePayload = false;
+            await sendMessage(pageId, payload, {});
+          } else if (lengthHit) {
             /* 对话过长 → 迁移+摘要：提取当前会话摘要 → newChat → 注入摘要重发原问题。
              * 旧实现检测到 length 后直接忽略，"对话过长"文案被当正常回复发给 DSH。 */
             log('streamAsk 对话过长 → 迁移+摘要重试 ' + attempt + '/2');
@@ -2818,11 +3051,80 @@ handlers.streamAsk = async (params) => {
         let lastText = ''; /* 本轮新回复的累计文本（cleanText 后；firstSeen 后才有效） */
         let lastThink = ''; /* 思考流累计快照（思考增量差分基线；每 attempt 重置） */
         let thinkSent = ''; /* 已发送的思考全量文本（用于正文去重：正文不应重复输出思考内容） */
+        let thinkLastChange = 0; /* 思考文本最后变化时刻：用于区分“仍在思考”与“思考面板仍可见但内容已静止” */
         let sentEnd = 0; /* 已发送正文的字符偏移（cleanText 后文本中的位置；增量去重基线） */
         let lastChange = 0; /* 不为初始值 Date.now()，避免 5s 兜底在文本未出现时误触发 */
+        let lastObservedText = ''; /* 最近一次观测到的正文快照（用于稳定判定；忽略 shrink 时不反复重置 lastChange） */
         let firstSeen = false; /* 首次看到新回复文本 */
         let genSeen = false; /* 是否见过生成中（文本相同的新回复靠 generating 完成判定） */
         let pollCount = 0; /* 轮询计数（调试日志用） */
+        let lastDoneReason = null; /* 本轮退出轮询的主要原因（debug/health） */
+        let lastDoneState = { thinking: false, searching: false, doneActions: false, thinkStalled: false, dedupedLen: 0 };
+        function normText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+        function stripLeadingThinkLeak(raw, thinkingText) {
+          const text = String(raw || '');
+          const think = String(thinkingText || '').trim();
+          if (!text || !think || think.length < 80) return { text, offset: 0, matched: false, mode: 'none' };
+          const thinkNorm = normText(think);
+          const textNorm = normText(text);
+          const thinkHead = thinkNorm.slice(0, Math.min(200, thinkNorm.length));
+          if (!textNorm.startsWith(thinkHead) || textNorm.length <= thinkHead.length) return { text, offset: 0, matched: false, mode: 'none' };
+          const tailLen = Math.min(120, Math.max(24, Math.floor(think.length * 0.08)));
+          const tail = think.slice(-tailLen).trim();
+          if (tail) {
+            const tailPos = text.indexOf(tail);
+            if (tailPos >= 0) {
+              const cut = tailPos + tail.length;
+              const sliced = text.slice(cut).replace(/^\s*\n?/, '');
+              if (sliced && sliced.length < text.length) return { text: sliced, offset: cut, matched: true, mode: 'tail' };
+            }
+          }
+          const suffixNorm = textNorm.slice(thinkHead.length).replace(/^\s+/, '');
+          if (suffixNorm.length > 0) {
+            const anchor = suffixNorm.slice(0, Math.min(24, suffixNorm.length));
+            const idx = text.indexOf(anchor, Math.max(0, Math.floor(think.length * 0.7)));
+            if (idx > 0) {
+              const sliced = text.slice(idx).replace(/^\s*\n/, '');
+              if (sliced && sliced.length < text.length) return { text: sliced, offset: idx, matched: true, mode: 'head' };
+            }
+          }
+          return { text, offset: 0, matched: false, mode: 'none' };
+        }
+        function looksLikeThinkLeak(raw, thinkingText) {
+          const thinkNorm = normText(thinkingText);
+          const rawNorm = normText(raw);
+          if (!thinkNorm || thinkNorm.length < 80 || !rawNorm) return false;
+          const head = thinkNorm.slice(0, Math.min(200, thinkNorm.length));
+          const pos = rawNorm.indexOf(head);
+          return pos >= 0 && pos < 80;
+        }
+        function shouldAcceptAnswerShrink(prevRaw, nextRaw, nextDeduped, thinkingText) {
+          const prevNorm = normText(prevRaw);
+          const nextNorm = normText(nextRaw);
+          const dedupNorm = normText(nextDeduped);
+          if (!prevNorm || !dedupNorm) return false;
+          if (prevNorm.length < 120 || dedupNorm.length >= prevNorm.length) return false;
+          if (!looksLikeThinkLeak(prevRaw, thinkingText)) return false;
+          if (nextNorm.length + 80 >= prevNorm.length) return false;
+          if (dedupNorm.length > Math.max(160, Math.floor(prevNorm.length * 0.45))) return false;
+          return true;
+        }
+        function shrinkDiag(prevRaw, nextRaw, nextDeduped, thinkingText) {
+          const prevNorm = normText(prevRaw);
+          const nextNorm = normText(nextRaw);
+          const dedupNorm = normText(nextDeduped);
+          const thinkNorm = normText(thinkingText);
+          const leak = looksLikeThinkLeak(prevRaw, thinkingText);
+          return 'prevRawLen=' + String(prevRaw || '').length +
+            ' prevNormLen=' + prevNorm.length +
+            ' nextRawLen=' + String(nextRaw || '').length +
+            ' nextNormLen=' + nextNorm.length +
+            ' nextDedupLen=' + String(nextDeduped || '').length +
+            ' nextDedupNormLen=' + dedupNorm.length +
+            ' thinkLen=' + String(thinkingText || '').length +
+            ' thinkNormLen=' + thinkNorm.length +
+            ' leak=' + leak;
+        }
         while (Date.now() - start < timeoutMs) {
           if (st.stopped) throw new Error('stopped');
           /* 五项探测并行（CDP roundtrip 串行会把轮询周期拉长近一倍）：
@@ -2847,6 +3149,7 @@ handlers.streamAsk = async (params) => {
             }
             lastThink = thinkText;
             thinkSent = thinkText;
+            thinkLastChange = Date.now();
           }
           /* 思考折叠后 extractThinking 返回 ''，但 thinkSent 保留已发思考全量。
            * 用于正文去重：extractLast 可能泄漏思考文本（class 过滤遗漏），需要
@@ -2857,6 +3160,10 @@ handlers.streamAsk = async (params) => {
           const gen = genR !== false; /* 探测失败按生成中处理（保守不退出） */
           const thinking = !!thinkR;
           const searching = !!searchR;
+          if (text !== lastObservedText) {
+            lastObservedText = text;
+            lastChange = Date.now();
+          }
           if (gen) genSeen = true;
           pollCount++;
           /* 调试日志：每 10 轮或关键状态变化时输出（避免日志洪泛） */
@@ -2872,20 +3179,15 @@ handlers.streamAsk = async (params) => {
           let deduped = text;
           let dedupOffset = 0;
           if (thinkSent && thinkSent.length > 20 && text) {
-            const thinkHead = thinkSent.replace(/\s+/g, ' ').trim().slice(0, 200);
-            const textNorm = text.replace(/\s+/g, ' ').trim();
-            if (textNorm.startsWith(thinkHead) && textNorm.length > thinkHead.length) {
-              const suffixNorm = textNorm.slice(thinkHead.length).replace(/^\s+/, '');
-              if (suffixNorm.length > 0) {
-                const idx = text.indexOf(suffixNorm.charAt(0), Math.floor(thinkHead.length * 0.8));
-                if (idx > 0) {
-                  deduped = text.slice(idx).replace(/^\s*\n/, '');
-                  dedupOffset = idx;
-                  logDbg('streamAsk think-dedup: offset=' + dedupOffset + ' rawLen=' + text.length + ' dedupedLen=' + deduped.length);
-                }
-              }
+            const leakStrip = stripLeadingThinkLeak(text, thinkSent);
+            if (leakStrip.matched) {
+              deduped = leakStrip.text;
+              dedupOffset = leakStrip.offset;
+              logDbg('streamAsk think-dedup: mode=' + leakStrip.mode + ' offset=' + dedupOffset + ' rawLen=' + text.length + ' dedupedLen=' + deduped.length);
             }
           }
+          const thinkStalled = !!(thinking && thinkLastChange > 0 && Date.now() - thinkLastChange >= 1200 && deduped && deduped.length > 0 && !gen && !searching);
+          const canEmitContent = (!thinking || thinkStalled) && !searching;
           /* 变化检测：与发送前基线不同 = 新回复开始出现。
            * 修复：delta 从新回复自身累计（首轮发全量、后续发增量），
            * 旧实现 text.slice(beforeText.length) 假设新回复是旧回复的前缀扩展——
@@ -2893,8 +3195,8 @@ handlers.streamAsk = async (params) => {
           if (deduped && !firstSeen && text !== beforeClean) {
             firstSeen = true;
             lastText = text;
-            sentEnd = deduped.length;
-            lastChange = Date.now();
+            if (canEmitContent) sentEnd = deduped.length;
+            else sentEnd = 0;
             log('streamAsk firstText len=' + deduped.length + ' (raw=' + text.length + ' dedupOffset=' + dedupOffset + ') after ' + (Date.now() - start) + 'ms');
             /* 受限提示检测（先于 delta 发出）：新回复文本短且命中风控模式 → 立即终止。
              * 检测先行保证限流文案绝不流入客户端——切号重试无残留文本污染。 */
@@ -2911,20 +3213,39 @@ handlers.streamAsk = async (params) => {
                 break;
               }
             }
-            emitEvent('stream-delta', { streamId, delta: deduped });
+            if (canEmitContent) {
+              emitEvent('stream-delta', { streamId, delta: deduped });
+            } else {
+              logDbg('streamAsk hold content while waiting: rawLen=' + text.length + ' dedupedLen=' + deduped.length + ' thinking=' + thinking + ' searching=' + searching + ' gen=' + gen);
+            }
           } else if (firstSeen && text && text !== lastText) {
             /* 流式增长：发增量。修复：页面重渲染/占位符闪烁可能导致文本瞬时缩短，
-             * 此时绝不回退 lastText（保留已捕获的最长文本，防内容丢失）；仅当变长才
-             * 发增量并更新 lastText；变短只重置稳定计时（页面仍在变化，未完）。
-             * 增量从去重后文本的 sentEnd 位置切片，确保不重复发送已输出内容。 */
+             * 大多数 shrink 仍视为瞬时抖动；但 think 模式存在一个合法 shrink：
+             * 早前 extractLast 混入了长思考文本，随后页面折叠思考、切换成很短的真实正文。
+             * 若此时仍一律忽略 shrink，就会把思考泄漏内容永久保留成 finalText，
+             * 真正正文永远进不了 content。 */
             const grew = text.length > lastText.length;
+            const acceptShrink = !grew && shouldAcceptAnswerShrink(lastText, text, deduped, thinkSent);
+            if (!grew && text.length !== lastText.length && thinkSent && thinkSent.length > 80) {
+              logDbg('streamAsk shrink-check: ' + shrinkDiag(lastText, text, deduped, thinkSent) + ' accept=' + acceptShrink + ' firstSeen=' + firstSeen + ' gen=' + gen + ' thinking=' + thinking + ' searching=' + searching);
+            }
             if (grew) {
               const newPart = deduped.slice(sentEnd);
               lastText = text;
-              sentEnd = deduped.length;
-              if (newPart) emitEvent('stream-delta', { streamId, delta: newPart });
+              if (canEmitContent) {
+                sentEnd = deduped.length;
+                if (newPart) emitEvent('stream-delta', { streamId, delta: newPart });
+              } else sentEnd = 0;
+            } else if (acceptShrink) {
+              const prevText = lastText;
+              lastText = text;
+              if (canEmitContent) {
+                sentEnd = 0;
+                if (deduped) emitEvent('stream-delta', { streamId, delta: '\n' + deduped });
+                sentEnd = deduped.length;
+              } else sentEnd = 0;
+              log('streamAsk 接纳 think→正文 shrink: ' + shrinkDiag(prevText, text, deduped, thinkSent) + '（旧正文疑似混入思考，切换到真实短答案）');
             }
-            lastChange = Date.now();
             if (!limitHit && deduped.length < 400) {
               const lim = detectLimit(deduped);
               if (lim && lim.kind === 'length') {
@@ -2939,6 +3260,12 @@ handlers.streamAsk = async (params) => {
               }
             }
           }
+          if (firstSeen && sentEnd === 0 && deduped && (!thinking || thinkStalled) && !searching) {
+            lastText = text;
+            emitEvent('stream-delta', { streamId, delta: deduped });
+            sentEnd = deduped.length;
+            logDbg('streamAsk flush buffered content after waiting: dedupedLen=' + deduped.length + ' thinkStalled=' + thinkStalled + ' thinking=' + thinking + ' searching=' + searching);
+          }
           /* 完成判定（v3d 搜索兼容版，防提前终止丢内容）：
            * 与 v3c 相比，新增 !searching 守卫——智能搜索阶段（思考折叠后、正文出现前/中）
            * 页面显示搜索结果容器，文本可能暂时稳定，但生成尚未完成。
@@ -2948,22 +3275,34 @@ handlers.streamAsk = async (params) => {
            *    直接解决 generating 选择器漏检时"文本稳定"误判提前 break 的问题。
            * 2) 非生成中 + 非思考中 + 非搜索中 + 文本稳定 1500ms → 完成（generating 漏检兜底；
            *    1500ms 而非 800ms，避免生成中 DOM 突发 >800ms 静默间隙误触发提前 break）。
-           * 3) 安全网：文本稳定超时即完成（防 generating 误判常驻卡死到 240s）。
+          * 3) 安全网：文本稳定超时即完成（防 generating 误判常驻卡死到 240s）。
            *    gen=true 时用 30s 超时（搜索阶段文本可能长时间稳定，需更长等待）；
            *    gen=false 时保留 5s 超时（generating 误判常驻兜底）。 */
           let doneActions = false;
-          if (!gen && !thinking && !searching) { try { doneActions = await evalJs(pageId, EXPR.doneActions); } catch (e) { /* ignore */ } }
-          const doneSignal = (genSeen && !gen) || doneActions;
-          if (lastChange > 0 && doneSignal && !thinking && !searching && Date.now() - lastChange >= 400) {
-            logDbg('streamAsk done: doneSignal (genSeen=' + genSeen + ' gen=' + gen + ' doneActions=' + doneActions + ') after ' + (Date.now() - start) + 'ms');
+          if (!searching) { try { doneActions = await evalJs(pageId, EXPR.doneActions); } catch (e) { /* ignore */ } }
+          lastDoneState = { thinking, searching, doneActions, thinkStalled, dedupedLen: deduped.length };
+          const doneSignal = (genSeen && !gen) || doneActions || thinkStalled;
+          if (thinkStalled) {
+            logDbg('streamAsk think-stalled: think panel still visible but content present and think stable for ' + (Date.now() - thinkLastChange) + 'ms; allow completion');
+          }
+          if (lastChange > 0 && doneSignal && !searching && (!thinking || thinkStalled) && Date.now() - lastChange >= 400) {
+            lastDoneReason = 'doneSignal';
+            logDbg('streamAsk done: doneSignal (genSeen=' + genSeen + ' gen=' + gen + ' doneActions=' + doneActions + ' thinkStalled=' + thinkStalled + ') after ' + (Date.now() - start) + 'ms');
             break;
           }
-          if (lastChange > 0 && lastText.length > 10 && !gen && !thinking && !searching && Date.now() - lastChange >= 1500) {
-            logDbg('streamAsk done: stable 1500ms after ' + (Date.now() - start) + 'ms');
+          if (lastChange > 0 && lastText.length > 10 && !gen && !searching && (!thinking || thinkStalled) && Date.now() - lastChange >= 1500) {
+            lastDoneReason = 'stable1500ms';
+            logDbg('streamAsk done: stable 1500ms after ' + (Date.now() - start) + 'ms' + (thinkStalled ? ' (thinkStalled)' : ''));
             break;
           }
-          if (lastChange > 0 && !thinking && !searching && Date.now() - lastChange >= (gen ? 30000 : 5000)) {
-            logDbg('streamAsk done: timeout (' + (gen ? 30 : 5) + 's) after ' + (Date.now() - start) + 'ms');
+          if (lastChange > 0 && lastText.length > 10 && gen && !searching && (!thinking || thinkStalled) && Date.now() - lastChange >= 5000) {
+            lastDoneReason = 'genStuck5s';
+            logDbg('streamAsk done: gen-stuck fallback 5s after ' + (Date.now() - start) + 'ms');
+            break;
+          }
+          if (lastChange > 0 && !searching && (!thinking || thinkStalled) && Date.now() - lastChange >= (gen ? 30000 : 5000)) {
+            lastDoneReason = gen ? 'timeout30s' : 'timeout5s';
+            logDbg('streamAsk done: timeout (' + (gen ? 30 : 5) + 's) after ' + (Date.now() - start) + 'ms' + (thinkStalled ? ' (thinkStalled)' : ''));
             break;
           }
           await sleep(200);
@@ -2971,6 +3310,28 @@ handlers.streamAsk = async (params) => {
         /* 对话过长：attempt 未用尽 → 迁移+摘要重试（循环开头处理）；
          * 用尽 → 显式报错（ok:false 无 errorKind，网关按普通错误上报，不切账号） */
         if (lengthHit) {
+          updateLastStreamSummary({
+            streamId,
+            profile: profile.name,
+            pageKey: (params && params.pageKey) || null,
+            pageId,
+            attempt,
+            finishBy: 'lengthRetryExhausted',
+            ok: false,
+            error: 'length: 对话过长且迁移重试后仍受限，请重试或缩短对话',
+            genSeen,
+            thinking: lastDoneState.thinking,
+            searching: lastDoneState.searching,
+            doneActions: lastDoneState.doneActions,
+            thinkStalled: lastDoneState.thinkStalled,
+            toolCalls: 0,
+            resultLen: 0,
+            lastTextLen: finalText ? finalText.length : lastText.length,
+            thinkLen: thinkSent.length,
+            dedupedLen: lastDoneState.dedupedLen,
+            lastChangeAgoMs: lastChange > 0 ? (Date.now() - lastChange) : null,
+            thinkIdleMs: thinkLastChange > 0 ? (Date.now() - thinkLastChange) : null,
+          });
           if (attempt < 2) continue;
           emitEvent('stream-end', { streamId, ok: false, error: 'length: 对话过长且迁移重试后仍受限，请重试或缩短对话' });
           return;
@@ -2979,24 +3340,66 @@ handlers.streamAsk = async (params) => {
          * 旧回复当本轮结果返回（旧实现静默返回旧文本，用户看到重复的旧答案）。
          * genSeen 兜底：见过生成中但文本与上轮完全相同（极端巧合）不误报 */
         if (!firstSeen && !genSeen) {
-          emitEvent('stream-end', { streamId, ok: false, error: 'timeout: 等待 ' + Math.round(timeoutMs / 1000) + 's 未见新回复（页面可能卡死或发送失败），请重试' });
+          if (attempt < 2) {
+            retrySamePayload = true;
+            await sleep(1000);
+            continue;
+          }
+          const waitedSec = Math.max(1, Math.round((Date.now() - requestStart) / 1000));
+          updateLastStreamSummary({
+            streamId,
+            profile: profile.name,
+            pageKey: (params && params.pageKey) || null,
+            pageId,
+            attempt,
+            finishBy: 'timeoutNoFirstSeen',
+            ok: false,
+            error: 'timeout: 等待 ' + waitedSec + 's 未见新回复（页面可能卡死或发送失败），请重试',
+            genSeen,
+            thinking: lastDoneState.thinking,
+            searching: lastDoneState.searching,
+            doneActions: lastDoneState.doneActions,
+            thinkStalled: lastDoneState.thinkStalled,
+            toolCalls: 0,
+            resultLen: 0,
+            lastTextLen: lastText.length,
+            thinkLen: thinkSent.length,
+            dedupedLen: lastDoneState.dedupedLen,
+            lastChangeAgoMs: lastChange > 0 ? (Date.now() - lastChange) : null,
+            thinkIdleMs: thinkLastChange > 0 ? (Date.now() - thinkLastChange) : null,
+          });
+          emitEvent('stream-end', { streamId, ok: false, error: 'timeout: 等待 ' + waitedSec + 's 未见新回复（页面可能卡死或发送失败），请重试' });
           return;
         }
         finalText = cleanText(lastText);
-        /* 终态兜底收割（v3c）：循环可能因生成中 DOM 突发静默/选择器瞬时失配而稍早
-         * break，此时页面实际已输出更多内容。退出前再抓一次最终全文，取较长者，
-         * 确保不丢内容；网关按前缀对齐会把缺失尾部补发给客户端。 */
+        /* 终态兜底收割（v3e）：循环可能因生成中 DOM 突发静默/选择器瞬时失配而稍早
+         * break。旧版仅取更长者，适用于"尾部漏抓"，但在 think 模式下可能相反：
+         * 较长文本是混入思考后的脏正文，较短文本才是真实最终答案。 */
         try {
           const re = cleanText(await evalJs(pageId, EXPR.extractLast).catch(() => ''));
-          if (re.length > finalText.length) {
-            logDbg('streamAsk final-harvest: ' + finalText.length + ' → ' + re.length + ' chars');
+          const pickShortAnswer = shouldAcceptAnswerShrink(finalText, re, re, thinkSent);
+          const shorterPrefixAnswer = !!(re && re.length > 0 && re.length < finalText.length && finalText.startsWith(re));
+          if (re.length > finalText.length || pickShortAnswer || shorterPrefixAnswer) {
+            logDbg('streamAsk final-harvest: ' + shrinkDiag(finalText, re, re, thinkSent) + ' pickShort=' + pickShortAnswer + ' replace=' + (re.length > finalText.length ? 'longer' : 'shrink'));
             finalText = re;
+          } else if (re && re !== finalText && thinkSent && thinkSent.length > 80) {
+            logDbg('streamAsk final-harvest skip: ' + shrinkDiag(finalText, re, re, thinkSent) + ' pickShort=' + pickShortAnswer);
           }
         } catch (e) { /* ignore */ }
+        finalLastText = lastText;
+        finalThinkSent = thinkSent;
+        finalThinkLastChange = thinkLastChange;
+        finalLastChange = lastChange;
+        finalGenSeen = genSeen;
+        finalLastDoneReason = lastDoneReason;
+        finalLastDoneState = lastDoneState;
         toolCalls = parseToolCalls(finalText, params.tools);
-        logDbg('streamAsk attempt=' + attempt + ' finalTextLen=' + finalText.length + ' toolCalls=' + toolCalls.length + ' looksLikeTool=' + looksLikeToolCall(finalText));
-        /* 解析成功 或 文本不像工具调用（正常回答）→ 停止重试 */
-        if (toolCalls.length || !looksLikeToolCall(finalText)) break;
+        const toolIntent = looksLikeToolCall(finalText, params.tools);
+        logDbg('streamAsk attempt=' + attempt + ' finalTextLen=' + finalText.length + ' toolCalls=' + toolCalls.length + ' looksLikeTool=' + toolIntent);
+        /* 解析成功 → 停止重试；
+         * 文本仍强烈像工具调用但未解析成功 → 继续走安全网纠正消息（最多 2 次）；
+         * 其余普通回答 → 直接结束。 */
+        if (toolCalls.length || !toolIntent) break;
       }
       /* 诊断日志：工具调用解析失败时打印实际输出与工具列表，方便定位 */
       if (toolCalls.length) {
@@ -3009,14 +3412,105 @@ handlers.streamAsk = async (params) => {
       }
       if (limitHit) {
         /* 受限（quota/captcha）：结构化上报网关（errorKind）→ 网关标记账号并切换重试 */
+        updateLastStreamSummary({
+          streamId,
+          profile: profile.name,
+          pageKey: (params && params.pageKey) || null,
+          pageId,
+          attempt: finalAttempt,
+          finishBy: 'limitHit',
+          ok: false,
+          errorKind: limitHit.kind,
+          error: 'DeepSeek 风控受限（' + limitHit.kind + '）: ' + String(finalText).slice(0, 200),
+          genSeen: finalGenSeen,
+          thinking: finalLastDoneState.thinking,
+          searching: finalLastDoneState.searching,
+          doneActions: finalLastDoneState.doneActions,
+          thinkStalled: finalLastDoneState.thinkStalled,
+          toolCalls: 0,
+          resultLen: finalText.length,
+          lastTextLen: finalLastText.length,
+          thinkLen: finalThinkSent.length,
+          dedupedLen: finalLastDoneState.dedupedLen,
+          lastChangeAgoMs: finalLastChange > 0 ? (Date.now() - finalLastChange) : null,
+          thinkIdleMs: finalThinkLastChange > 0 ? (Date.now() - finalThinkLastChange) : null,
+        });
         emitEvent('stream-end', { streamId, ok: false, errorKind: limitHit.kind, error: 'DeepSeek 风控受限（' + limitHit.kind + '）: ' + String(finalText).slice(0, 200) });
         return;
       }
-      if (toolCalls.length) emitEvent('stream-end', { streamId, ok: true, result: finalText, toolCalls });
-      else emitEvent('stream-end', { streamId, ok: true, result: finalText });
+      if (toolCalls.length) {
+        updateLastStreamSummary({
+          streamId,
+          profile: profile.name,
+          pageKey: (params && params.pageKey) || null,
+          pageId,
+          attempt: finalAttempt,
+          finishBy: finalLastDoneReason || 'tool_calls',
+          ok: true,
+          genSeen: finalGenSeen,
+          thinking: finalLastDoneState.thinking,
+          searching: finalLastDoneState.searching,
+          doneActions: finalLastDoneState.doneActions,
+          thinkStalled: finalLastDoneState.thinkStalled,
+          toolCalls: toolCalls.length,
+          resultLen: finalText.length,
+          lastTextLen: finalLastText.length,
+          thinkLen: finalThinkSent.length,
+          dedupedLen: finalLastDoneState.dedupedLen,
+          lastChangeAgoMs: finalLastChange > 0 ? (Date.now() - finalLastChange) : null,
+          thinkIdleMs: finalThinkLastChange > 0 ? (Date.now() - finalThinkLastChange) : null,
+        });
+        emitEvent('stream-end', { streamId, ok: true, result: finalText, toolCalls });
+      } else {
+        updateLastStreamSummary({
+          streamId,
+          profile: profile.name,
+          pageKey: (params && params.pageKey) || null,
+          pageId,
+          attempt: finalAttempt,
+          finishBy: finalLastDoneReason || 'stop',
+          ok: true,
+          genSeen: finalGenSeen,
+          thinking: finalLastDoneState.thinking,
+          searching: finalLastDoneState.searching,
+          doneActions: finalLastDoneState.doneActions,
+          thinkStalled: finalLastDoneState.thinkStalled,
+          toolCalls: 0,
+          resultLen: finalText.length,
+          lastTextLen: finalLastText.length,
+          thinkLen: finalThinkSent.length,
+          dedupedLen: finalLastDoneState.dedupedLen,
+          lastChangeAgoMs: finalLastChange > 0 ? (Date.now() - finalLastChange) : null,
+          thinkIdleMs: finalThinkLastChange > 0 ? (Date.now() - finalThinkLastChange) : null,
+        });
+        emitEvent('stream-end', { streamId, ok: true, result: finalText });
+      }
     } catch (e) {
       /* 登录失效的结构化信号（网关据此走自动登录/切换流程） */
       const isLogin = String(e && e.message || '').startsWith('login required');
+      updateLastStreamSummary({
+        streamId,
+        profile: profile.name,
+        pageKey: (params && params.pageKey) || null,
+        pageId,
+        attempt: 0,
+        finishBy: 'exception',
+        ok: false,
+        errorKind: isLogin ? 'login' : undefined,
+        error: e.message,
+        genSeen: false,
+        thinking: false,
+        searching: false,
+        doneActions: false,
+        thinkStalled: false,
+        toolCalls: 0,
+        resultLen: 0,
+        lastTextLen: 0,
+        thinkLen: 0,
+        dedupedLen: 0,
+        lastChangeAgoMs: null,
+        thinkIdleMs: null,
+      });
       emitEvent('stream-end', { streamId, ok: false, errorKind: isLogin ? 'login' : undefined, error: e.message });
     } finally {
       streamStates.delete(streamId);

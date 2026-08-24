@@ -26,7 +26,7 @@ function loadGateway() {
   const cut = GW_SRC.indexOf('server.listen(');
   if (cut < 0) throw new Error('server.listen not found');
   const code = GW_SRC.slice(0, cut) + `
-;globalThis.__x = { isRuntimeContext, buildContext, extractBaseline, sessionFingerprint, blockText };`;
+;globalThis.__x = { isRuntimeContext, isNewConversation, buildContext, extractBaseline, sessionFingerprint, blockText };`;
   const sandbox = {
     require: (m) => {
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
@@ -177,10 +177,48 @@ const fpD = gw.sessionFingerprint({ messages: [
   { role: 'user', content: CTX_ASK },
 ] });
 check('5b 真实场景（approval 事件在首位）两种 ctx 指纹一致', fpC.full === fpD.full);
+const fpE = gw.sessionFingerprint({ messages: [
+  { role: 'system', content: SYS },
+  { role: 'user', content: '项目背景：这是一个 DeepSeek Web 适配器' },
+  { role: 'tool', content: 'spec/SPEC-v2.md 摘要：支持 recovery 重建' },
+  { role: 'user', content: '请分析首轮上下文问题' },
+  { role: 'user', content: CTX_NEVER },
+] });
+const fpF = gw.sessionFingerprint({ messages: [
+  { role: 'system', content: SYS },
+  { role: 'user', content: '项目背景：这是一个 DeepSeek Web 适配器' },
+  { role: 'tool', content: 'spec/SPEC-v2.md 摘要：支持 recovery 重建' },
+  { role: 'user', content: '请分析首轮上下文问题' },
+  { role: 'user', content: CTX_ASK },
+] });
+check('5c 首轮含 tool 结果 + ctx 变化时指纹仍稳定', fpE.full === fpF.full && fpE.loose === fpF.loose);
+const fpToolLoopA = gw.sessionFingerprint({ messages: [
+  { role: 'system', content: SYS },
+  { role: 'user', content: '上海天气怎么样' },
+] });
+const fpToolLoopB = gw.sessionFingerprint({ messages: [
+  { role: 'system', content: SYS },
+  { role: 'user', content: '上海天气怎么样' },
+  { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'web_search', arguments: '{}' } }] },
+  { role: 'tool', tool_call_id: 'c1', content: '晴，28C' },
+] });
+check('5d 工具循环追加 tool 结果后指纹仍稳定（避免误触发 recovery）', fpToolLoopA.full === fpToolLoopB.full && fpToolLoopA.loose === fpToolLoopB.loose);
 
-/* ---------- 6. blockText 容错 ---------- */
-check('6a content blocks 数组格式', gw.blockText([{ type: 'text', text: QUESTION }]) === QUESTION);
-check('6b 纯字符串', gw.blockText(QUESTION) === QUESTION);
+/* ---------- 6. isNewConversation 边界 ---------- */
+check('6a 普通首轮无 assistant → 新会话', gw.isNewConversation(turn1Never) === true);
+check('6b 有 assistant 文本 → 非新会话', gw.isNewConversation({ messages: [
+  { role: 'user', content: QUESTION },
+  { role: 'assistant', content: '好的，我来分析。' },
+] }) === false);
+check('6c assistant 仅 tool_calls 也算非新会话（避免误判首轮）', gw.isNewConversation({ messages: [
+  { role: 'user', content: QUESTION },
+  { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } }] },
+  { role: 'tool', tool_call_id: 'c1', content: 'file content here' },
+] }) === false);
+
+/* ---------- 7. blockText 容错 ---------- */
+check('7a content blocks 数组格式', gw.blockText([{ type: 'text', text: QUESTION }]) === QUESTION);
+check('7b 纯字符串', gw.blockText(QUESTION) === QUESTION);
 
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

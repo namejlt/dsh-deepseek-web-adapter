@@ -131,15 +131,55 @@ check('G6 未加引号 key', '<tool_call>{"name": "write", "args": {file_path: "
 check('G7 Python 函数格式', '```\nwrite(file_path="a.txt", content="hi")\n```', 'write');
 check('G8 单反斜杠+args 容器', '<tool_call>{"name": "write", "args": {"file_path": "C:\\Users\\hp\\Desktop\\a.txt", "content": "hi"}}</tool_call>', 'write');
 check('G9 name+args 无 arguments', '```tool_call\n{"name": "pwsh", "args": {"command": "echo hi"}}\n```', 'pwsh');
+check('G10 tool_call.arguments 无 name → 直接按授权工具推断', '<tool_call>{"tool_call": {"arguments": {"command": "ls"}}}</tool_call>', 'pwsh');
+check('G11 顶层 arguments 无 name → 直接按授权工具推断', '{"arguments": {"file_path": "a.txt", "content": "hi"}}', 'write');
+check('G12 单元素数组包裹纯参数对象 → 直接恢复授权工具', '[{"file_path": "a.txt", "content": "hi"}]', 'write');
+check('G13 顶层 input 无 name → 直接按授权工具推断', '{"input": {"query": "AGI"}}', 'web_search');
+check('G13b web_search queries 数组 → 规范化为 query 单值', '<tool_call>{"name": "web_search", "args": {"queries": ["上海天气 今天 实时"]}}</tool_call>', 'web_search');
+const g13b = parseToolCalls('<tool_call>{"name": "web_search", "args": {"queries": ["上海天气 今天 实时"]}}</tool_call>', tools);
+if (g13b.length) {
+  try {
+    const args = JSON.parse(g13b[0].arguments || '{}');
+    if (args.query === '上海天气 今天 实时' && args.queries === undefined) pass++;
+    else { fail++; failures.push({ desc: 'G13b 参数规范化', expected: '{query:"上海天气 今天 实时"}', got: JSON.stringify(args), detail: 'web_search args not normalized' }); }
+  } catch (e) {
+    fail++; failures.push({ desc: 'G13b 参数规范化 JSON', expected: 'valid json', got: String(e.message || e), detail: g13b[0].arguments });
+  }
+}
+check('G13c XML invoke 风格 tool_calls → 直接恢复 web_search', '<tool_calls>\n<invoke name="web_search">\n<parameter name="queries">["上海 近三天 天气预报 2026-08-22"]</parameter>\n</invoke>\n</tool_calls>', 'web_search');
+const g13c = parseToolCalls('<tool_calls>\n<invoke name="web_search">\n<parameter name="queries">["上海 近三天 天气预报 2026-08-22"]</parameter>\n</invoke>\n</tool_calls>', tools);
+if (g13c.length) {
+  try {
+    const args = JSON.parse(g13c[0].arguments || '{}');
+    if (args.query === '上海 近三天 天气预报 2026-08-22' && args.queries === undefined) pass++;
+    else { fail++; failures.push({ desc: 'G13c XML 参数规范化', expected: '{query:"上海 近三天 天气预报 2026-08-22"}', got: JSON.stringify(args), detail: 'xml invoke args not normalized' }); }
+  } catch (e) {
+    fail++; failures.push({ desc: 'G13c XML 参数规范化 JSON', expected: 'valid json', got: String(e.message || e), detail: g13c[0].arguments });
+  }
+}
+check('G13d think/正文 混合输出仍可恢复 web_search', 'think：\n\nThe user asks about Shanghai weather. This is a current information query. I should use web_search to get current weather info. Let me search in Chinese.\n\n正文：\n\n{\n  "name": "web_search",\n  "args": {\n    "queries": ["上海今天天气 2026-08-22"]\n  }\n}', 'web_search');
+const g13d = parseToolCalls('think：\n\nThe user asks about Shanghai weather. This is a current information query. I should use web_search to get current weather info. Let me search in Chinese.\n\n正文：\n\n{\n  "name": "web_search",\n  "args": {\n    "queries": ["上海今天天气 2026-08-22"]\n  }\n}', tools);
+if (g13d.length) {
+  try {
+    const args = JSON.parse(g13d[0].arguments || '{}');
+    if (args.query === '上海今天天气 2026-08-22' && args.queries === undefined) pass++;
+    else { fail++; failures.push({ desc: 'G13d think/正文 参数规范化', expected: '{query:"上海今天天气 2026-08-22"}', got: JSON.stringify(args), detail: 'think/body args not normalized' }); }
+  } catch (e) {
+    fail++; failures.push({ desc: 'G13d think/正文 参数规范化 JSON', expected: 'valid json', got: String(e.message || e), detail: g13d[0].arguments });
+  }
+}
+const noWriteTools = tools.filter((t) => (t.function || t).name !== 'write');
+checkWith('G14 纯参数对象若目标工具未授权则拒绝恢复', '{"file_path": "a.txt", "content": "hi"}', '', noWriteTools);
 
 /* ============ H. looksLikeToolCall 辅助检测（安全网触发条件） ============ */
 const llc = eval('(' + src.slice(src.indexOf('function looksLikeToolCall'), src.indexOf('\nhandlers.streamAsk', src.indexOf('function looksLikeToolCall'))) + ')');
-console.log('H1 含tool_call →', llc('我来调用 <tool_call>') === true ? 'PASS' : 'FAIL', llc('我来调用 <tool_call>'));
-console.log('H2 含name键 →', llc('{"name": "write", ...}') === true ? 'PASS' : 'FAIL');
-console.log('H3 普通文本 →', llc('你好，今天天气不错') === false ? 'PASS' : 'FAIL', '→ got', llc('你好，今天天气不错'));
-console.log('H4 已知工具名 →', llc('我想用 write_file 写文件') === true ? 'PASS' : 'FAIL', '→ got', llc('我想用 write_file 写文件'));
-console.log('H5 代码块函数 →', llc('```write("a.txt")```') === true ? 'PASS' : 'FAIL', '→ got', llc('```write("a.txt")```'));
-pass += 4; // H 计入汇总（简化）
+console.log('H1 含tool_call →', llc('我来调用 <tool_call>', tools) === true ? 'PASS' : 'FAIL', llc('我来调用 <tool_call>', tools));
+console.log('H2 含name键 →', llc('{"name": "write", ...}', tools) === true ? 'PASS' : 'FAIL');
+console.log('H3 普通文本 →', llc('你好，今天天气不错', tools) === false ? 'PASS' : 'FAIL', '→ got', llc('你好，今天天气不错', tools));
+console.log('H4 已知工具名 →', llc('我想用 write_file 写文件', tools) === true ? 'PASS' : 'FAIL', '→ got', llc('我想用 write_file 写文件', tools));
+console.log('H5 代码块函数 →', llc('```write("a.txt")```', tools) === true ? 'PASS' : 'FAIL', '→ got', llc('```write("a.txt")```', tools));
+console.log('H6 纯参数 JSON（命中多个 schema key）→', llc('{"file_path": "a.txt", "content": "hi"}', tools) === true ? 'PASS' : 'FAIL', '→ got', llc('{"file_path": "a.txt", "content": "hi"}', tools));
+pass += 5; // H 计入汇总（简化）
 
 /* ============ 汇总 ============ */
 console.log(`\n========== 结果: ${pass} 通过 / ${fail} 失败 / 共 ${pass + fail} ==========\n`);

@@ -283,9 +283,14 @@ server.listen(5688, '127.0.0.1', () => {
 
 ```javascript
 const MODELS = {
-  'deepseek-chat':    { name: 'DeepSeek 快速', mode: 'quick',  deepThink: false },
-  'deepseek-reasoner': { name: 'DeepSeek 专家', mode: 'expert', deepThink: true },
-  'deepseek-vision':  { name: 'DeepSeek 识图', mode: 'vision', deepThink: false },
+  'deepseek-chat':            { name: 'DeepSeek 快速',            mode: 'quick',  deepThink: false, search: false },
+  'deepseek-reasoner':        { name: 'DeepSeek 深度思考',        mode: 'quick',  deepThink: true,  search: false },
+  'deepseek-search':          { name: 'DeepSeek 智能搜索',        mode: 'quick',  deepThink: false, search: true  },
+  'deepseek-think-search':    { name: 'DeepSeek 深度思考+搜索',   mode: 'quick',  deepThink: true,  search: true  },
+  'deepseek-expert':          { name: 'DeepSeek 专家',            mode: 'expert', deepThink: false, search: false },
+  'deepseek-expert-reasoner': { name: 'DeepSeek 专家+深度思考',    mode: 'expert', deepThink: true,  search: false },
+  'deepseek-vision':          { name: 'DeepSeek 识图',            mode: 'vision', deepThink: false, search: false },
+  'deepseek-vision-reasoner': { name: 'DeepSeek 识图+深度思考',    mode: 'vision', deepThink: true,  search: false },
 };
 ```
 
