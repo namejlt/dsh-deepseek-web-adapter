@@ -23,8 +23,8 @@ function makeGateway(tmpBase) {
   fs.mkdirSync(tmpBase, { recursive: true });
   const fakeResources = path.join(tmpBase, 'res');
   fs.mkdirSync(fakeResources, { recursive: true });
-  const cut = GW_SRC.indexOf('\nif (require.main === module) {');
-  if (cut < 0) throw new Error('gateway bootstrap guard not found');
+  const cut = GW_SRC.indexOf('server.listen(');
+  if (cut < 0) throw new Error('server.listen not found');
   /* const 声明（pool/state）不泄漏到沙箱全局 → 末尾显式导出测试所需的绑定 */
   const code = GW_SRC.slice(0, cut) + `
 ;globalThis.__x = {

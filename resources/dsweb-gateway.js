@@ -2176,6 +2176,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// server.listen( is intentionally a test extraction boundary for legacy offline VM suites.
 if (require.main === module) {
   server.listen(PORT, '127.0.0.1', () => {
     log('DeepSeek 网页版网关已监听 http://127.0.0.1:' + PORT + '/v1/');
