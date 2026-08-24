@@ -1038,6 +1038,22 @@ function looksLikeToolCallText(t, tools) {
   }
   return false;
 }
+/** 校验 OpenAI chat/completions 请求。必须在 SSE/driver 之前执行，
+ * 以便调用方收到明确的 HTTP JSON 错误，而不是半截流或浏览器副作用。 */
+function validateChatPayload(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { status: 400, code: 'invalid_request', message: 'request body must be a JSON object' };
+  }
+  if (typeof payload.model !== 'string' || !MODELS[payload.model]) {
+    return { status: 404, code: 'model_not_found', message: 'model not found: ' + String(payload.model || '') };
+  }
+  const msgs = payload.messages;
+  if (!Array.isArray(msgs) || !msgs.length || msgs.some((m) => !m || typeof m !== 'object' || Array.isArray(m) || typeof m.role !== 'string' || !m.role)) {
+    return { status: 400, code: 'invalid_messages', message: 'messages must be a non-empty array of role-bearing objects' };
+  }
+  return null;
+}
+
 /**
  * 处理 /v1/chat/completions（网关主流程，OpenAI 兼容契约的唯一实现点）。
  * 流程：会话识别 → 会话锁/信号量 → 账号调度 → askOnce 循环
@@ -1050,8 +1066,13 @@ function looksLikeToolCallText(t, tools) {
  * @param {object} payload 已解析的请求体（model/messages/tools/stream）
  */
 async function handleChatCompletion(req, res, payload) {
-  const model = payload.model || 'deepseek-chat';
-  const cfg = MODELS[model] || MODELS['deepseek-chat'];
+  const validation = validateChatPayload(payload);
+  if (validation) {
+    sendJson(res, { error: { message: validation.message, type: 'invalid_request_error', code: validation.code } }, validation.status);
+    return;
+  }
+  const model = payload.model;
+  const cfg = MODELS[model];
   const created = Math.floor(Date.now() / 1000);
   const cid = 'chatcmpl-' + created;
   /* OpenAI 兼容：stream=false → 完整 JSON 响应（旧实现一律 SSE，非流式客户端解析必炸） */

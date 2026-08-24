@@ -52,11 +52,12 @@ function makeGateway(tmpBase) {
 /* ---------- mock rpc / res：驱动 handleChatCompletion 集成流程 ---------- */
 function makeRpcMock(gw, script, loginResult) {
   const calls = [];
+  let ensureCount = 0;
   let seq = 0;
   const d = { consumers: new Map() };
   const sb = gw.__sandbox;
   /* 覆盖沙箱顶层绑定（function 声明挂在 globalThis 上，直接改属性即可生效） */
-  sb.ensureDriver = async () => d;
+  sb.ensureDriver = async () => { ensureCount++; return d; };
   sb.rpc = async (method, params) => {
     calls.push({ method, params });
     if (method === 'streamAsk') {
@@ -72,12 +73,13 @@ function makeRpcMock(gw, script, loginResult) {
     if (method === 'login') return loginResult || { ok: true, loggedIn: true };
     return { ok: true };
   };
-  return { calls, d };
+  return { calls, d, getEnsureCount: () => ensureCount };
 }
 function makeResMock() {
   return {
-    setHeader() {}, writeHead() {},
-    chunks: [], write(c) { this.chunks.push(String(c)); }, end() { this.ended = true; },
+    statusCode: null, headers: null,
+    setHeader() {}, writeHead(statusCode, headers) { this.statusCode = statusCode; this.headers = headers || null; },
+    chunks: [], write(c) { this.chunks.push(String(c)); }, end(c) { if (c !== undefined) this.chunks.push(String(c)); this.ended = true; },
   };
 }
 function sseText(res) { return res.chunks.join(''); }
@@ -281,6 +283,22 @@ const PAYLOAD_FIRST = {
     await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
     check('2e1 captcha 账号 → disabled（转人工）', gw.pool.accounts.get('default').state === 'disabled');
     check('2e2 SSE 报错（无可用切换）', sseText(res).includes('风控受限'));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+  {
+    /* 2g 无效 OpenAI 请求必须在 driver/SSE 前返回 JSON 错误 */
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-invalid-'));
+    const gw = makeGateway(tmp);
+    const { calls, getEnsureCount } = makeRpcMock(gw, [{ ok: true, result: '不应生成' }]);
+    const unknown = makeResMock();
+    await gw.handleChatCompletion({}, unknown, { model: 'not-a-real-model', messages: PAYLOAD_FIRST.messages });
+    check('2g1 未知模型返回 404', unknown.statusCode === 404, String(unknown.statusCode));
+    check('2g2 未知模型返回 JSON 错误', /\"code\":\"model_not_found\"/.test(sseText(unknown)) && !/data: /.test(sseText(unknown)), sseText(unknown));
+    const emptyMessages = makeResMock();
+    await gw.handleChatCompletion({}, emptyMessages, { model: 'deepseek-chat', messages: [] });
+    check('2g3 空 messages 返回 400', emptyMessages.statusCode === 400, String(emptyMessages.statusCode));
+    check('2g4 空 messages 返回 JSON 错误', /\"code\":\"invalid_messages\"/.test(sseText(emptyMessages)) && !/data: /.test(sseText(emptyMessages)), sseText(emptyMessages));
+    check('2g5 无效请求不启动 driver 或 streamAsk', getEnsureCount() === 0 && calls.filter((c) => c.method === 'streamAsk').length === 0, 'ensure=' + getEnsureCount() + ' calls=' + JSON.stringify(calls));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
   {
