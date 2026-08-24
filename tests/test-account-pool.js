@@ -339,11 +339,15 @@ const PAYLOAD_FIRST = {
     await gw.handleChatCompletion({}, unknown, { model: 'not-a-real-model', messages: PAYLOAD_FIRST.messages });
     check('2g1 未知模型返回 404', unknown.statusCode === 404, String(unknown.statusCode));
     check('2g2 未知模型返回 JSON 错误', /\"code\":\"model_not_found\"/.test(sseText(unknown)) && !/data: /.test(sseText(unknown)), sseText(unknown));
+    const inheritedModel = makeResMock();
+    await gw.handleChatCompletion({}, inheritedModel, { model: 'toString', messages: PAYLOAD_FIRST.messages });
+    check('2g3 原型链模型名返回 404', inheritedModel.statusCode === 404, String(inheritedModel.statusCode));
+    check('2g4 原型链模型名返回 model_not_found', /\"code\":\"model_not_found\"/.test(sseText(inheritedModel)), sseText(inheritedModel));
     const emptyMessages = makeResMock();
     await gw.handleChatCompletion({}, emptyMessages, { model: 'deepseek-chat', messages: [] });
-    check('2g3 空 messages 返回 400', emptyMessages.statusCode === 400, String(emptyMessages.statusCode));
-    check('2g4 空 messages 返回 JSON 错误', /\"code\":\"invalid_messages\"/.test(sseText(emptyMessages)) && !/data: /.test(sseText(emptyMessages)), sseText(emptyMessages));
-    check('2g5 无效请求不启动 driver 或 streamAsk', getEnsureCount() === 0 && calls.filter((c) => c.method === 'streamAsk').length === 0, 'ensure=' + getEnsureCount() + ' calls=' + JSON.stringify(calls));
+    check('2g5 空 messages 返回 400', emptyMessages.statusCode === 400, String(emptyMessages.statusCode));
+    check('2g6 空 messages 返回 JSON 错误', /\"code\":\"invalid_messages\"/.test(sseText(emptyMessages)) && !/data: /.test(sseText(emptyMessages)), sseText(emptyMessages));
+    check('2g7 无效请求不启动 driver 或 streamAsk', getEnsureCount() === 0 && calls.filter((c) => c.method === 'streamAsk').length === 0, 'ensure=' + getEnsureCount() + ' calls=' + JSON.stringify(calls));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
   {

@@ -1061,7 +1061,7 @@ function validateChatPayload(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { status: 400, code: 'invalid_request', message: 'request body must be a JSON object' };
   }
-  if (typeof payload.model !== 'string' || !MODELS[payload.model]) {
+  if (typeof payload.model !== 'string' || !Object.prototype.hasOwnProperty.call(MODELS, payload.model)) {
     return { status: 404, code: 'model_not_found', message: 'model not found: ' + String(payload.model || '') };
   }
   const msgs = payload.messages;
