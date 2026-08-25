@@ -20,11 +20,12 @@ function check(name, fn) {
   }
 }
 
-check('inspect does not reuse an arbitrary provider tab for a profile-specific login check', () => {
+check('passive provider inspection never switches profiles or reuses another provider tab', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'resources', 'driver.js'), 'utf8');
-  assert(!/const pid = taskPage \|\| \(\[\.\.\.browser\.pages\.keys\(\)\]\[0\]\)/.test(source));
-  assert(/const inspectHeadless = params && params\.headless !== undefined \? !!params\.headless : false;/.test(source));
-  assert(/const pid = taskPage \|\| await ensurePage\(\{ name: profileKey\(adapter\.id, params && params\.profile\), headless: inspectHeadless \}, adapter\.id\)/.test(source));
+  assert(/const passive = !!\(params && params\.passive\) \|\| streamActive > 0;/.test(source));
+  assert(/profileInactive: true/.test(source));
+  assert(/if \(!pid && passive\) \{/.test(source));
+  assert(/else if \(!pid\) \{[\s\S]*?await ensurePage/.test(source));
 });
 
 check('exports pure provider identity helpers', () => {

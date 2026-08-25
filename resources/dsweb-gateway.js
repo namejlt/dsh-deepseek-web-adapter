@@ -1734,11 +1734,11 @@ function buildAccountsPayload() {
     note: '受限信号只来自页面文案检测（动态风控无固定数值）；恢复=指数退避到期后真实请求探测',
   };
 }
-async function getLoginSnapshot(providerId) {
+async function getLoginSnapshot(providerId, passive) {
   let st = { needsLogin: true };
   const id = providerId || 'deepseek';
   try {
-    const insp = await rpc('inspect', { providerId: id, profile: providerProfile(id), headless: state.headless }, 8000);
+    const insp = await rpc('inspect', { providerId: id, profile: providerProfile(id), headless: state.headless, passive: !!passive }, 8000);
     st = (insp && insp.login) || { needsLogin: true };
   } catch (e) { /* driver not ready */ }
   return st;
@@ -1777,7 +1777,7 @@ async function buildProvidersPayload() {
   for (const provider of Object.values(PROVIDERS)) {
     const models = listModels().filter((model) => model.providerId === provider.id).map((model) => ({ id: model.id, name: model.name, mode: model.mode, thinking: !!(model.thinking || model.deepThink), search: !!model.search }));
     const accounts = providerAccountSummary(provider.id, accountRows);
-    const login = await getLoginSnapshot(provider.id);
+    const login = await getLoginSnapshot(provider.id, true);
     const state = providerManagementState(login, accounts);
     providers.push({
       id: provider.id,
@@ -1794,7 +1794,7 @@ async function buildProvidersPayload() {
   return { ok: true, providers, generatedAt: Date.now() };
 }
 async function getInspectSnapshot() {
-  try { return await rpc('inspect', {}, 8000); } catch (e) { return null; }
+  try { return await rpc('inspect', { passive: true }, 8000); } catch (e) { return null; }
 }
 async function buildHealthPayload() {
   const uptime = Math.floor((Date.now() - gatewayStartTime) / 1000);

@@ -2393,12 +2393,33 @@ handlers.inspect = async (params) => {
   const providerId = (params && params.providerId) || 'deepseek';
   const adapter = resolveProviderAdapter(providerId);
   const taskPage = params && params.taskId ? (tasks.get(params.taskId) || {}).pageId : null;
-  /* A generic first tab may belong to another provider/profile. For provider status,
-   * always create/reuse the page bound to the requested provider profile. The check
-   * must use the same headless mode as actual requests, otherwise login cookies or
-   * anti-bot presentation can differ from the DSH execution page. */
+  const requestedProfile = profileKey(adapter.id, params && params.profile);
+  /* Dashboard/health refreshes must be observational only. Switching a single
+   * browser between provider profiles aborts active web streams, so a passive
+   * inspect reports inactive state rather than launching/restarting Chrome. */
+  const passive = !!(params && params.passive) || streamActive > 0;
   const inspectHeadless = params && params.headless !== undefined ? !!params.headless : false;
-  const pid = taskPage || await ensurePage({ name: profileKey(adapter.id, params && params.profile), headless: inspectHeadless }, adapter.id);
+  let pid = taskPage;
+  if (!pid && passive) {
+    const activePage = thePage && pageInfo(thePage) ? thePage : [...browser.pages.keys()][0];
+    if (!browser.profile || browser.profile.name !== requestedProfile || !activePage) {
+      return {
+        providerId: adapter.id,
+        dom: { url: providerUrl(adapter.id), providerId: adapter.id },
+        buttons: [],
+        login: { needsLogin: false, hasChatInput: false, challenge: false, profileInactive: true, url: providerUrl(adapter.id), bodySnippet: 'provider profile is not active' },
+        modelBadge: { text: '', tag: '' },
+        channels: [...channels.keys()],
+        freePages: subPages.length,
+        lastStreamSummary,
+      };
+    }
+    pid = activePage;
+  } else if (!pid) {
+    /* An explicit login-status check uses the same headed/headless mode as actual
+     * DSH requests, avoiding a mismatched browser presentation. */
+    pid = await ensurePage({ name: requestedProfile, headless: inspectHeadless }, adapter.id);
+  }
   const info = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.domDebug) : { url: providerUrl(adapter.id), providerId: adapter.id };
   const buttons = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.buttons) : [];
   const login = await ensureLoggedIn(pid, adapter.id);
