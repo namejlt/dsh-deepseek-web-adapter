@@ -34,6 +34,7 @@ function makeGateway(tmpBase) {
 };`;
   const sandbox = {
     require: (m) => {
+      if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },
@@ -212,8 +213,8 @@ const PAYLOAD_FIRST = {
     await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
     const asks = calls.filter((c) => c.method === 'streamAsk');
     check('2a1 quota 后发生 2 次 streamAsk', asks.length === 2, 'asks=' + asks.length);
-    check('2a2 首次用 default', asks[0].params.profile === 'default');
-    check('2a3 切换后用 acc2', asks[1].params.profile === 'acc2');
+    check('2a2 首次用 DeepSeek provider 默认 profile', asks[0].params.profile === 'deepseek-default');
+    check('2a3 切换后使用 provider-scoped acc2 profile', asks[1].params.profile === 'deepseek-acc2');
     check('2a4 FF4 切换后 recovery 重建（含压缩历史标注）', /网页会话中断/.test(asks[1].params.question));
     check('2a5 FF4 recovery 强制 newChat（reset=true）', asks[1].params.reset === true);
     check('2a6 SSE 返回第二账号回答', sseText(res).includes('acc2 的正常回答'));
@@ -251,7 +252,7 @@ const PAYLOAD_FIRST = {
     await gw.handleChatCompletion({}, res, PAYLOAD_FIRST);
     const m = calls.map((c) => c.method);
     check('2c1 顺序：streamAsk → login → streamAsk', m[0] === 'streamAsk' && m[1] === 'login' && m[2] === 'streamAsk', m.join(','));
-    check('2c2 登录重试同账号（default）', calls[2].params.profile === 'default');
+    check('2c2 登录重试同一 provider 默认 profile', calls[2].params.profile === 'deepseek-default');
     check('2c3 登录重试走 recovery', /网页会话中断/.test(calls[2].params.question));
     check('2c4 SSE 返回重试结果', sseText(res).includes('登录后重试成功'));
     check('2c5 账号恢复 active', gw.pool.accounts.get('default').state === 'active');

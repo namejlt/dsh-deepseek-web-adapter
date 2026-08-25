@@ -1,8 +1,10 @@
-# SPEC-multisite — 增加 ChatGPT Web 与 Qwen Web 转 API 支持的扩展计划
+# SPEC-multisite — Beta 多站点 Web-to-OpenAI 网关（实施规格）
 
-> 状态：规划中（本文件仅输出分析与实施计划，不改动现有代码）
-> 背景：当前插件已实现 **DeepSeek Web → OpenAI 兼容 API**。目标是在尽量复用现有网关与会话/工具/账号池能力的前提下，新增 **ChatGPT Web → API** 与 **Qwen Web → API** 支持。
-> 结论先行：**推荐把当前项目从“单站点 DeepSeek 适配器”重构为“多站点 Web-to-OpenAI 网关”**，保持 DSH 侧协议不变，把页面差异下沉到 provider/site adapter 层。
+> **状态：已实现（代码与离线测试）；待真实已登录账号的手工验收。** 本规格不宣称已完成 live verified / 在线真实环境验证。
+> 背景：插件已从仅 DeepSeek Web 扩展为 DeepSeek、ChatGPT 与 Qwen 的统一 Web-to-OpenAI 网关，继续对 DSH 提供 `/v1/models` 与 `/v1/chat/completions`（SSE）。
+> 当前交付：`chatgpt-auto`、`chatgpt-thinking`、`qwen-chat`、`qwen-thinking`、`qwen-search`；provider profile 独立，手工登录入口为 `/login?provider=deepseek|chatgpt|qwen`。
+> 保守范围：文本、代码块、基础 SSE；不支持附件/多模态、挑战自动求解或绕过、网页原生 artifact/iframe 等原生产物语义。ChatGPT challenge 返回需手动操作的 `challenge_required`，与 DOM 错误（`provider_dom_changed`/`dom_unavailable`）区分；Qwen 不可用模式返回 `mode_unavailable`。
+> 下文保留原始调研和分阶段内容作为**已落地实施的设计依据与验收记录**，不是未开始的工作计划。
 
 ---
 
@@ -612,7 +614,10 @@ provider 切换、driver 重启、profile 切换、登录重做时，统一走 `
 
 ---
 
-## 10. 分阶段实施计划
+## 10. 分阶段实施记录（Beta 核心已完成离线实现）
+
+> 以下阶段说明保留为实现追溯。当前 Beta 核心代码和离线测试已完成；剩余发布门槛是三站真实已登录 profile 的手工验收，而不是再次声明实现尚未开始。
+
 
 ### Phase 0：规划与抽象准备
 
@@ -719,7 +724,7 @@ provider 切换、driver 重启、profile 切换、登录重做时，统一走 `
 
 ---
 
-## 12. 推荐实施顺序
+## 12. 已采用的实施顺序
 
 **推荐顺序不是先上 ChatGPT，而是：**
 
@@ -736,7 +741,7 @@ provider 切换、driver 重启、profile 切换、登录重做时，统一走 `
 
 ---
 
-## 13. 本次规划的最终建议
+## 13. 已采用的实现决策
 
 ### 建议 A：不要复制项目做三个独立插件
 
@@ -813,6 +818,6 @@ provider 切换、driver 重启、profile 切换、登录重做时，统一走 `
 
 ---
 
-## 16. 一句话结论
+## 16. 当前结论与待验收项
 
-**这件事值得做，而且最优解不是在现有 DeepSeek 代码上继续堆 if/else，而是把项目升级成“多 provider Web-to-OpenAI 网关”：先抽象、先迁 DeepSeek、先落地 Qwen、再接 ChatGPT。**
+**当前 Beta 已把项目升级为多 provider Web-to-OpenAI 网关：DeepSeek、ChatGPT 与 Qwen 的 provider 路由、独立 profile 和离线测试均已落地。发布前仍需在真实已登录 profile 上完成文本、代码、SSE、错误边界和 provider 隔离的手工验收；在此之前不得宣称已 live verified。**

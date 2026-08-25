@@ -33,6 +33,7 @@ function loadGateway(exports) {
 ;globalThis.__x = { ${exports} };`;
   const sandbox = {
     require: (m) => {
+      if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },

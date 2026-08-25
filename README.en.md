@@ -1,28 +1,20 @@
-# dsh-deepseek-web-adapter
+# dsh-deepseek-web-adapter — Beta multisite Web-to-OpenAI gateway
 
-> **中文**: [README.md](README.md)
+> **Chinese**: [README.md](README.md)
 
-> ⚠️ **Developer Preview**: published by an individual developer, **not extensively tested in the wild**.
-> Verified: login, basic Q&A, mode-pill switching (Deep Think / Smart Search), single tool call, gateway auto-start/stop, account-pool
-> state machine / switching / backoff (61 offline unit tests).
-> Not fully verified: multi-round tool loops, long-chat migration, multi-session concurrency, headless mode,
-> vision mode, disconnect recovery, multi-account switching against live risk control.
-> Read [Known limitations](#known-limitations) before use.
-> Please report issues at [Issues](https://github.com/huermi/dsh-deepseek-web-adapter/issues).
+> ⚠️ **Beta / Developer Preview**: a local **Web-to-OpenAI** gateway for authenticated DeepSeek, ChatGPT, and Qwen web sessions.
+> Provider routing, isolated profiles, and offline coverage are implemented; **real logged-in manual acceptance is still pending. This project does not claim live verification.**
+> Use only accounts you are authorized to use and complete the authenticated smoke tests before release.
 
-Turn **DeepSeek Web (chat.deepseek.com)** into a free, API-key-free LLM provider for DeepSeek Harness (DSH).
-On plugin load, a local gateway (`resources/dsweb-gateway.js` + `driver.js`, one persistent browser) is
-spawned automatically and serves an OpenAI-compatible API. Supports: continuous chat, tool calling,
-model calibration, session-affinity concurrency, and multi-account pooling with quota-triggered switching.
+The DSH plugin still starts one local gateway exposing `/v1/models` and `/v1/chat/completions` (SSE). Existing DeepSeek models remain available; the Beta adds:
 
-- No API key, no third-party login (just your own DeepSeek account)
-- `dsh plugin add` — one command; the gateway auto-starts/stops
+- ChatGPT: `chatgpt-auto`, `chatgpt-thinking`
+- Qwen: `qwen-chat`, `qwen-thinking`, `qwen-search`
+- Each provider has an independent browser profile, session, and login state; cookies and sessions are never shared across providers.
 
-> **v2 core implemented**: multi-account storage · auto re-login · quota-triggered account switching ·
-> dynamic risk-control backoff (exponential + probe recovery) · `/setup` onboarding and built-in plugin management UI — see [spec/SPEC-v2.md](spec/SPEC-v2.md).
-> Remaining v2 items (per-account browser instances) are still 🚧 planned.
+**Conservative boundary:** text, code blocks, and basic SSE only. No attachments or multimodal input; no challenge solving or bypassing (CAPTCHA, Turnstile, etc.); no translation of native artifacts, tool cards, traces, or iframes into OpenAI-native artifacts.
 
-**Docs**: [User guide](docs/user-guide.md) · [Publishing guide](docs/publishing.md) · [Plugin dev tutorial](docs/dsh-plugin-tutorial.md) · [Best practices](docs/dsh-plugin-best-practices.md)
+**Docs**: [User guide](docs/user-guide.md) · [Publishing guide](docs/publishing.md) · [Multisite specification](spec/SPEC-multisite.md) · [Plugin tutorial](docs/dsh-plugin-tutorial.md)
 
 ## Known limitations
 
@@ -33,6 +25,10 @@ model calibration, session-affinity concurrency, and multi-account pooling with 
 | Dynamic risk control is unpredictable | Fair-use limits have no published numbers or unfreeze times — the gateway only trusts on-page signals, backs off exponentially and probes recovery; it **cannot promise when an account unfreezes** |
 | Built-in plugin management UI | This package now ships its own management frontend at `http://127.0.0.1:5688/`: onboarding, quick login, status checks, account checks, config management, and diagnostics. A future native DSH settings card can reuse the same JSON interfaces (`/setup`, `/health`, `/accounts`, `/config`) |
 | Requires a real browser | Needs Chrome installed locally; login state is kept in the `runtime/profiles/` browser profile directory — persists across restarts when "Keep me signed in" is ticked; re-login needed after DeepSeek tokens expire |
+| Provider profile isolation | DeepSeek, ChatGPT, and Qwen use separate profiles; sign in through `/login?provider=...` for each |
+| Conservative protocol boundary | Text, code blocks, and basic SSE only; no attachments/multimodal input, challenge solving, or native artifact/iframe semantics |
+| ChatGPT challenge | Returns a manual-action provider challenge error, distinct from a DOM selector error |
+| Qwen mode controls | Unavailable thinking/search returns `mode_unavailable`; it is not silently downgraded |
 | Depends on DeepSeek web UI | UI changes may break selectors (calibration/send/extract); `driver.js` then needs updating |
 | Parser is tolerant, not infallible | 54-case regression covers common formats; exotic malformed model output may still fail |
 
@@ -56,20 +52,25 @@ Edit `~/.dsh/settings.yaml`, inside `llm-pi-ai.providers: { ... }` add:
 ```yaml
 dsweb:
   {
-    displayName: DeepSeek Web (no API key),
+    displayName: Beta multisite Web-to-OpenAI (no API key),
     apiKeyEnv: MOCK_LLM_KEY,
     api: openai-completions,
     baseURL: http://127.0.0.1:5688/v1/,
     models:
       [
-        { id: deepseek-chat, name: DeepSeek Fast },
+        { id: deepseek-chat, name: DeepSeek Quick },
         { id: deepseek-reasoner, name: DeepSeek Deep Think },
         { id: deepseek-search, name: DeepSeek Smart Search },
         { id: deepseek-think-search, name: DeepSeek Deep Think + Search },
         { id: deepseek-expert, name: DeepSeek Expert },
         { id: deepseek-expert-reasoner, name: DeepSeek Expert + Deep Think },
         { id: deepseek-vision, name: DeepSeek Vision },
-        { id: deepseek-vision-reasoner, name: DeepSeek Vision + Deep Think }
+        { id: deepseek-vision-reasoner, name: DeepSeek Vision + Deep Think },
+        { id: chatgpt-auto, name: ChatGPT Auto (Beta) },
+        { id: chatgpt-thinking, name: ChatGPT Thinking (Beta) },
+        { id: qwen-chat, name: Qwen Chat (Beta) },
+        { id: qwen-thinking, name: Qwen Thinking (Beta) },
+        { id: qwen-search, name: Qwen Search (Beta) }
       ]
   }
 ```
@@ -79,18 +80,21 @@ DSH config hot-reloads — the DeepSeek Web models appear in the model picker im
 
 ## Login
 
-Recommended: open `http://127.0.0.1:5688/` first and use the quick-login card.
-You can also open `http://127.0.0.1:5688/login` in a browser and sign in to chat.deepseek.com.
-If a "Keep me signed in / Remember me" option exists, tick it — the session persists across restarts.
-On session expiry the gateway auto-opens a login window (`autoRelogin`, on by default, one window at a time)
-and retries the original request in recovery mode once login completes.
+**Manually sign in to each provider separately** in local Chrome. Start from the management page or open these routes directly:
 
-Additional accounts: `http://127.0.0.1:5688/login?profile=acc2` (each account gets its own browser profile;
-login windows time out after 5 minutes; completion is auto-detected via `/login-status`).
+```text
+http://127.0.0.1:5688/login?provider=deepseek
+http://127.0.0.1:5688/login?provider=chatgpt
+http://127.0.0.1:5688/login?provider=qwen
+```
+
+The default profiles are `deepseek-default`, `chatgpt-default`, and `qwen-default`. Do not copy or share profile directories across providers. Omitting `provider` remains backward-compatible and selects DeepSeek.
+
+If ChatGPT exposes a Cloudflare, Turnstile, or other challenge, the gateway returns a **manual-action** `challenge_required`/`provider_challenge_required` error that is distinct from a DOM-selector error; it will not solve or bypass the challenge. If Qwen thinking/search cannot be enabled, the request returns `mode_unavailable` rather than silently using the wrong mode.
 
 ## Usage
 
-Pick **DeepSeek Web** in the DSH model picker. The current mapping follows the 2026-08 page redesign: three mode entries (quick / expert / vision) plus idempotent pills under the input box.
+Pick **Beta multisite Web-to-OpenAI** in the DSH model picker. DeepSeek keeps its eight existing models; ChatGPT and Qwen are Beta text/code/basic-SSE channels only.
 
 | Page mode | Optional pills | Model IDs |
 |---|---|---|
@@ -175,7 +179,7 @@ cordis.patch.yml      # bundle config patch
 ## How it works
 
 ```
-DSH (dsweb provider) → gateway :5688 → driver (persistent Chrome) → chat.deepseek.com
+DSH (dsweb provider) → gateway :5688 → driver (provider-isolated Chrome profile) → DeepSeek / ChatGPT / Qwen Web
 plugin load → spawn gateway → unload → recycle
 ```
 

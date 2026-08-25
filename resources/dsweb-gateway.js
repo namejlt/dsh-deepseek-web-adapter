@@ -31,6 +31,7 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { MODELS, resolveModel, listModels, getProvider, defaultProfile } = require('./provider-registry');
 
 /* ---------- 配置 ---------- */
 const args = process.argv.slice(2);
@@ -91,16 +92,40 @@ const SEM_WAIT_TIMEOUT_MS = 120 * 1000;
  *     deepseek-vision           识图（纯识图，不带思考）
  *     deepseek-vision-reasoner  识图 + 深度思考（识图模式下开启深度思考 pill）
  * driver 侧 applyConfig 幂等切换模式入口与 pill（先读状态不一致才点击）。 */
-const MODELS = {
-  'deepseek-chat':            { name: 'DeepSeek 快速（网页版）',          mode: 'quick',  deepThink: false, search: false },
-  'deepseek-reasoner':        { name: 'DeepSeek 深度思考（网页版）',      mode: 'quick',  deepThink: true,  search: false },
-  'deepseek-search':          { name: 'DeepSeek 智能搜索（网页版）',      mode: 'quick',  deepThink: false, search: true  },
-  'deepseek-think-search':    { name: 'DeepSeek 深度思考+搜索（网页版）', mode: 'quick',  deepThink: true,  search: true  },
-  'deepseek-expert':          { name: 'DeepSeek 专家（网页版）',          mode: 'expert', deepThink: false, search: false },
-  'deepseek-expert-reasoner': { name: 'DeepSeek 专家+深度思考（网页版）',  mode: 'expert', deepThink: true,  search: false },
-  'deepseek-vision':          { name: 'DeepSeek 识图（网页版）',          mode: 'vision', deepThink: false, search: false },
-  'deepseek-vision-reasoner': { name: 'DeepSeek 识图+深度思考（网页版）',  mode: 'vision', deepThink: true,  search: false },
-};
+/* Public models are defined once in provider-registry.js. */
+
+/** Resolve an OpenAI model id to immutable provider-aware registry metadata. */
+function resolveProviderModel(modelId) { return resolveModel(modelId || 'deepseek-chat'); }
+
+/** Browser profiles and logical channels are provider-scoped to prevent cross-site reuse. */
+function profileKey(providerId, requestedProfile) {
+  if (!getProvider(providerId)) return null;
+  const requested = String(requestedProfile || '').trim();
+  if (!requested) return defaultProfile(providerId);
+  if (providerId === 'deepseek' && requested === 'default') return 'default'; // legacy direct profile
+  if (requested.startsWith(providerId + '-')) return requested;
+  return providerId + '-' + requested;
+}
+function channelKey(providerId, pageKey) { return String(providerId || 'deepseek') + ':' + String(pageKey || 'main'); }
+function providerProfile(providerId, accountName) {
+  const account = String(accountName || '').trim();
+  return !account || account === 'default' ? defaultProfile(providerId) : profileKey(providerId, account);
+}
+function providerFromQuery(searchParams) {
+  const providerId = (searchParams.get('provider') || 'deepseek').trim() || 'deepseek';
+  return getProvider(providerId) ? providerId : null;
+}
+function driverErrorResponse(kind, message) {
+  const map = {
+    challenge_required: [403, 'permission_error', 'provider_challenge_required'],
+    login_required: [401, 'authentication_error', 'provider_login_required'],
+    mode_unavailable: [422, 'invalid_request_error', 'provider_mode_unavailable'],
+    dom_unavailable: [503, 'api_error', 'provider_dom_unavailable'],
+    unavailable: [503, 'api_error', 'provider_unavailable'],
+  };
+  const row = map[kind];
+  return row ? { status: row[0], type: row[1], code: row[2], message } : null;
+}
 
 /** 网关日志（带时间戳与 [gw] 前缀，stdout）。 */
 const GW_DEBUG = !!process.env.DS_WEB_DEBUG;
@@ -434,7 +459,7 @@ function poolUsable(a) {
  * @returns {object|null} 账号记录；null = 无可用
  */
 let currentProfile = 'default'; /* driver 当前浏览器绑定的 profile（最近一次成功请求的账号） */
-function poolPick(stickyName, exclude) {
+function poolPick(stickyName, exclude, providerId) {
   if (!state.accountPool) {
     const d = pool.accounts.get('default');
     return d || null;
@@ -449,7 +474,7 @@ function poolPick(stickyName, exclude) {
     if (!poolUsable(a)) continue;
     if (exclude && exclude.has(a.name)) continue;
     if (!best || a.lastUsedAt < best.lastUsedAt) best = a;
-    if (a.name === currentProfile && (!bestCur || a.lastUsedAt < bestCur.lastUsedAt)) bestCur = a;
+    if (providerProfile(providerId || 'deepseek', a.name) === currentProfile && (!bestCur || a.lastUsedAt < bestCur.lastUsedAt)) bestCur = a;
   }
   /* 当前浏览器 profile 的账号可用 → 优先（避免 profile 切换重启浏览器） */
   return bestCur || best;
@@ -485,11 +510,11 @@ function poolDescribe() {
 }
 
 /** 登录互斥（同时只一个登录窗口）：串行执行登录 rpc。 */
-function poolLogin(name, timeoutMs) {
+function poolLogin(name, timeoutMs, providerId) {
   const prev = pool.loginBusy || Promise.resolve();
   let done;
   pool.loginBusy = new Promise((r) => { done = r; });
-  return prev.then(() => rpc('login', { profile: name, timeoutMs }, timeoutMs + 15000))
+  return prev.then(() => rpc('login', { profile: name, providerId: providerId || 'deepseek', timeoutMs }, timeoutMs + 15000))
     .finally(() => { done(); });
 }
 
@@ -557,7 +582,7 @@ function hashText(s) {
  * full  = hash(system + 首条非 ctx user 全文) —— 精确匹配；
  * loose = hash(system + 首条非 ctx user 前 300 字符) —— 宽松匹配，
  *         抗 runtime-context 拼接在首条 user 里且每轮变化导致的指纹漂移。 */
-function sessionFingerprint(payload) {
+function sessionFingerprint(payload, providerId) {
   const msgs = payload.messages || [];
   const { sysText } = extractBaseline(msgs);
   const inputs = [];
@@ -573,8 +598,8 @@ function sessionFingerprint(payload) {
   }
   const basis = inputs.join('\n\n');
   return {
-    full: hashText(sysText + '\x00' + basis),
-    loose: hashText(sysText + '\x00' + basis.slice(0, 600)),
+    full: hashText(String(providerId || 'deepseek') + '\x00' + sysText + '\x00' + basis),
+    loose: hashText(String(providerId || 'deepseek') + '\x00' + sysText + '\x00' + basis.slice(0, 600)),
   };
 }
 
@@ -589,7 +614,7 @@ function activeChannelCount() {
 async function releaseSession(s) {
   sessions.delete(s.id);
   try {
-    await rpc('releaseChannel', { pageKey: s.pageKey }, 15000);
+    await rpc('releaseChannel', { pageKey: s.pageKey, providerId: s.providerId || 'deepseek' }, 15000);
   } catch (e) {
     log('releaseChannel warn (' + s.pageKey + '): ' + e.message);
   }
@@ -635,8 +660,8 @@ async function allocPageKey() {
  * @param {object} payload OpenAI chat/completions 请求体
  * @returns {Promise<{session: object, mode: string}>}
  */
-async function resolveSession(payload) {
-  const fp = sessionFingerprint(payload);
+async function resolveSession(payload, providerId) {
+  const fp = sessionFingerprint(payload, providerId);
   if (!isNewConversation(payload)) {
     for (const s of sessions.values()) {
       if (s.fpFull === fp.full || s.fpLoose === fp.loose) {
@@ -649,7 +674,7 @@ async function resolveSession(payload) {
   }
   const pageKey = await allocPageKey();
   const s = {
-    id: 's' + (++sessionSeq), pageKey, fpFull: fp.full, fpLoose: fp.loose,
+    id: 's' + (++sessionSeq), pageKey, channelId: channelKey(providerId, pageKey), providerId, fpFull: fp.full, fpLoose: fp.loose,
     epoch: driverEpoch, busy: false, lock: null, lastSeen: Date.now(),
     acctName: null, /* 会话-账号粘性绑定（SPEC-v2 §5.2 调度第 1 步） */
   };
@@ -1038,39 +1063,6 @@ function looksLikeToolCallText(t, tools) {
   }
   return false;
 }
-/** 判断短缓冲是否仍可能拼成支持的工具调用标记。
- * 只在首个分片尚不完整时短暂延迟，避免将 `` ` `` / `<` / `tool_`
- * 等前缀先作为 content 发出，后续又以 tool_calls 结束同一轮。 */
-function isPossibleToolCallPrefix(text) {
-  const s = String(text || '').trim().toLowerCase();
-  if (!s || s.length > 96) return false;
-  const prefixes = [
-    '`', '``', '```', '```t', '```to', '```too', '```tool', '```tool_', '```tool_c', '```tool_ca', '```tool_cal',
-    '```j', '```js', '```jso',
-    '<', '<t', '<to', '<too', '<tool', '<tool_', '<tool_c', '<tool_ca', '<tool_cal', '<tool_call', '<tool_call>', '<tool_calls', '<tool_calls>',
-    '<i', '<in', '<inv', '<invo', '<invok', '<invoke',
-    't', 'to', 'too', 'tool', 'tool_', 'tool_c', 'tool_ca', 'tool_cal', 'tool_call',
-    '{', '[',
-  ];
-  return prefixes.includes(s);
-}
-
-/** 校验 OpenAI chat/completions 请求。必须在 SSE/driver 之前执行，
- * 以便调用方收到明确的 HTTP JSON 错误，而不是半截流或浏览器副作用。 */
-function validateChatPayload(payload) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return { status: 400, code: 'invalid_request', message: 'request body must be a JSON object' };
-  }
-  if (typeof payload.model !== 'string' || !Object.prototype.hasOwnProperty.call(MODELS, payload.model)) {
-    return { status: 404, code: 'model_not_found', message: 'model not found: ' + String(payload.model || '') };
-  }
-  const msgs = payload.messages;
-  if (!Array.isArray(msgs) || !msgs.length || msgs.some((m) => !m || typeof m !== 'object' || Array.isArray(m) || typeof m.role !== 'string' || !m.role)) {
-    return { status: 400, code: 'invalid_messages', message: 'messages must be a non-empty array of role-bearing objects' };
-  }
-  return null;
-}
-
 /**
  * 处理 /v1/chat/completions（网关主流程，OpenAI 兼容契约的唯一实现点）。
  * 流程：会话识别 → 会话锁/信号量 → 账号调度 → askOnce 循环
@@ -1082,14 +1074,10 @@ function validateChatPayload(payload) {
  * @param {object} res HTTP 响应
  * @param {object} payload 已解析的请求体（model/messages/tools/stream）
  */
-async function handleChatCompletion(req, res, payload) {
-  const validation = validateChatPayload(payload);
-  if (validation) {
-    sendJson(res, { error: { message: validation.message, type: 'invalid_request_error', code: validation.code } }, validation.status);
-    return;
-  }
-  const model = payload.model;
-  const cfg = MODELS[model];
+async function handleChatCompletion(req, res, payload, resolvedModel) {
+  const model = payload.model || 'deepseek-chat';
+  const cfg = resolvedModel || resolveProviderModel(model);
+  if (!cfg) return sendJson(res, { error: { message: 'unknown model: ' + model, type: 'invalid_request_error', code: 'model_not_found' } }, 404);
   const created = Math.floor(Date.now() / 1000);
   const cid = 'chatcmpl-' + created;
   /* OpenAI 兼容：stream=false → 完整 JSON 响应（旧实现一律 SSE，非流式客户端解析必炸） */
@@ -1181,13 +1169,13 @@ async function handleChatCompletion(req, res, payload) {
     }
     /* 会话解析（并发核心：指纹识别 → 专属通道绑定）。
      * mode: first=新会话首轮 / delta=增量（网页版历史保持） / recovery=压缩重建 */
-    const { session, mode } = await resolveSession(payload);
+    const { session, mode } = await resolveSession(payload, cfg.providerId);
     session0 = session;
     log('会话: ' + session.id + ' 通道=' + session.pageKey + ' mode=' + mode + ' msgs=' + (payload.messages || []).length);
     releaseLock = await acquireSessionLock(session); /* 同一会话串行 */
     const d = await ensureDriver();
     /* 账号调度（SPEC-v2 §5.2）：会话粘性 → 当前浏览器 profile（避免重启）→ 最旧；无可用 → 429 语义提示 */
-    let acct = poolPick(session.acctName);
+    let acct = poolPick(session.acctName, null, cfg.providerId);
     if (!acct) {
       const er = poolEarliestRetry();
       const msg = er
@@ -1224,12 +1212,12 @@ async function handleChatCompletion(req, res, payload) {
       /* 模式联动：driver 每次请求幂等应用 pill 开关（2026-08 页面重构后
        * 无模型选择器）。calibKey=model 保留为 pill 未找到时的校准回放 fallback。 */
       const { streamId } = await rpc('streamAsk', {
-        question: q, mode: cfg.mode, deepThink: cfg.deepThink, search: cfg.search === true,
+        question: q, providerId: cfg.providerId, model: cfg, mode: cfg.mode, deepThink: cfg.deepThink, search: cfg.search === true,
         headless: state.headless, tools: payload.tools,
         /* 会话亲和：driver 侧把 pageKey 固定映射到同一浏览器 tab */
         pageKey: session.pageKey,
         /* 多账号：driver 按 profile 绑定浏览器 user-data-dir（cookie 隔离） */
-        profile: profileName,
+        profile: providerProfile(cfg.providerId, profileName),
         /* first/recovery → 强制 newChat（清掉网页版残留的旧会话，避免上下文污染）；
          * delta → 'auto'（续当前会话，超限 driver 自动迁移+摘要）。 */
         reset: askMode === 'delta' ? 'auto' : true,
@@ -1266,9 +1254,6 @@ async function handleChatCompletion(req, res, payload) {
                     silentStart = Date.now();
                     emitCurrentDelta = false;
                     log('toolMode → silent (toolBuf[:80]=' + toolBuf.slice(0, 80).replace(/\n/g, '\\n') + ')');
-                  } else if (isPossibleToolCallPrefix(toolBuf)) {
-                    /* 标记可能被拆在多个 delta 中；继续缓冲，不能先泄漏 content。 */
-                    emitCurrentDelta = false;
                   } else {
                     toolMode = 'stream';
                     log('toolMode → stream (toolBuf len=' + toolBuf.length + ')');
@@ -1317,7 +1302,7 @@ async function handleChatCompletion(req, res, payload) {
         evt = (await askOnce(acct.name, askMode)).evt;
         if (evt.ok) {
           poolMarkOk(acct.name);
-          currentProfile = acct.name; /* driver 浏览器当前绑定该 profile（调度优先，减少重启） */
+          currentProfile = providerProfile(cfg.providerId, acct.name); /* driver 浏览器当前绑定该 profile（调度优先，减少重启） */
           break;
         }
         const kind = evt.errorKind;
@@ -1332,7 +1317,7 @@ async function handleChatCompletion(req, res, payload) {
           if (state.autoRelogin && exclude.size < state.maxAccountSwitchesPerRequest) {
             log('自动登录: ' + acct.name + '（已打开浏览器登录窗口，等待完成…超时 5 分钟）');
             try {
-              const r = await poolLogin(acct.name, 300000);
+              const r = await poolLogin(providerProfile(cfg.providerId, acct.name), 300000, cfg.providerId);
               if (r && r.ok) {
                 poolMarkOk(acct.name);
                 log('自动登录成功: ' + acct.name + ' → recovery 模式重试');
@@ -1346,7 +1331,7 @@ async function handleChatCompletion(req, res, payload) {
         /* 切换下一可用账号（排除本请求已失败的） */
         exclude.add(acct.name);
         if (exclude.size > state.maxAccountSwitchesPerRequest) { log('账号切换预算已用尽（' + state.maxAccountSwitchesPerRequest + ' 次）'); break; }
-        const next = poolPick(null, exclude);
+        const next = poolPick(null, exclude, cfg.providerId);
         if (!next) { log('无可切换账号（其余账号受限/未登录/禁用）'); break; }
         log('切换账号: ' + acct.name + ' → ' + next.name + '（recovery 重建上下文）');
         acct = next;
@@ -1388,9 +1373,10 @@ async function handleChatCompletion(req, res, payload) {
       session0.epoch = -1;
       const msg = evt.error || 'unknown';
       const kind = evt.errorKind || '';
-      const status = kind === 'quota' ? 429 : kind === 'login' ? 401 : kind === 'captcha' ? 403 : /^nothing to send/.test(String(msg)) ? 400 : /^timeout:/.test(String(msg)) ? 504 : 502;
-      const type = kind === 'quota' ? 'rate_limit_error' : kind === 'login' ? 'authentication_error' : kind === 'captcha' ? 'permission_error' : /^nothing to send/.test(String(msg)) ? 'invalid_request_error' : /^timeout:/.test(String(msg)) ? 'timeout_error' : 'api_error';
-      const code = kind || (/^nothing to send/.test(String(msg)) ? 'nothing_to_send' : /^timeout:/.test(String(msg)) ? 'driver_timeout' : 'driver_error');
+      const providerError = driverErrorResponse(kind, msg);
+      const status = providerError ? providerError.status : kind === 'quota' ? 429 : kind === 'login' ? 401 : kind === 'captcha' ? 403 : /^nothing to send/.test(String(msg)) ? 400 : /^timeout:/.test(String(msg)) ? 504 : 502;
+      const type = providerError ? providerError.type : kind === 'quota' ? 'rate_limit_error' : kind === 'login' ? 'authentication_error' : kind === 'captcha' ? 'permission_error' : /^nothing to send/.test(String(msg)) ? 'invalid_request_error' : /^timeout:/.test(String(msg)) ? 'timeout_error' : 'api_error';
+      const code = providerError ? providerError.code : kind || (/^nothing to send/.test(String(msg)) ? 'nothing_to_send' : /^timeout:/.test(String(msg)) ? 'driver_timeout' : 'driver_error');
       return failJson(status, type, msg, code);
     }
   } catch (e) {
@@ -1629,10 +1615,11 @@ function buildAccountsPayload() {
     note: '受限信号只来自页面文案检测（动态风控无固定数值）；恢复=指数退避到期后真实请求探测',
   };
 }
-async function getLoginSnapshot() {
+async function getLoginSnapshot(providerId) {
   let st = { needsLogin: true };
+  const id = providerId || 'deepseek';
   try {
-    const insp = await rpc('inspect', {}, 8000);
+    const insp = await rpc('inspect', { providerId: id, profile: providerProfile(id) }, 8000);
     st = (insp && insp.login) || { needsLogin: true };
   } catch (e) { /* driver not ready */ }
   return st;
@@ -2049,7 +2036,7 @@ const server = http.createServer(async (req, res) => {
     /* 模型列表 */
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       gatewayRequestCount++;
-      return sendJson(res, { object: 'list', data: Object.entries(MODELS).map(([id, m]) => ({ id, object: 'model', owned_by: 'dsweb', name: m.name })) });
+      return sendJson(res, { object: 'list', data: listModels().map((m) => ({ id: m.id, object: 'model', owned_by: m.providerId + '-web', name: m.name })) });
     }
     /* OpenAI chat completions */
     if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {
@@ -2072,7 +2059,9 @@ const server = http.createServer(async (req, res) => {
       if (payload.model === 'workbuddy-agent') {
         return handleWorkBuddy(req, res, payload);
       }
-      return handleChatCompletion(req, res, payload);
+      const resolvedModel = resolveProviderModel(payload.model || 'deepseek-chat');
+      if (!resolvedModel) return sendJson(res, { error: { message: 'unknown model: ' + (payload.model || ''), type: 'invalid_request_error', code: 'model_not_found' } }, 404);
+      return handleChatCompletion(req, res, payload, resolvedModel);
     }
     if (req.method === 'GET' && p === '/') {
       gatewayRequestCount++;
@@ -2086,18 +2075,18 @@ const server = http.createServer(async (req, res) => {
       const payload = buildSetupPayload(health, buildAccountsPayload());
       return sendJson(res, payload);
     }
-    /* 登录（支持 ?profile=xxx 指定账号；多账号场景各账号独立登录） */
-    if (req.method === 'GET' && (p === '/login')) {
-      const profileName = (u.searchParams.get('profile') || 'default').trim();
+    /* 登录（支持 ?provider=deepseek|chatgpt|qwen 与 ?profile=xxx）。 */
+    if (req.method === 'GET' && p === '/login') {
+      const providerId = providerFromQuery(u.searchParams);
+      if (!providerId) return sendJson(res, { error: { message: 'unknown provider', type: 'invalid_request_error', code: 'provider_not_found' } }, 400);
+      const accountName = (u.searchParams.get('profile') || 'default').trim() || 'default';
+      const profileName = providerProfile(providerId, accountName);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#17181c;color:#ddd"><h2>DeepSeek 网页版登录（账号: ' + profileName + '）</h2><p>已打开浏览器窗口，请在其中登录 chat.deepseek.com。登录完成后会自动检测。</p><p><a href="/">返回插件管理页</a> · <a href="/login-status">查看登录状态</a> · <a href="/accounts">账号列表</a></p></body></html>');
+      res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#17181c;color:#ddd"><h2>' + getProvider(providerId).label + ' 网页版登录（账号: ' + profileName + '）</h2><p>已打开浏览器窗口，请在其中登录该提供方网站。登录完成后会自动检测。</p><p><a href="/">返回插件管理页</a> · <a href="/login-status?provider=' + providerId + '">查看登录状态</a> · <a href="/accounts">账号列表</a></p></body></html>');
       await ensureDriver();
-      poolLogin(profileName, 300000)
-        .then((r) => {
-          if (r && r.ok) poolMarkOk(profileName);
-          log('登录结果(' + profileName + '):', JSON.stringify(r).slice(0, 160));
-        })
-        .catch((e) => log('登录失败(' + profileName + '):', e.message));
+      poolLogin(profileName, 300000, providerId)
+        .then((r) => { if (r && r.ok) poolMarkOk(accountName); log('登录结果(' + providerId + '/' + profileName + '):', JSON.stringify(r).slice(0, 160)); })
+        .catch((e) => log('登录失败(' + providerId + '/' + profileName + '):', e.message));
       return;
     }
     /* 账号池管理（SPEC-v2 §5.7）：多账号保存 / 状态查看 / 启停 */
@@ -2134,10 +2123,12 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, { ok: true, removed: a.name, note: '账号已移出池。浏览器 profile 目录保留在 runtime/profiles/' + a.name + '（如需彻底删除请手动清理）' });
       } catch (e) { return sendJson(res, { ok: false, error: String(e.message || e) }); }
     }
-    if (req.method === 'GET' && (p === '/login-status')) {
+    if (req.method === 'GET' && p === '/login-status') {
+      const providerId = providerFromQuery(u.searchParams);
+      if (!providerId) return sendJson(res, { error: { message: 'unknown provider', type: 'invalid_request_error', code: 'provider_not_found' } }, 400);
       gatewayRequestCount++;
-      const st = await getLoginSnapshot();
-      return sendJson(res, { ok: true, login: st });
+      const st = await getLoginSnapshot(providerId);
+      return sendJson(res, { ok: true, providerId, login: st });
     }
     /* 校准 */
     if (p === '/calibrate/list') { let c = {}; try { c = JSON.parse(fs.readFileSync(CALIB_FILE, 'utf8')); } catch (e) { /* none */ } return sendJson(res, { ok: true, calibration: c }); }
@@ -2185,14 +2176,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  log('DeepSeek 网页版网关已监听 http://127.0.0.1:' + PORT + '/v1/');
-  log('driver: ' + DRIVER_PATH + ' | baseDir: ' + BASE_DIR);
-  log('模型: ' + Object.keys(MODELS).join(', '));
-  log('配置: headless=' + state.headless + ' maxConcurrent=' + state.maxConcurrent + ' maxTurnsPerChat=' + state.maxTurnsPerChat + ' maxPages=' + state.maxPages + '（会话亲和并发）');
-  log('账号池: ' + pool.accounts.size + ' 个账号（限流自动切换开' + (state.accountPool ? '启' : '关') + '，退避 ' + Math.round(state.quotaBackoffBaseMs / 60000) + 'min 起 ×2 封顶 ' + Math.round(state.quotaBackoffMaxMs / 3600000) + 'h）');
-  ensureDriver().catch((e) => log('driver 启动失败: ' + e.message));
-});
+// server.listen( is intentionally a test extraction boundary for legacy offline VM suites.
+if (require.main === module) {
+  server.listen(PORT, '127.0.0.1', () => {
+    log('DeepSeek 网页版网关已监听 http://127.0.0.1:' + PORT + '/v1/');
+    log('driver: ' + DRIVER_PATH + ' | baseDir: ' + BASE_DIR);
+    log('模型: ' + Object.keys(MODELS).join(', '));
+    log('配置: headless=' + state.headless + ' maxConcurrent=' + state.maxConcurrent + ' maxTurnsPerChat=' + state.maxTurnsPerChat + ' maxPages=' + state.maxPages + '（会话亲和并发）');
+    log('账号池: ' + pool.accounts.size + ' 个账号（限流自动切换开' + (state.accountPool ? '启' : '关') + '，退避 ' + Math.round(state.quotaBackoffBaseMs / 60000) + 'min 起 ×2 封顶 ' + Math.round(state.quotaBackoffMaxMs / 3600000) + 'h）');
+    ensureDriver().catch((e) => log('driver 启动失败: ' + e.message));
+  });
+  process.on('SIGINT', () => { terminating = true; if (D && D.cp) { try { D.cp.kill('SIGTERM'); } catch (e) { /* ignore */ } } process.exit(0); });
+  process.on('SIGTERM', () => { terminating = true; if (D && D.cp) { try { D.cp.kill('SIGTERM'); } catch (e) { /* ignore */ } } process.exit(0); });
+}
 
-process.on('SIGINT', () => { terminating = true; if (D && D.cp) { try { D.cp.kill('SIGTERM'); } catch (e) { /* ignore */ } } process.exit(0); });
-process.on('SIGTERM', () => { terminating = true; if (D && D.cp) { try { D.cp.kill('SIGTERM'); } catch (e) { /* ignore */ } } process.exit(0); });
+module.exports = { resolveProviderModel, profileKey, providerProfile, channelKey, providerFromQuery, driverErrorResponse, MODELS, server };

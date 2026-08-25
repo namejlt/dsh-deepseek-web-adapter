@@ -29,6 +29,7 @@ function loadGateway() {
 ;globalThis.__x = { isRuntimeContext, isNewConversation, buildContext, extractBaseline, sessionFingerprint, blockText };`;
   const sandbox = {
     require: (m) => {
+      if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },

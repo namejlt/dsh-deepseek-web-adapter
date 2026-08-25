@@ -29,14 +29,71 @@ function check(name, cond, detail) {
   else { fail++; console.log('FAIL ' + name + (detail ? ' | ' + detail : '')); }
 }
 
+/* Provider-runtime source inventory: adapters are loaded by a later driver task. */
+const PROVIDER_RUNTIME_SOURCES = [
+  'resources/provider-registry.js',
+  'resources/providers/deepseek.js',
+  'resources/providers/chatgpt.js',
+  'resources/providers/qwen.js',
+];
+const missingProviderRuntimeSources = PROVIDER_RUNTIME_SOURCES.filter((file) => !fs.existsSync(path.join(ROOT, file)));
+check('Provider runtime source inventory contains registry and all adapters',
+  missingProviderRuntimeSources.length === 0,
+  missingProviderRuntimeSources.join(', '));
+
+/* ---------- 文档契约：多站点 Beta 对外表述 ---------- */
+const DOCS = Object.fromEntries([
+  ['readmeZh', 'README.md'],
+  ['readmeEn', 'README.en.md'],
+  ['userGuide', 'docs/user-guide.md'],
+  ['publishing', 'docs/publishing.md'],
+  ['multisiteSpec', 'spec/SPEC-multisite.md'],
+  ['multisiteDesign', 'docs/superpowers/specs/2026-08-24-multisite-web-provider-design.md'],
+].map(([key, file]) => [key, fs.readFileSync(path.join(ROOT, file), 'utf8')]));
+const MULTISITE_MODEL_IDS = ['chatgpt-auto', 'chatgpt-thinking', 'qwen-chat', 'qwen-thinking', 'qwen-search'];
+const publicDocs = [DOCS.readmeZh, DOCS.readmeEn, DOCS.userGuide].join('\n');
+check('Docs identify the Beta Web-to-OpenAI multisite gateway',
+  /Beta/.test(publicDocs) && /Web-to-OpenAI|Web → OpenAI|Web-to-OpenAI/.test(publicDocs),
+  'missing Beta Web-to-OpenAI positioning');
+check('Docs list all public ChatGPT and Qwen model IDs',
+  MULTISITE_MODEL_IDS.every((id) => publicDocs.includes(id)),
+  MULTISITE_MODEL_IDS.filter((id) => !publicDocs.includes(id)).join(', '));
+check('User guide documents independent provider profiles and manual login routes',
+  /deepseek-default/.test(DOCS.userGuide) && /chatgpt-default/.test(DOCS.userGuide) && /qwen-default/.test(DOCS.userGuide)
+    && /\/login\?provider=deepseek/.test(DOCS.userGuide) && /\/login\?provider=chatgpt/.test(DOCS.userGuide) && /\/login\?provider=qwen/.test(DOCS.userGuide),
+  'missing provider profile or login route');
+check('Docs preserve the conservative text/code/SSE boundary and exclusions',
+  /text\/code\/SSE|文本.*代码.*SSE|文本、代码、基础 SSE/.test(publicDocs)
+    && /attachments|附件/.test(publicDocs) && /multimodal|多模态/.test(publicDocs)
+    && /challenge solving|挑战.*自动.*求解|挑战.*绕过/.test(publicDocs)
+    && /native artifacts|原生.*artifact|原生.*产物/.test(publicDocs),
+  'missing conservative boundary');
+check('Docs distinguish ChatGPT manual-action challenge errors from DOM errors and Qwen mode_unavailable',
+  /challenge_required/.test(DOCS.multisiteSpec) && /(provider_dom_changed|dom_unavailable)/.test(DOCS.multisiteSpec)
+    && /manual-action|手动操作|手工完成/.test(DOCS.multisiteSpec)
+    && /mode_unavailable/.test(DOCS.multisiteSpec),
+  'missing error distinction');
+check('Publishing guide requires provider tests and authenticated manual smoke tests',
+  /provider.*test|provider.*测试|测试.*provider/i.test(DOCS.publishing)
+    && /manual.*authenticated|手工.*登录|已登录.*手工|认证.*手工/i.test(DOCS.publishing),
+  'missing provider or authenticated manual smoke checklist');
+check('Multisite spec and design are implemented but pending logged-in manual acceptance',
+  /已实现|implemented/i.test(DOCS.multisiteSpec) && /待.*登录.*手工.*验收|pending.*logged-in.*manual.*acceptance/i.test(DOCS.multisiteSpec)
+    && /已实现|implemented/i.test(DOCS.multisiteDesign) && /待.*登录.*手工.*验收|pending.*logged-in.*manual.*acceptance/i.test(DOCS.multisiteDesign)
+    && /(不宣称|does not claim).*live verified/i.test(DOCS.multisiteSpec + DOCS.multisiteDesign),
+  'status must explicitly avoid a live-verification claim');
+
 /* ---------- 沙箱加载网关（截断到 server.listen 前，导出内部绑定） ---------- */
 function makeGateway(tmpBase) {
-  const cut = GW_SRC.indexOf('server.listen(');
-  if (cut < 0) throw new Error('server.listen not found');
+  const cut = GW_SRC.indexOf('if (require.main === module)');
+  if (cut < 0) throw new Error('gateway main guard not found');
+  /* Exclude the require.main startup guard so the VM loads handlers without
+   * evaluating module or binding a TCP port. */
   const code = GW_SRC.slice(0, cut) + `
 ;globalThis.__x = { handleChatCompletion, buildToolsText, buildHealthPayload, sessions, state, pool, poolAdd, poolMarkOk, poolMarkQuota };`;
   const sandbox = {
     require: (m) => {
+      if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry.js'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },
