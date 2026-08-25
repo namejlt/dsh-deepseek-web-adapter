@@ -182,7 +182,39 @@ const PAYLOAD_DELTA_ASSISTANT_TAIL = {
   ],
 };
 
+/* DSH 首轮完成后会额外发起标题生成。该任务是结构化且不需要浏览器模型，
+ * 必须在网关本地结束，避免并发 streamAsk 打开第二个网页 tab。 */
+const PAYLOAD_SESSION_TITLE = {
+  model: 'deepseek-chat', stream: false,
+  messages: [
+    { role: 'system', content: 'Create a concise title for an AI coding-assistant session from the supplied human messages. Return only the title on one line, in plain text of natural language, with no quotes, prefix, explanation, Markdown, XML, or terminal control codes. No code is allowed. Use the language of the messages.' },
+    { role: 'user', content: 'Generate the session title from this JSON array of human messages:\n[{"seq":7,"text":"1+1="}]' },
+  ],
+};
+
 (async () => {
+  /* ========== T. DSH 会话标题本地完成（不启动网页流） ========== */
+  console.log('== T. DSH 会话标题本地完成 ==');
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-cp-title-'));
+    const gw = makeGateway(tmp);
+    const { calls } = makeRpcMock(gw, []);
+    const res = makeResMock();
+    await gw.handleChatCompletion({}, res, PAYLOAD_SESSION_TITLE);
+    let obj = null; try { obj = JSON.parse(sseText(res)); } catch (e) { /* assertion reports body */ }
+    check('T1 标题请求不调用 driver streamAsk', calls.filter((c) => c.method === 'streamAsk').length === 0, JSON.stringify(calls));
+    check('T2 标题请求返回本地单行标题', obj && obj.choices && obj.choices[0].message.content === '计算 1+1', sseText(res));
+
+    const streamRes = makeResMock();
+    await gw.handleChatCompletion({}, streamRes, Object.assign({}, PAYLOAD_SESSION_TITLE, { stream: true }));
+    const streamEvents = parseSseEvents(streamRes);
+    const streamText = streamEvents.filter((e) => e.json && e.json.choices[0].delta.content).map((e) => e.json.choices[0].delta.content).join('');
+    const streamFinish = streamEvents.filter((e) => e.json && e.json.choices[0].finish_reason).map((e) => e.json.choices[0].finish_reason);
+    check('T3 流式标题请求同样不调用 driver streamAsk', calls.filter((c) => c.method === 'streamAsk').length === 0, JSON.stringify(calls));
+    check('T4 流式标题请求正常 content/stop/[DONE] 收尾', streamText === '计算 1+1' && streamFinish.length === 1 && streamFinish[0] === 'stop' && streamEvents[streamEvents.length - 1].done === true && streamRes.ended === true, JSON.stringify(streamEvents));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
   /* ========== A. SSE 流悬挂修复（headersSent 守卫） ========== */
   console.log('== A. SSE 流悬挂修复（headersSent 守卫） ==');
   {

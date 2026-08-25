@@ -1111,6 +1111,66 @@ function validateChatPayload(payload, allowWorkBuddy) {
   }
   return null;
 }
+
+
+/* DSH requests a title immediately after a new coding session receives its first
+ * answer. Its prompt carries a JSON array of human messages and is deterministic
+ * enough to handle locally. Do not route it to the web page: doing so creates a
+ * second concurrent browser tab and keeps the client activity indicator alive. */
+function sessionTitleSourceTexts(payload) {
+  const msgs = (payload && payload.messages) || [];
+  const instructions = msgs
+    .filter((m) => m && (m.role === 'system' || m.role === 'developer'))
+    .map((m) => blockText(m.content))
+    .join('\n');
+  if (!/create\s+a\s+concise\s+title\s+for\s+an\s+ai\s+coding-assistant\s+session/i.test(instructions)) return null;
+  if (!/return\s+only\s+the\s+title/i.test(instructions)) return null;
+  const prefix = 'Generate the session title from this JSON array of human messages:';
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m || m.role !== 'user') continue;
+    const text = blockText(m.content);
+    const at = text.indexOf(prefix);
+    if (at < 0) continue;
+    try {
+      const values = JSON.parse(text.slice(at + prefix.length).trim());
+      if (!Array.isArray(values)) return null;
+      const source = values.map((value) => value && typeof value.text === 'string' ? value.text.trim() : '').filter(Boolean);
+      return source.length ? source : null;
+    } catch (e) { return null; }
+  }
+  return null;
+}
+
+function makeSessionTitle(sourceTexts) {
+  const raw = String((sourceTexts && sourceTexts[sourceTexts.length - 1]) || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!raw) return '新会话';
+  const math = raw.match(/^\s*([\d][\d\s()+\-*/×÷.=？?]*)\s*$/);
+  if (math) {
+    const expression = math[1].replace(/[=？?]+$/, '').trim();
+    return expression ? '计算 ' + expression : '计算问题';
+  }
+  if (/[\u3400-\u9fff]/.test(raw)) return raw.slice(0, 16).replace(/[，。；：、\s]+$/, '') || '新会话';
+  const words = raw.replace(/[^\w\s'-]/g, ' ').trim().split(/\s+/).filter(Boolean);
+  return (words.slice(0, 5).join(' ') || 'New session').slice(0, 80);
+}
+
+function sendLocalTitleCompletion(res, model, cid, created, wantStream, title) {
+  if (wantStream) {
+    sseHeaders(res);
+    sseChunk(res, { id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+    sseChunk(res, { id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: title }, finish_reason: null }] });
+    sseChunk(res, { id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+    res.write('data: [DONE]\n\n');
+    res.end();
+    return;
+  }
+  sendJson(res, {
+    id: cid, object: 'chat.completion', created, model,
+    choices: [{ index: 0, message: { role: 'assistant', content: title }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  });
+}
 /**
  * 处理 /v1/chat/completions（网关主流程，OpenAI 兼容契约的唯一实现点）。
  * 流程：会话识别 → 会话锁/信号量 → 账号调度 → askOnce 循环
@@ -1136,6 +1196,8 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
   const cid = 'chatcmpl-' + created;
   /* OpenAI 兼容：stream=false → 完整 JSON 响应（旧实现一律 SSE，非流式客户端解析必炸） */
   const wantStream = payload.stream !== false;
+  const titleSource = sessionTitleSourceTexts(payload);
+  if (titleSource) return sendLocalTitleCompletion(res, model, cid, created, wantStream, makeSessionTitle(titleSource));
   const sendChunk = (obj) => sseChunk(res, obj);
   /* 输出抽象：流式边收集边推送；非流式只收集，最后一次性 JSON 返回 */
   const out = { text: '', tools: [] };
