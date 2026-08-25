@@ -34,6 +34,22 @@ module.exports = {
       const enabled = (element) => !!element && !element.disabled && !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true';
       const composer = findComposer();
       const form = composer && composer.closest ? composer.closest('form') : null;
+      const preferredSelectors = [
+        '#composer-submit-button',
+        'button[data-testid="send-button"]',
+        'button[aria-label*="发送提示"]',
+        'button[aria-label*="Send prompt" i]',
+      ];
+      const findPreferred = (root) => {
+        if (!root) return null;
+        for (const selector of preferredSelectors) {
+          const match = Array.from(root.querySelectorAll(selector)).find((button) => isVisible(button) && enabled(button));
+          if (match) return match;
+        }
+        return null;
+      };
+      const preferred = findPreferred(form) || findPreferred(document);
+      if (preferred) { preferred.click(); return true; }
       if (!form) return false;
       const submit = Array.from(form.querySelectorAll('button[type="submit"]')).find((button) => isVisible(button) && enabled(button));
       const fallback = submit || Array.from(form.querySelectorAll('button')).find((button) => isVisible(button) && enabled(button));
@@ -137,8 +153,23 @@ module.exports = {
     openNewChat: `(() => { location.href = 'https://chatgpt.com/'; return true; })()`,
 
     applyMode: `((options) => {
-      if (options && options.thinking === true) return { ok: false, kind: 'mode_unavailable', mode: 'thinking' };
+      const isVisible = (element) => {
+        if (!element || element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
+        const style = typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
+        return !(style && (style.display === 'none' || style.visibility === 'hidden'));
+      };
+      const enabled = (element) => !!element && !element.disabled && !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true';
       if (options && options.search === true) return { ok: false, kind: 'mode_unavailable', mode: 'search' };
+      if (!options || !Object.prototype.hasOwnProperty.call(options, 'thinking')) return { ok: true };
+      const controls = Array.from(document.querySelectorAll('button[aria-pressed], [role="button"][aria-pressed]')).filter((element) => isVisible(element) && enabled(element));
+      const label = (element) => String(element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || element.textContent || '').toLowerCase();
+      const pill = controls.find((element) => /thinking|think|reasoning|思考|深度思考|推理/.test(label(element))) || null;
+      if (!pill) return { ok: false, kind: 'mode_unavailable', mode: 'thinking' };
+      const desired = !!options.thinking;
+      const current = String(pill.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+      if (current !== desired) pill.click();
+      const after = String(pill.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+      if (after !== desired) return { ok: false, kind: 'mode_unavailable', mode: 'thinking' };
       return { ok: true };
     })`,
   },

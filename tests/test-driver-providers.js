@@ -28,6 +28,19 @@ check('passive provider inspection never switches profiles or reuses another pro
   assert(/else if \(!pid\) \{[\s\S]*?await ensurePage/.test(source));
 });
 
+check('skips treating the previous adapter answer as a new reply', () => {
+  assert.strictEqual(typeof driver.shouldSkipAdapterBaseline, 'function');
+  assert.strictEqual(driver.shouldSkipAdapterBaseline('old response', 'old response', false), true);
+  assert.strictEqual(driver.shouldSkipAdapterBaseline('new response', 'old response', false), false);
+});
+
+check('computes the first adapter delta against the pre-send baseline', () => {
+  assert.strictEqual(typeof driver.computeAdapterDelta, 'function');
+  assert.strictEqual(driver.computeAdapterDelta('old response', '', 'old response', false), '');
+  assert.strictEqual(driver.computeAdapterDelta('old response\nnew line', '', 'old response', false), '\nnew line');
+  assert.strictEqual(driver.computeAdapterDelta('brand new', '', 'old response', false), 'brand new');
+});
+
 check('exports pure provider identity helpers', () => {
   assert.strictEqual(typeof driver.profileKey, 'function');
   assert.strictEqual(typeof driver.channelKey, 'function');

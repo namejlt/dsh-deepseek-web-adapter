@@ -2974,6 +2974,20 @@ function shouldFinishAdapterResponse({ sawText, generating, lastChangeAt, now })
   return (!generating && stableFor >= 1200) || stableFor >= 5000;
 }
 
+function shouldSkipAdapterBaseline(text, baselineText, sawText) {
+  if (sawText) return false;
+  return String(text || '') === String(baselineText || '');
+}
+
+function computeAdapterDelta(text, lastText, baselineText, sawText) {
+  const current = String(text || '');
+  const previous = String(lastText || '');
+  const baseline = String(baselineText || '');
+  if (!current) return '';
+  if (!sawText) return baseline && current.startsWith(baseline) ? current.slice(baseline.length) : current;
+  return previous && current.startsWith(previous) ? current.slice(previous.length) : current;
+}
+
 async function waitForAdapterComposer(pageId, adapter, timeoutMs) {
   const start = Date.now();
   for (;;) {
@@ -3011,6 +3025,11 @@ async function streamAdapterAsk(params, adapter, profile) {
         await openAdapterNewChat(pageId, adapter);
         await waitForAdapterComposer(pageId, adapter, 15000);
       }
+      let baselineText = '';
+      try {
+        const before = await evalJs(pageId, adapter.expressions.extractLatest).catch(() => null);
+        baselineText = before && typeof before.text === 'string' ? before.text : '';
+      } catch (e) { /* ignore */ }
       const model = (params && params.model) || {};
       const mode = await evalJs(pageId, '(' + adapter.expressions.applyMode + ')(' + JSON.stringify({
         thinking: model.mode === 'thinking' || model.thinking === true,
@@ -3030,11 +3049,15 @@ async function streamAdapterAsk(params, adapter, profile) {
         if (!latest || typeof latest.text !== 'string') throw providerError('dom_unavailable', adapter.id + ' response DOM unavailable');
         const text = latest.text;
         if (text && text !== lastText) {
-          const delta = text.startsWith(lastText) ? text.slice(lastText.length) : text;
-          if (delta) emitEvent('stream-delta', { streamId, delta });
-          lastText = text;
-          lastChange = Date.now();
-          sawText = true;
+          if (shouldSkipAdapterBaseline(text, baselineText, sawText)) {
+            lastText = text;
+          } else {
+            const delta = computeAdapterDelta(text, lastText, baselineText, sawText);
+            if (delta) emitEvent('stream-delta', { streamId, delta });
+            lastText = text;
+            lastChange = Date.now();
+            sawText = true;
+          }
         }
         const generating = await evalJs(pageId, adapter.expressions.detectGenerating).catch(() => true);
         if (shouldFinishAdapterResponse({ sawText, generating, lastChangeAt: lastChange, now: Date.now() })) break;
@@ -3945,4 +3968,4 @@ if (IS_MAIN) {
   emitEvent('ready', { version: VERSION, baseDir: CFG.baseDir, pid: process.pid });
 }
 
-module.exports = { profileKey, channelKey, resolveProviderAdapter, providerUrl, ProviderDriverError, shouldFinishAdapterResponse };
+module.exports = { profileKey, channelKey, resolveProviderAdapter, providerUrl, ProviderDriverError, shouldFinishAdapterResponse, shouldSkipAdapterBaseline, computeAdapterDelta };

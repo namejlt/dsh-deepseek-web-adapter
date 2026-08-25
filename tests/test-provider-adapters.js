@@ -227,6 +227,17 @@ check('ChatGPT send lookup stays inside the composer form and prefers submit', (
   assert.strictEqual(composer.closest('form'), form);
 });
 
+check('ChatGPT clicks the current composer submit button by id and data-testid', () => {
+  const form = new FakeElement('form', { attributes: { 'data-testid': 'prompt-form' } });
+  form.append(new FakeElement('div', { attributes: { id: 'prompt-textarea', contenteditable: 'true', role: 'textbox' } }));
+  const send = form.append(button({ attributes: { id: 'composer-submit-button', 'data-testid': 'send-button', 'aria-label': '发送提示' } }));
+  const fallback = form.append(button());
+  const document = makeDocument(form);
+  assert.strictEqual(run(chatgpt, 'clickSend', document).result, true);
+  assert.strictEqual(send.clicks, 1);
+  assert.strictEqual(fallback.clicks, 0);
+});
+
 check('ChatGPT composer helpers ignore a preceding unrelated textarea form', () => {
   const decoyForm = new FakeElement('form', { attributes: { 'aria-label': 'Newsletter signup' } });
   const decoyComposer = decoyForm.append(new FakeTextarea());
@@ -299,10 +310,28 @@ check('ChatGPT extracts only the latest assistant response without duplicate cod
   });
 });
 
-check('ChatGPT refuses to claim an unreliable thinking-mode toggle succeeded', () => {
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(run(chatgpt, 'applyMode', makeDocument(), { thinking: true }).result)), {
-    ok: false, kind: 'mode_unavailable', mode: 'thinking',
+check('ChatGPT toggles its visible thinking pill when requested', () => {
+  const pill = button({
+    text: '思考',
+    attributes: { 'aria-pressed': 'false' },
+    onClick: (element) => element.setAttribute('aria-pressed', 'true'),
   });
+  const out = run(chatgpt, 'applyMode', makeDocument(pill), { thinking: true }).result;
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(out)), { ok: true });
+  assert.strictEqual(pill.clicks, 1);
+  assert.strictEqual(pill.getAttribute('aria-pressed'), 'true');
+});
+
+check('ChatGPT can also turn its thinking pill back off', () => {
+  const pill = button({
+    text: 'Thinking',
+    attributes: { 'aria-pressed': 'true' },
+    onClick: (element) => element.setAttribute('aria-pressed', 'false'),
+  });
+  const out = run(chatgpt, 'applyMode', makeDocument(pill), { thinking: false }).result;
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(out)), { ok: true });
+  assert.strictEqual(pill.clicks, 1);
+  assert.strictEqual(pill.getAttribute('aria-pressed'), 'false');
 });
 
 check('Qwen recognizes and fills a visible contenteditable composer', () => {
