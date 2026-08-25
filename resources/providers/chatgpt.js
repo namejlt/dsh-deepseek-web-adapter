@@ -167,10 +167,12 @@ module.exports = {
       if (!pill) return { ok: false, kind: 'mode_unavailable', mode: 'thinking' };
       const desired = !!options.thinking;
       const current = String(pill.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
-      if (current !== desired) pill.click();
+      if (current === desired) return { ok: true };
+      /* ChatGPT may update aria-pressed on the next UI tick after a successful click.
+       * Do not fail synchronously if we located the correct pill and triggered it. */
+      pill.click();
       const after = String(pill.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
-      if (after !== desired) return { ok: false, kind: 'mode_unavailable', mode: 'thinking' };
-      return { ok: true };
+      return after === desired ? { ok: true } : { ok: true, pending: true };
     })`,
   },
 };

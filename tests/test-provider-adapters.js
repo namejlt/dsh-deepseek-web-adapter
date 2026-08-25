@@ -334,6 +334,18 @@ check('ChatGPT can also turn its thinking pill back off', () => {
   assert.strictEqual(pill.getAttribute('aria-pressed'), 'false');
 });
 
+check('ChatGPT accepts a thinking pill whose aria state updates asynchronously after click', () => {
+  const pill = button({
+    text: '思考',
+    attributes: { 'aria-pressed': 'false' },
+    onClick: () => {},
+  });
+  const out = run(chatgpt, 'applyMode', makeDocument(pill), { thinking: true }).result;
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(out)), { ok: true, pending: true });
+  assert.strictEqual(pill.clicks, 1);
+  assert.strictEqual(pill.getAttribute('aria-pressed'), 'false');
+});
+
 check('Qwen recognizes and fills a visible contenteditable composer', () => {
   const composer = new FakeElement('div', { attributes: { contenteditable: 'true', role: 'textbox', 'data-placeholder': '请输入问题' } });
   const sendWrap = new FakeElement('div', { className: 'chat-prompt-send-button' });
