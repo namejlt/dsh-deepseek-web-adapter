@@ -161,17 +161,27 @@ module.exports = {
       const enabled = (element) => !!element && !element.disabled && !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true';
       if (options && options.search === true) return { ok: false, kind: 'mode_unavailable', mode: 'search' };
       if (!options || !Object.prototype.hasOwnProperty.call(options, 'thinking')) return { ok: true };
-      const controls = Array.from(document.querySelectorAll('button[aria-pressed], [role="button"][aria-pressed]')).filter((element) => isVisible(element) && enabled(element));
-      const label = (element) => String(element.getAttribute('aria-label') || element.getAttribute('title') || element.innerText || element.textContent || '').toLowerCase();
-      const pill = controls.find((element) => /thinking|think|reasoning|思考|深度思考|推理/.test(label(element))) || null;
+      const controls = Array.from(document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="option"], [role="checkbox"], [role="switch"], input[type="checkbox"], input[type="switch"]')).filter((element) => isVisible(element) && enabled(element));
+      const label = (element) => String(element.getAttribute('aria-label') || element.getAttribute('title') || element.getAttribute('data-testid') || element.innerText || element.textContent || '').toLowerCase();
+      const state = (element) => {
+        if (typeof element.checked === 'boolean') return element.checked;
+        const raw = String(element.getAttribute('aria-pressed') || element.getAttribute('aria-selected') || element.getAttribute('aria-checked') || element.getAttribute('data-state') || element.className || '').toLowerCase();
+        if (/^(true|on|active|selected|checked|pressed)$/.test(raw)) return true;
+        if (/^(false|off|inactive|unselected|unchecked|unpressed)$/.test(raw)) return false;
+        if (/\b(active|selected|checked|pressed)\b/.test(raw)) return true;
+        return null;
+      };
+      const pill = controls.find((element) => /thinking|think|reasoning|reason|深度思考|思考|推理/.test(label(element))) || null;
       if (!pill) return { ok: false, kind: 'mode_unavailable', mode: 'thinking' };
       const desired = !!options.thinking;
-      const current = String(pill.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+      const current = state(pill);
       if (current === desired) return { ok: true };
-      /* ChatGPT may update aria-pressed on the next UI tick after a successful click.
-       * Do not fail synchronously if we located the correct pill and triggered it. */
       pill.click();
-      const after = String(pill.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+      const after = state(pill);
+      /* Some ChatGPT UI versions re-render the control asynchronously, so a freshly
+       * toggled control may not reflect its new state until the next UI tick. Report
+       * success once the correct control was found and clicked rather than failing
+       * hard on a stale DOM read. */
       return after === desired ? { ok: true } : { ok: true, pending: true };
     })`,
   },
