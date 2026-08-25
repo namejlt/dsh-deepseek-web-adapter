@@ -200,6 +200,19 @@ check('ChatGPT finds the visible semantic composer and fills it via input event'
   assert.strictEqual(composer.events[0].type, 'input');
 });
 
+check('ChatGPT recognizes and fills its current contenteditable prompt', () => {
+  const form = new FakeElement('form', { attributes: { 'data-testid': 'prompt-form' } });
+  const composer = form.append(new FakeElement('div', { attributes: { id: 'prompt-textarea', contenteditable: 'true', role: 'textbox' } }));
+  const submit = form.append(button({ attributes: { type: 'submit' } }));
+  const document = makeDocument(form);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(run(chatgpt, 'findComposer', document).result)), { found: true });
+  assert.strictEqual(run(chatgpt, 'fillPrompt', document, 'hello editable ChatGPT').result, true);
+  assert.strictEqual(composer.textContent, 'hello editable ChatGPT');
+  assert.strictEqual(composer.events[0].type, 'input');
+  assert.strictEqual(run(chatgpt, 'clickSend', document).result, true);
+  assert.strictEqual(submit.clicks, 1);
+});
+
 check('ChatGPT send lookup stays inside the composer form and prefers submit', () => {
   const form = new FakeElement('form', { attributes: { 'data-testid': 'prompt-form' } });
   const composer = form.append(new FakeTextarea());
@@ -250,6 +263,11 @@ check('ChatGPT uses prompt-textarea fallback without touching an unrelated texta
   assert.strictEqual(decoySend.clicks, 0);
 });
 
+check('ChatGPT ignores a hidden sign-in control when deciding authenticated state', () => {
+  const hiddenLogin = button({ text: 'Sign in', hidden: true });
+  assert.strictEqual(run(chatgpt, 'detectLogin', makeDocument(hiddenLogin)).result, false);
+});
+
 check('ChatGPT distinguishes sign-in UI from Turnstile challenge UI', () => {
   const login = makeDocument(button({ text: 'Sign in' }));
   assert.strictEqual(run(chatgpt, 'detectLogin', login).result, true);
@@ -285,6 +303,19 @@ check('ChatGPT refuses to claim an unreliable thinking-mode toggle succeeded', (
   assert.deepStrictEqual(JSON.parse(JSON.stringify(run(chatgpt, 'applyMode', makeDocument(), { thinking: true }).result)), {
     ok: false, kind: 'mode_unavailable', mode: 'thinking',
   });
+});
+
+check('Qwen recognizes and fills a visible contenteditable composer', () => {
+  const composer = new FakeElement('div', { attributes: { contenteditable: 'true', role: 'textbox', 'data-placeholder': '请输入问题' } });
+  const sendWrap = new FakeElement('div', { className: 'chat-prompt-send-button' });
+  const send = sendWrap.append(button({ className: 'send-button', attributes: { 'aria-label': '发送' } }));
+  const document = makeDocument(composer, sendWrap);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(run(qwen, 'findComposer', document).result)), { found: true });
+  assert.strictEqual(run(qwen, 'fillPrompt', document, '你好 Qwen').result, true);
+  assert.strictEqual(composer.textContent, '你好 Qwen');
+  assert.strictEqual(composer.events[0].type, 'input');
+  assert.strictEqual(run(qwen, 'clickSend', document).result, true);
+  assert.strictEqual(send.clicks, 1);
 });
 
 check('Qwen prefers its current composer and exact send selector', () => {
@@ -337,6 +368,11 @@ check('Qwen configures visible thinking only after the control reports enabled',
 check('Qwen explicitly rejects unavailable search rather than silently using another mode', () => {
   const out = run(qwen, 'applyMode', makeDocument(), { search: true }).result;
   assert.deepStrictEqual(JSON.parse(JSON.stringify(out)), { ok: false, kind: 'mode_unavailable', mode: 'search' });
+});
+
+check('Qwen ignores a hidden login control when deciding authenticated state', () => {
+  const hiddenLogin = button({ text: '登录', hidden: true });
+  assert.strictEqual(run(qwen, 'detectLogin', makeDocument(hiddenLogin)).result, false);
 });
 
 check('Qwen detects rate-limit copy', () => {

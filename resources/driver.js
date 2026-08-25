@@ -2393,7 +2393,9 @@ handlers.inspect = async (params) => {
   const providerId = (params && params.providerId) || 'deepseek';
   const adapter = resolveProviderAdapter(providerId);
   const taskPage = params && params.taskId ? (tasks.get(params.taskId) || {}).pageId : null;
-  const pid = taskPage || ([...browser.pages.keys()][0]) || await ensurePage({ name: profileKey(adapter.id, params && params.profile), headless: true }, adapter.id);
+  /* A generic first tab may belong to another provider/profile. For provider status,
+   * always create/reuse the page bound to the requested provider profile. */
+  const pid = taskPage || await ensurePage({ name: profileKey(adapter.id, params && params.profile), headless: true }, adapter.id);
   const info = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.domDebug) : { url: providerUrl(adapter.id), providerId: adapter.id };
   const buttons = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.buttons) : [];
   const login = await ensureLoggedIn(pid, adapter.id);
@@ -2948,6 +2950,20 @@ function shouldFinishAdapterResponse({ sawText, generating, lastChangeAt, now })
   return (!generating && stableFor >= 1200) || stableFor >= 5000;
 }
 
+async function waitForAdapterComposer(pageId, adapter, timeoutMs) {
+  const start = Date.now();
+  for (;;) {
+    const login = await ensureLoggedIn(pageId, adapter.id);
+    if (login.challenge) throw providerError('challenge_required', adapter.id + ' requires a browser challenge to be completed');
+    if (login.needsLogin) throw providerError('login_required', adapter.id + ' login required');
+    if (login.hasChatInput) return login;
+    if (Date.now() - start >= timeoutMs) {
+      throw providerError('dom_unavailable', adapter.id + ' composer not found on an authenticated page');
+    }
+    await sleep(500);
+  }
+}
+
 async function streamAdapterAsk(params, adapter, profile) {
   const streamId = 's' + (++streamSeqs.n);
   const hasChannel = !!(params && params.pageKey);
@@ -2966,10 +2982,11 @@ async function streamAdapterAsk(params, adapter, profile) {
   streamStates.set(streamId, state);
   (async () => {
     try {
-      const login = await ensureLoggedIn(pageId, adapter.id);
-      if (login.challenge) throw providerError('challenge_required', adapter.id + ' requires a browser challenge to be completed');
-      if (login.needsLogin || !login.hasChatInput) throw providerError('login_required', adapter.id + ' login required');
-      if (params && params.reset === true) await openAdapterNewChat(pageId, adapter);
+      await waitForAdapterComposer(pageId, adapter, 15000);
+      if (params && params.reset === true) {
+        await openAdapterNewChat(pageId, adapter);
+        await waitForAdapterComposer(pageId, adapter, 15000);
+      }
       const model = (params && params.model) || {};
       const mode = await evalJs(pageId, '(' + adapter.expressions.applyMode + ')(' + JSON.stringify({
         thinking: model.mode === 'thinking' || model.thinking === true,

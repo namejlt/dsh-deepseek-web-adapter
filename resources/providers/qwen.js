@@ -12,9 +12,11 @@ module.exports = {
         const style = typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
         return !(style && (style.display === 'none' || style.visibility === 'hidden'));
       };
-      const composer = Array.from(document.querySelectorAll('.message-input-textarea')).find(isVisible)
-        || Array.from(document.querySelectorAll('.qwen-chat-v2-input-textarea')).find(isVisible)
-        || null;
+      const findVisible = (selector) => Array.from(document.querySelectorAll(selector)).find(isVisible) || null;
+      const composer = findVisible('.message-input-textarea')
+        || findVisible('.qwen-chat-v2-input-textarea')
+        || findVisible('textarea[placeholder*="输入"], textarea[placeholder*="问题"]')
+        || findVisible('[contenteditable="true"][role="textbox"], [contenteditable="true"][data-placeholder*="输入"]');
       return { found: !!composer };
     })()`,
 
@@ -38,12 +40,31 @@ module.exports = {
         const style = typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
         return !(style && (style.display === 'none' || style.visibility === 'hidden'));
       };
-      const composer = Array.from(document.querySelectorAll('.message-input-textarea')).find(isVisible)
-        || Array.from(document.querySelectorAll('.qwen-chat-v2-input-textarea')).find(isVisible);
+      const findVisible = (selector) => Array.from(document.querySelectorAll(selector)).find(isVisible) || null;
+      const composer = findVisible('.message-input-textarea')
+        || findVisible('.qwen-chat-v2-input-textarea')
+        || findVisible('textarea[placeholder*="输入"], textarea[placeholder*="问题"]')
+        || findVisible('[contenteditable="true"][role="textbox"], [contenteditable="true"][data-placeholder*="输入"]');
       if (!composer) return false;
-      const descriptor = typeof HTMLTextAreaElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
-      if (descriptor && typeof descriptor.set === 'function') descriptor.set.call(composer, String(text));
-      else composer.value = String(text);
+      const value = String(text);
+      const contenteditable = composer.getAttribute('contenteditable') === 'true';
+      if (contenteditable) {
+        try {
+          if (typeof composer.focus === 'function') composer.focus();
+          if (document.execCommand) {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, value);
+          }
+        } catch (e) { /* fall through to DOM text assignment */ }
+        if (String(composer.innerText || composer.textContent || '') !== value) {
+          composer.textContent = value;
+          if ('innerText' in composer) composer.innerText = value;
+        }
+      } else {
+        const descriptor = typeof HTMLTextAreaElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+        if (descriptor && typeof descriptor.set === 'function') descriptor.set.call(composer, value);
+        else composer.value = value;
+      }
       composer.dispatchEvent(new Event('input', { bubbles: true }));
       return true;
     })`,
@@ -71,7 +92,12 @@ module.exports = {
     detectLogin: `(() => {
       const path = String(location.pathname || '').toLowerCase();
       if (/(login|sign-in|signin|auth|account)/.test(path)) return true;
-      return Array.from(document.querySelectorAll('button, a, [role="button"]')).some((element) => /sign\\s*in|log\\s*in|登录/.test(String(element.innerText || element.textContent || element.getAttribute('aria-label') || '').toLowerCase()));
+      const isVisible = (element) => {
+        if (!element || element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
+        const style = typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
+        return !(style && (style.display === 'none' || style.visibility === 'hidden'));
+      };
+      return Array.from(document.querySelectorAll('button, a, [role="button"]')).some((element) => isVisible(element) && /sign\\s*in|log\\s*in|登录/.test(String(element.innerText || element.textContent || element.getAttribute('aria-label') || '').toLowerCase()));
     })()`,
 
     detectChallenge: `(() => {

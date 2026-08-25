@@ -7,12 +7,13 @@ const composerLookup = `
     return !(style && (style.display === 'none' || style.visibility === 'hidden'));
   };
   const findComposer = () => {
+    const withinComposerForm = 'textarea, #prompt-textarea[contenteditable="true"], [contenteditable="true"][data-testid*="prompt"], [contenteditable="true"][role="textbox"]';
     const forms = Array.from(document.querySelectorAll('form[data-testid="prompt-form"], form[data-testid*="composer"], form[aria-label*="message"], form[aria-label*="Message"], form[aria-label*="composer"], form[aria-label*="Composer"]')).filter(isVisible);
     for (const form of forms) {
-      const textarea = Array.from(form.querySelectorAll('textarea')).find(isVisible);
-      if (textarea) return textarea;
+      const composer = Array.from(form.querySelectorAll(withinComposerForm)).find(isVisible);
+      if (composer) return composer;
     }
-    return Array.from(document.querySelectorAll('textarea#prompt-textarea')).find(isVisible) || null;
+    return Array.from(document.querySelectorAll('textarea#prompt-textarea, #prompt-textarea[contenteditable="true"], [contenteditable="true"][data-testid*="prompt"]')).find(isVisible) || null;
   };
 `;
 
@@ -44,9 +45,25 @@ module.exports = {
     fillPrompt: `((text) => {${composerLookup}
       const composer = findComposer();
       if (!composer) return false;
-      const descriptor = typeof HTMLTextAreaElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
-      if (descriptor && typeof descriptor.set === 'function') descriptor.set.call(composer, String(text));
-      else composer.value = String(text);
+      const value = String(text);
+      const contenteditable = composer.getAttribute('contenteditable') === 'true';
+      if (contenteditable) {
+        try {
+          if (typeof composer.focus === 'function') composer.focus();
+          if (document.execCommand) {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('insertText', false, value);
+          }
+        } catch (e) { /* fall through to DOM text assignment */ }
+        if (String(composer.innerText || composer.textContent || '') !== value) {
+          composer.textContent = value;
+          if ('innerText' in composer) composer.innerText = value;
+        }
+      } else {
+        const descriptor = typeof HTMLTextAreaElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+        if (descriptor && typeof descriptor.set === 'function') descriptor.set.call(composer, value);
+        else composer.value = value;
+      }
       composer.dispatchEvent(new Event('input', { bubbles: true }));
       return true;
     })`,
@@ -82,9 +99,14 @@ module.exports = {
         || Array.from(document.querySelectorAll('body, main, article, div, p, span')).some((element) => /turnstile|security verification|verify you are human|captcha/.test(String(element.innerText || element.textContent || '').toLowerCase()));
       if (challenge) return false;
       if (/(login|sign-in|signin|auth|account)/.test(path)) return true;
+      const isVisible = (element) => {
+        if (!element || element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
+        const style = typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
+        return !(style && (style.display === 'none' || style.visibility === 'hidden'));
+      };
       return Array.from(document.querySelectorAll('button, a, [role="button"]')).some((element) => {
         const text = String(element.innerText || element.textContent || element.getAttribute('aria-label') || '').toLowerCase();
-        return /sign\\s*in|log\\s*in|continue with/.test(text);
+        return isVisible(element) && /sign\\s*in|log\\s*in|continue with/.test(text);
       });
     })()`,
 

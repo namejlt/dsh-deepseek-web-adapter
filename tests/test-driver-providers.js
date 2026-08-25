@@ -3,6 +3,8 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const driver = require('../resources/driver');
 
 let pass = 0;
@@ -17,6 +19,12 @@ function check(name, fn) {
     console.error('FAIL ' + name + ' | ' + error.message);
   }
 }
+
+check('inspect does not reuse an arbitrary provider tab for a profile-specific login check', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'resources', 'driver.js'), 'utf8');
+  assert(!/const pid = taskPage \|\| \(\[\.\.\.browser\.pages\.keys\(\)\]\[0\]\)/.test(source));
+  assert(/const pid = taskPage \|\| await ensurePage\(\{ name: profileKey\(adapter\.id, params && params\.profile\), headless: true \}, adapter\.id\)/.test(source));
+});
 
 check('exports pure provider identity helpers', () => {
   assert.strictEqual(typeof driver.profileKey, 'function');
