@@ -24,7 +24,7 @@ function makeGateway(tmpBase) {
 ;globalThis.__x = {
   pool, state, poolAdd, poolMarkOk, poolMarkQuota,
   providerSnippet, credentialsSnippet, buildAccountsPayload,
-  buildHealthPayload, buildSetupPayload, renderManagementPage,
+  buildHealthPayload, buildProvidersPayload, buildSetupPayload, renderManagementPage,
   healthSummary, gatewayBaseURL, gatewayApiBaseURL,
 };`;
   const sandbox = {
@@ -66,25 +66,41 @@ function makeGateway(tmpBase) {
   check('2b cooling 账号带 cooldownRemainText', !!(cooling && cooling.cooldownRemainText), JSON.stringify(cooling));
   check('2c needs_login 账号带 actionHint', needsLogin && /重新登录/.test(needsLogin.actionHint || ''), JSON.stringify(needsLogin));
 
-  gw.__sandbox.rpc = async () => ({ login: { needsLogin: false } });
-  const health = await gw.buildHealthPayload();
-  check('3a health payload 含 summary', health.summary && health.summary.gateway === 'down' && health.summary.login === 'logged_in', JSON.stringify(health.summary));
-  check('3b health config 含 quotaBackoff 字段', 'quotaBackoffBaseMs' in health.config && 'quotaBackoffMaxMs' in health.config, JSON.stringify(health.config));
+  gw.__sandbox.rpc = async (method, params) => {
+    if (method !== 'inspect') return {};
+    if (params && params.providerId === 'chatgpt') return { login: { needsLogin: true, challenge: true, hasChatInput: false } };
+    return { login: { needsLogin: false, hasChatInput: true } };
+  };
+  const providers = await gw.buildProvidersPayload();
+  check('3a provider 聚合包含 DeepSeek、ChatGPT、Qwen', providers.providers.map((provider) => provider.id).join(',') === 'deepseek,chatgpt,qwen', JSON.stringify(providers));
+  const chatgpt = providers.providers.find((provider) => provider.id === 'chatgpt');
+  check('3b ChatGPT challenge 优先显示人工操作状态', chatgpt && chatgpt.status === 'challenge' && chatgpt.action.kind === 'challenge' && chatgpt.defaultProfile === 'chatgpt-default' && chatgpt.models.length === 2, JSON.stringify(chatgpt));
+  const qwen = providers.providers.find((provider) => provider.id === 'qwen');
+  check('3c Qwen 聚合含独立默认 profile 与三个模型', qwen && qwen.defaultProfile === 'qwen-default' && qwen.models.length === 3, JSON.stringify(qwen));
 
-  const setup = gw.buildSetupPayload(health, accountsPayload);
+  const health = await gw.buildHealthPayload();
+  check('3d health payload 含 summary', health.summary && health.summary.gateway === 'down' && health.summary.login === 'logged_in', JSON.stringify(health.summary));
+  check('3e health config 含 quotaBackoff 字段', 'quotaBackoffBaseMs' in health.config && 'quotaBackoffMaxMs' in health.config, JSON.stringify(health.config));
+
+  const setup = gw.buildSetupPayload(health, accountsPayload, providers);
   check('4a setup quickLinks 指向 /login', setup.setup.quickLinks && setup.setup.quickLinks.login === '/login');
-  check('4b setup checklist 含登录项且已完成', setup.setup.checklist.some((x) => x.key === 'login' && x.done === true), JSON.stringify(setup.setup.checklist));
+  check('4b setup 保留 provider 聚合', setup.providers && setup.providers.providers.length === 3, JSON.stringify(setup.providers));
   check('4c setup cards.accounts 汇总账号数', setup.cards.accounts.total === 3 && setup.cards.accounts.cooling === 1 && setup.cards.accounts.needsLogin === 1, JSON.stringify(setup.cards.accounts));
 
   const html = gw.renderManagementPage(setup);
-  check('5a 管理页标题存在', /DeepSeek 网页版插件管理/.test(html));
-  check('5b 管理页包含快速登录卡片', /快速登录/.test(html));
-  check('5c 管理页包含账户检查与管理卡片', /账户检查与管理/.test(html));
-  check('5d 管理页包含运行配置卡片', /运行配置/.test(html));
-  check('5e 管理页包含默认账号登录入口', /href="\/login"/.test(html));
-  check("5f 管理页包含 fetch('/setup') 刷新逻辑", /api\('\/setup'\)/.test(html), html.slice(html.indexOf('Promise.all'), html.indexOf('renderSetup')));
+  check('5a 管理页标题升级为 Provider 指挥台', /Web Provider Console/.test(html));
+  check('5b 管理页包含三个 provider 状态卡容器', /providerCards/.test(html) && /DeepSeek/.test(html) && /ChatGPT/.test(html) && /Qwen/.test(html));
+  check('5c 管理页包含选中 provider 详情与操作队列', /providerDetail/.test(html) && /actionQueue/.test(html));
+  check('5d 管理页 provider 登录链接携带 provider 参数', /login\?provider=/.test(html));
+  check('5e 管理页账号操作会传 provider', /provider:\s*selectedProviderId/.test(html));
+  check("5f 管理页包含 fetch('/setup') 刷新逻辑", /api\('\/setup'\)/.test(html), html.slice(html.indexOf('Promise.all'), html.indexOf('refreshAll')));
   check('5g 管理页包含 /accounts\/add 动作', /\/accounts\/add/.test(html));
-  check('5h 管理页保留未来 DSH 卡片复用说明', /未来接入 DSH 原生设置卡片/.test(html));
+  check('5h 管理页保留全局配置与诊断入口', /全局配置/.test(html) && /\/debug/.test(html));
+  check('5i 长运行快照不会挤压全局配置列', /grid-template-columns:minmax\(0,1fr\) minmax\(0,1fr\)/.test(html) && /white-space:pre-wrap/.test(html), html.slice(html.indexOf('.bottom-grid'), html.indexOf('</style>')));
+  check('5j 点击 provider 卡片内部元素也会切换详情', /closest\('\[data-select-provider\]'\)/.test(html) && /closest\('\[data-provider-action\]'\)/.test(html), html.slice(html.indexOf("document.addEventListener('click'"), html.indexOf('renderAll();')));
+  check('5k Provider 卡片为底部操作保留空间', /\.provider-card\{[^}]*padding-bottom:58px/.test(html), html.slice(html.indexOf('.provider-card{'), html.indexOf('.provider-head')));
+  check('5l Gateway ready 状态显示为在线而非等待 driver', /summary\.gateway === 'ready'/.test(html), html.slice(html.indexOf('function renderTop'), html.indexOf('function renderProviderCards')));
+  check('5m 管理页声明空 favicon 避免 404 控制台噪音', /<link rel="icon" href="data:,">/.test(html));
 
   fs.rmSync(tmp, { recursive: true, force: true });
   console.log('\n== SUMMARY ==');

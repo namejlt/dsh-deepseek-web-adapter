@@ -22,3 +22,10 @@ Thumbs.db
 
 # Local Git worktrees
 .worktrees/
+
+# Local visual brainstorming companion
+.superpowers/
+
+# Local browser QA artifacts
+.playwright-cli/
+/output/playwright/

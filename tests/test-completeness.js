@@ -77,6 +77,11 @@ check('Publishing guide requires provider tests and authenticated manual smoke t
   /provider.*test|provider.*测试|测试.*provider/i.test(DOCS.publishing)
     && /manual.*authenticated|手工.*登录|已登录.*手工|认证.*手工/i.test(DOCS.publishing),
   'missing provider or authenticated manual smoke checklist');
+check('Docs describe the Provider command center and /providers aggregate endpoint',
+  /Web Provider Console|Provider 指挥台/.test(DOCS.readmeZh + DOCS.userGuide)
+    && /\/providers/.test(DOCS.readmeZh) && /\/providers/.test(DOCS.readmeEn)
+    && /provider.*账号|账号.*provider/i.test(DOCS.userGuide),
+  'missing provider management console documentation');
 check('Multisite spec and design are implemented but pending logged-in manual acceptance',
   /已实现|implemented/i.test(DOCS.multisiteSpec) && /待.*登录.*手工.*验收|pending.*logged-in.*manual.*acceptance/i.test(DOCS.multisiteSpec)
     && /已实现|implemented/i.test(DOCS.multisiteDesign) && /待.*登录.*手工.*验收|pending.*logged-in.*manual.*acceptance/i.test(DOCS.multisiteDesign)

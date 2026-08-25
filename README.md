@@ -42,13 +42,12 @@ dsh plugin --profile web add github:你的用户名/dsh-deepseek-web-adapter
 
 插件加载后，网关自动启动（3-8 秒，日志见 DSH 终端：`DeepSeek 网页版网关已监听 5688`）。
 
-安装完成后，直接打开 `http://127.0.0.1:5688/` 进入**插件管理页**：
-- 安装与接入卡片：复制 `settings.yaml` / `.credentials.yaml` 片段
-- 快速登录卡片：默认账号登录、其它账号登录入口
-- 运行状态卡片：gateway / driver / 会话 / 通道摘要
-- 账户检查与管理卡片：账号状态、冷却、启用/禁用/删除
-- 运行配置卡片：直接调用 `/config` 管理常用参数
-- 诊断与维护卡片：`/health`、`/debug`、校准等快捷入口
+安装完成后，直接打开 `http://127.0.0.1:5688/` 进入 **Web Provider Console（Provider 指挥台）**：
+- 三张固定 provider 状态卡：DeepSeek、ChatGPT、Qwen 的默认 profile、登录/challenge、模型数量与账号池摘要
+- 选中 provider 工作区：只显示该端的模型、账号、冷却/challenge 解释和下一步操作；不会再把 ChatGPT/Qwen 操作落到 DeepSeek
+- 操作队列：按未登录、challenge、冷却、DSH 烟测、诊断顺序给出明确动作
+- 全局区：gateway / driver / 会话 / 通道摘要、全局配置与最近流快照
+- 聚合接口：`/providers` 返回三端状态、模型、默认 profile、账号摘要与建议动作；`/debug` 继续提供 DOM 诊断
 
 ## 配置 DSH 模型提供方
 
@@ -123,8 +122,10 @@ DSH 模型选择器选择 **Beta 多站点 Web-to-OpenAI**。DeepSeek 保持既�
 ```bash
 # 打开插件管理页（推荐）
 open http://127.0.0.1:5688/
-# 查看引导 JSON（供未来 DSH 设置卡片复用）
+# 查看引导 JSON（管理台的首屏聚合数据）
 curl http://127.0.0.1:5688/setup
+# 查看三端 provider 聚合状态（登录、模型、账号摘要、建议操作）
+curl http://127.0.0.1:5688/providers
 # 查看网关日志 / 状态
 curl http://127.0.0.1:5688/v1/models
 # 查看运行状态（登录态 / 会话 / 通道 / 账号池 / 配置）

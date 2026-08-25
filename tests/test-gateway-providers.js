@@ -120,6 +120,16 @@ function driverRecords() {
     assert.strictEqual(models.length, 13, 'all provider models must be advertised');
     assert.deepStrictEqual(models.map((model) => model.owned_by), models.map((model) => model.id.split('-')[0] + '-web'));
 
+    const providersResponse = await request(port, 'GET', '/providers');
+    assert.strictEqual(providersResponse.status, 200, providersResponse.text);
+    const providers = JSON.parse(providersResponse.text).providers;
+    assert.deepStrictEqual(providers.map((provider) => provider.id), ['deepseek', 'chatgpt', 'qwen']);
+    assert.strictEqual(providers.find((provider) => provider.id === 'chatgpt').defaultProfile, 'chatgpt-default');
+    assert.strictEqual(providers.find((provider) => provider.id === 'qwen').models.length, 3);
+    const setupResponse = await request(port, 'GET', '/setup');
+    assert.strictEqual(setupResponse.status, 200, setupResponse.text);
+    assert.strictEqual(JSON.parse(setupResponse.text).providers.providers.length, 3, 'setup must embed provider aggregate for one-page refresh');
+
     const beforeUnknown = driverRecords().filter((record) => record.method === 'streamAsk').length;
     const unknown = await request(port, 'POST', '/v1/chat/completions', { model: 'no-such-model', messages: [{ role: 'user', content: 'hello' }], stream: false });
     assert.strictEqual(unknown.status, 404, unknown.text);

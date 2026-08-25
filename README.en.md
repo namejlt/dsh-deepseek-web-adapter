@@ -43,7 +43,7 @@ dsh plugin --profile web add github:your-name/dsh-deepseek-web-adapter
 On load, the gateway starts automatically (3–8s; see the DSH terminal log:
 `DeepSeek 网页版网关已监听 5688`).
 
-After install, open `http://127.0.0.1:5688/` for the built-in **plugin management page** with cards for onboarding, quick login, runtime status, account management, config editing, and diagnostics.
+After install, open `http://127.0.0.1:5688/` for the built-in **Web Provider Console**: fixed DeepSeek/ChatGPT/Qwen status cards, provider-scoped login and account actions, a next-action queue for login/challenge/cooling states, global gateway configuration, and diagnostics. `GET /providers` exposes the same three-provider aggregate as JSON.
 
 ## Configure the DSH provider
 
@@ -145,7 +145,7 @@ dsh plugin --profile web remove dsh-deepseek-web-adapter && dsh plugin --profile
 | `maxPages` | 1-8 (4) | Browser channel cap (evicts the longest-idle session when full) |
 | `maxTurnsPerChat` | 2-500 (50) | Max turns per web chat (auto-migrates + summarizes beyond it) |
 | `accountPool` | bool (true) | Account-pool switch (false = always use default, v1 behavior) |
-| `maxAccounts` | 1-8 (3) | Account count cap |
+| `maxAccounts` | 1-8 (3) | Per-provider account count cap |
 | `autoRelogin` | bool (true) | Auto-open a login window on session expiry and retry |
 | `quotaBackoffBaseMs` | 60s-1h (5min) | Risk-control exponential-backoff base |
 | `quotaBackoffMaxMs` | 30min-24h (6h) | Risk-control exponential-backoff cap |
@@ -153,14 +153,15 @@ dsh plugin --profile web remove dsh-deepseek-web-adapter && dsh plugin --profile
 Account management (v2, implemented):
 
 ```bash
-curl -X POST http://127.0.0.1:5688/accounts/add -d '{"name": "acc2"}'      # add an account (opens a login window, 5-min timeout)
+curl -X POST http://127.0.0.1:5688/accounts/add -d '{"name": "acc2"}'      # add a DeepSeek account (opens a login window, 5-min timeout)
+curl -X POST http://127.0.0.1:5688/accounts/add -d '{"provider":"qwen","name":"acc2"}' # add a provider-scoped account
 curl http://127.0.0.1:5688/accounts                                        # account states (backoff / stats)
 curl -X POST http://127.0.0.1:5688/accounts/disable -d '{"name": "acc2"}'  # disable
 curl -X POST http://127.0.0.1:5688/accounts/enable -d '{"name": "acc2"}'   # enable (requires login verification to resume)
 curl -X POST http://127.0.0.1:5688/accounts/remove -d '{"name": "acc2", "confirm": true}'  # remove (profile dir kept)
 ```
 
-✅ Implemented: `GET /setup` onboarding JSON and `GET /` built-in plugin management UI (card-style HTML page).
+✅ Implemented: `GET /setup` onboarding JSON, `GET /providers` provider aggregate, and `GET /` Web Provider Console.
 
 ## Structure
 

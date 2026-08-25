@@ -211,6 +211,20 @@ curl -X POST http://127.0.0.1:5688/config -H 'Content-Type: application/json' -d
 
 ---
 
+## 5.6 Web Provider Console（5688 管理页）
+
+打开 `http://127.0.0.1:5688/` 后，首页会并列展示 DeepSeek、ChatGPT、Qwen 三张 provider 卡片。每张卡片显示默认 profile、模型数量、登录/challenge 状态与该 provider 的账号池摘要；点击卡片后，详情区只显示该 provider 的模型和账号。
+
+- ChatGPT 的 challenge 会显示“在浏览器中完成 challenge”，不会伪装成普通 DOM 错误。
+- Qwen/ChatGPT 的新增、登录、启用、禁用、删除账号操作都会发送对应的 `provider` 参数，不会误操作 DeepSeek 账号。
+- 管理页优先选择需要人工操作的 provider；没有待办时默认显示 DeepSeek。
+- `GET /providers` 返回管理页使用的三端聚合 JSON，包含 `status`、`action`、`models`、`defaultProfile`、`login` 与 provider 维度账号摘要。
+
+```bash
+curl http://127.0.0.1:5688/providers
+curl -X POST http://127.0.0.1:5688/accounts/add -d '{"provider":"qwen","name":"acc2"}'
+```
+
 ## 6. 日常运维（API 速查）
 
 网关地址 `http://127.0.0.1:5688`（端口可用环境变量 `DSWEB_PORT` 改）。

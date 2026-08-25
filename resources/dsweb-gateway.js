@@ -31,7 +31,7 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { MODELS, resolveModel, listModels, getProvider, defaultProfile } = require('./provider-registry');
+const { PROVIDERS, MODELS, resolveModel, listModels, getProvider, defaultProfile } = require('./provider-registry');
 
 /* ---------- 配置 ---------- */
 const args = process.argv.slice(2);
@@ -1681,6 +1681,56 @@ async function getLoginSnapshot(providerId) {
   } catch (e) { /* driver not ready */ }
   return st;
 }
+
+/** 归并一个 provider 的账号统计。账号池本身按 provider 隔离，管理页不能再把
+ * DeepSeek 的 active/cooling 状态错误展示给 ChatGPT 或 Qwen。 */
+function providerAccountSummary(providerId, accounts) {
+  const rows = (accounts || []).filter((account) => account.providerId === providerId);
+  return {
+    total: rows.length,
+    active: rows.filter((account) => account.state === 'active').length,
+    cooling: rows.filter((account) => account.state === 'cooling').length,
+    probing: rows.filter((account) => account.state === 'probing').length,
+    needsLogin: rows.filter((account) => account.state === 'needs_login').length,
+    disabled: rows.filter((account) => account.state === 'disabled').length,
+  };
+}
+
+/** 将可验证的网页登录和账号池状态转为前端唯一状态与下一步操作。 */
+function providerManagementState(login, accounts) {
+  if (login && login.challenge) return { status: 'challenge', action: { kind: 'challenge', label: '在浏览器中完成 challenge' } };
+  if (login && login.needsLogin) return { status: 'needs_login', action: { kind: 'login', label: '登录此 provider' } };
+  const usable = (accounts.active || 0) + (accounts.probing || 0);
+  if (!usable && accounts.total && accounts.cooling) return { status: 'cooling', action: { kind: 'wait', label: '查看恢复时间' } };
+  if (!usable && accounts.total && accounts.disabled === accounts.total) return { status: 'disabled', action: { kind: 'enable', label: '启用并重新登录' } };
+  if (login && login.hasChatInput) return { status: 'ready', action: { kind: 'manage', label: '管理此 provider' } };
+  return { status: 'unknown', action: { kind: 'refresh', label: '刷新 provider 状态' } };
+}
+
+/** 三端管理页的单一 provider 聚合契约。检查按顺序执行，避免单浏览器 driver
+ * 被并发 inspect 强制切换 profile；每个 provider 的异常也不阻断其余卡片。 */
+async function buildProvidersPayload() {
+  const accountRows = poolDescribe().accounts;
+  const providers = [];
+  for (const provider of Object.values(PROVIDERS)) {
+    const models = listModels().filter((model) => model.providerId === provider.id).map((model) => ({ id: model.id, name: model.name, mode: model.mode, thinking: !!(model.thinking || model.deepThink), search: !!model.search }));
+    const accounts = providerAccountSummary(provider.id, accountRows);
+    const login = await getLoginSnapshot(provider.id);
+    const state = providerManagementState(login, accounts);
+    providers.push({
+      id: provider.id,
+      label: provider.label,
+      siteUrl: provider.siteUrl,
+      defaultProfile: defaultProfile(provider.id),
+      models,
+      login,
+      accounts,
+      status: state.status,
+      action: state.action,
+    });
+  }
+  return { ok: true, providers, generatedAt: Date.now() };
+}
 async function getInspectSnapshot() {
   try { return await rpc('inspect', {}, 8000); } catch (e) { return null; }
 }
@@ -1708,9 +1758,10 @@ async function buildHealthPayload() {
   payload.summary = healthSummary(payload);
   return payload;
 }
-function buildSetupPayload(health, accountsPayload) {
+function buildSetupPayload(health, accountsPayload, providersPayload) {
   const accounts = (accountsPayload && accountsPayload.accounts) || [];
   const summary = (health && health.summary) || {};
+  const providers = providersPayload || { ok: true, providers: [] };
   return {
     ok: true,
     gateway: {
@@ -1719,6 +1770,7 @@ function buildSetupPayload(health, accountsPayload) {
       port: PORT,
       running: true,
     },
+    providers,
     setup: {
       providerSnippet: providerSnippet(),
       credentialsSnippet: credentialsSnippet(),
@@ -1736,6 +1788,7 @@ function buildSetupPayload(health, accountsPayload) {
         accounts: '/accounts',
         config: '/config',
         debug: '/debug',
+        providers: '/providers',
       },
     },
     cards: {
@@ -1763,305 +1816,133 @@ function sendHtml(res, html) {
   res.end(html);
 }
 function renderManagementPage(setup) {
+  const boot = JSON.stringify(setup || {}).replace(/</g, '\\u003c');
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>DeepSeek 网页版插件管理</title>
+<link rel="icon" href="data:,">
+<title>Web Provider Console · 5688</title>
 <style>
-:root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --muted:#8b949e; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --link:#58a6ff; }
-* { box-sizing:border-box; }
-body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); }
-a { color:var(--link); text-decoration:none; }
-a:hover { text-decoration:underline; }
-.wrap { max-width:1280px; margin:0 auto; padding:24px; }
-.hero { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; justify-content:space-between; margin-bottom:20px; }
-.hero h1 { margin:0 0 6px; font-size:28px; }
-.hero p { margin:0; color:var(--muted); }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
-.card { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.18); }
-.card h2 { margin:0 0 10px; font-size:18px; }
-.card h3 { margin:14px 0 8px; font-size:14px; color:var(--muted); }
-.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-.stat { display:flex; justify-content:space-between; gap:12px; border-top:1px solid rgba(255,255,255,.06); padding-top:8px; margin-top:8px; }
-.badge { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; background:#21262d; color:var(--text); border:1px solid var(--line); }
-.badge.ok { color:#aff5b4; border-color:rgba(63,185,80,.4); }
-.badge.warn { color:#f2cc60; border-color:rgba(210,153,34,.4); }
-.badge.bad { color:#ffb3ad; border-color:rgba(248,81,73,.4); }
-button, .btn, input, textarea { font:inherit; }
-button, .btn { background:#238636; color:white; border:0; padding:8px 12px; border-radius:10px; cursor:pointer; }
-button.secondary, .btn.secondary { background:#21262d; color:var(--text); border:1px solid var(--line); }
-button.warn { background:#9e6a03; }
-button.bad { background:#da3633; }
-button:disabled { opacity:.6; cursor:not-allowed; }
-pre { overflow:auto; padding:12px; border-radius:12px; background:#0b0f14; border:1px solid var(--line); }
-code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-small, .muted { color:var(--muted); }
-input[type="text"], input[type="number"] { width:100%; background:#0b0f14; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px 10px; }
-label.field { display:block; margin:8px 0; }
-label.field span { display:block; margin-bottom:6px; color:var(--muted); }
-.table { width:100%; border-collapse:collapse; }
-.table th, .table td { text-align:left; vertical-align:top; padding:8px 6px; border-top:1px solid rgba(255,255,255,.08); }
-.table th { color:var(--muted); font-weight:600; }
-.notice { padding:10px 12px; border-radius:12px; background:rgba(88,166,255,.08); border:1px solid rgba(88,166,255,.25); }
-.footer { margin-top:18px; color:var(--muted); }
+:root{color-scheme:dark;--bg:#090f1d;--panel:#111a2b;--panel2:#0d1524;--line:#283852;--text:#edf4ff;--muted:#93a4be;--blue:#5aa4ff;--purple:#c084fc;--cyan:#22d3ee;--ok:#4ade80;--warn:#fbbf24;--bad:#fb7185;--shadow:0 18px 48px rgba(0,0,0,.26)}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 14% 0,#172554 0,transparent 30%),radial-gradient(circle at 85% 0,#172554 0,transparent 26%),var(--bg);color:var(--text);font:14px/1.55 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}button{border:0;border-radius:9px;padding:8px 11px;background:#2563eb;color:#fff;cursor:pointer;font-weight:650}button:hover{filter:brightness(1.08)}button.secondary{background:#18243a;border:1px solid var(--line);color:var(--text)}button.danger{background:#be123c}.shell{max-width:1260px;margin:0 auto;padding:25px}.topbar{display:flex;gap:18px;align-items:flex-start;justify-content:space-between;margin-bottom:21px}.topbar h1{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}.subtitle{color:var(--muted);margin:0}.statusbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.pill{border:1px solid var(--line);border-radius:999px;padding:5px 9px;background:rgba(15,23,42,.75);font-size:12px}.pill.ok{border-color:rgba(74,222,128,.45);color:#bbf7d0}.pill.warn{border-color:rgba(251,191,36,.5);color:#fde68a}.pill.bad{border-color:rgba(251,113,133,.5);color:#fecdd3}.provider-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.provider-card{position:relative;min-height:165px;border:1px solid var(--line);border-radius:15px;padding:15px;padding-bottom:58px;background:linear-gradient(145deg,rgba(30,41,59,.9),rgba(11,18,32,.95));box-shadow:var(--shadow);cursor:pointer;transition:.18s transform,.18s border-color}.provider-card:hover{transform:translateY(-2px)}.provider-card.selected{outline:2px solid var(--accent);border-color:var(--accent)}.provider-card[data-provider="deepseek"]{--accent:var(--blue)}.provider-card[data-provider="chatgpt"]{--accent:var(--purple)}.provider-card[data-provider="qwen"]{--accent:var(--cyan)}.provider-head{display:flex;justify-content:space-between;gap:9px;align-items:flex-start}.provider-name{font-weight:760;font-size:16px}.provider-meta{color:var(--muted);font-size:12px}.provider-count{font-size:28px;font-weight:750;margin:13px 0 1px}.provider-card .card-action{position:absolute;bottom:13px;left:15px}.main-grid{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(280px,.78fr);gap:14px;margin-top:15px}.panel{border:1px solid var(--line);border-radius:15px;background:rgba(13,21,36,.94);box-shadow:var(--shadow);padding:16px}.panel-head{display:flex;gap:10px;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:13px}.panel h2{font-size:18px;margin:0}.panel h3{font-size:14px;margin:0 0 6px}.detail-columns{display:grid;grid-template-columns:1fr 1fr;gap:12px}.subpanel{border:1px solid rgba(40,56,82,.8);border-radius:11px;padding:12px;background:var(--panel2)}.notice{border-left:3px solid var(--warn);border-radius:7px;background:#3a2a0d;padding:9px;color:#fef3c7}.notice.challenge{border-color:var(--bad);background:#3c1421;color:#fecdd3}.notice.ok{border-color:var(--ok);background:#133320;color:#bbf7d0}.models{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.model{border:1px solid var(--line);background:#172033;border-radius:7px;padding:5px 7px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}.actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.queue{margin:0;padding-left:20px}.queue li{margin:8px 0;color:#dbeafe}.queue li.active{color:#fff;font-weight:650}.account-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:13px 0}.account-toolbar input{min-width:170px;flex:1;background:#080d18;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px 7px;border-top:1px solid rgba(40,56,82,.72);vertical-align:top}th{color:var(--muted);font-size:12px}.muted{color:var(--muted)}.empty{padding:20px 0;color:var(--muted)}.bottom-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;margin-top:15px}.bottom-grid>*{min-width:0}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.field label{display:block;color:var(--muted);font-size:12px;margin-bottom:4px}.field input,.field select{width:100%;background:#080d18;border:1px solid var(--line);color:var(--text);padding:8px;border-radius:8px}pre{max-height:290px;overflow:auto;margin:0;background:#080d18;border:1px solid var(--line);border-radius:9px;padding:10px;color:#b9c7dc;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}.hidden{display:none!important}@media(max-width:900px){.provider-grid{grid-template-columns:1fr}.main-grid,.bottom-grid{grid-template-columns:1fr}.topbar{flex-direction:column}.statusbar{justify-content:flex-start}.detail-columns{grid-template-columns:1fr}}@media(max-width:560px){.shell{padding:15px}.form-grid{grid-template-columns:1fr}.provider-card{min-height:145px}}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="hero">
-    <div>
-      <h1>DeepSeek 网页版插件管理</h1>
-      <p>安装完成后，这里就是本插件的统一管理入口：快速登录、状态检查、账户检查、配置管理与诊断。</p>
-    </div>
-    <div class="row">
-      <span id="gatewayBadge" class="badge">网关检查中</span>
-      <span id="loginBadge" class="badge">登录态检查中</span>
-      <a class="btn secondary" href="/health" target="_blank" rel="noreferrer">查看 /health JSON</a>
-    </div>
-  </div>
-  <div id="lastErrorNotice" class="notice" style="display:none; margin-bottom:16px; background:rgba(248,81,73,.10); border-color:rgba(248,81,73,.35);"></div>
+<div class="shell">
+  <header class="topbar">
+    <div><h1>Web Provider Console</h1><p class="subtitle">DeepSeek · ChatGPT · Qwen 的登录、账号池、模型能力和诊断中心</p></div>
+    <div class="statusbar"><span id="gatewayBadge" class="pill">Gateway 检查中</span><span id="runtimeBadge" class="pill">Driver 检查中</span><button id="refreshAllBtn" class="secondary">刷新全部</button><a href="/debug" target="_blank" rel="noreferrer"><button class="secondary">打开诊断</button></a></div>
+  </header>
 
-  <div class="grid">
-    <section class="card">
-      <h2>安装与接入</h2>
-      <div id="checklist" class="notice">正在读取 setup 信息…</div>
-      <h3>settings.yaml provider 片段</h3>
-      <pre><code>${htmlEscape(setup.setup.providerSnippet)}</code></pre>
-      <h3>.credentials.yaml 片段</h3>
-      <pre><code>${htmlEscape(setup.setup.credentialsSnippet)}</code></pre>
-    </section>
+  <section id="providerCards" class="provider-grid" aria-label="Provider 状态"></section>
 
-    <section class="card">
-      <h2>快速登录</h2>
-      <p id="loginHint" class="muted">正在检查登录态…</p>
-      <div class="row">
-        <a class="btn" href="/login" target="_blank" rel="noreferrer">默认账号登录</a>
-        <button class="secondary" id="loginOtherBtn">登录其它账号</button>
-        <a class="btn secondary" href="/login-status" target="_blank" rel="noreferrer">查看登录状态 JSON</a>
+  <section class="main-grid">
+    <section id="providerDetail" class="panel" aria-live="polite"></section>
+    <aside id="actionQueue" class="panel"></aside>
+  </section>
+
+  <section class="bottom-grid">
+    <section class="panel"><div class="panel-head"><h2>全局配置</h2><button id="refreshConfigBtn" class="secondary">重新读取</button></div>
+      <div class="form-grid">
+        <div class="field"><label>无头浏览器</label><select id="cfgHeadless"><option value="false">false</option><option value="true">true</option></select></div>
+        <div class="field"><label>最大并发</label><input id="cfgConcurrent" type="number" min="1" max="5"></div>
+        <div class="field"><label>最大页面数</label><input id="cfgPages" type="number" min="1" max="8"></div>
+        <div class="field"><label>单会话最大轮数</label><input id="cfgTurns" type="number" min="2" max="500"></div>
+        <div class="field"><label>账号池</label><select id="cfgAccountPool"><option value="true">true</option><option value="false">false</option></select></div>
+        <div class="field"><label>每 Provider 最大账号数</label><input id="cfgMaxAccounts" type="number" min="1" max="8"></div>
+        <div class="field"><label>自动重新登录</label><select id="cfgAutoRelogin"><option value="true">true</option><option value="false">false</option></select></div>
+        <div class="field"><label>退避起点（ms）</label><input id="cfgBackoffBase" type="number" min="60000"></div>
+        <div class="field"><label>退避上限（ms）</label><input id="cfgBackoffMax" type="number" min="1800000"></div>
       </div>
-      <div class="footer">其它账号登录可直接访问 <code>/login?profile=你的账号名</code>。</div>
+      <div class="actions"><button id="saveConfigBtn">保存全局配置</button><span id="configNote" class="muted"></span></div>
     </section>
-
-    <section class="card">
-      <h2>运行状态</h2>
-      <div class="stat"><span>网关地址</span><code>${htmlEscape(setup.gateway.baseURL)}</code></div>
-      <div class="stat"><span>OpenAI 兼容入口</span><code>${htmlEscape(setup.gateway.apiBaseURL)}</code></div>
-      <div class="stat"><span>请求数</span><span id="requestsText">-</span></div>
-      <div class="stat"><span>运行时长</span><span id="uptimeText">-</span></div>
-      <div class="stat"><span>会话 / 通道 / 空闲通道</span><span id="sessionText">-</span></div>
-      <div class="stat"><span>driver</span><span id="driverText">-</span></div>
-      <div class="stat"><span>最近一次请求</span><span id="lastStreamText" class="badge">-</span></div>
-      <div class="footer" id="lastStreamDetail">-</div>
-    </section>
-
-    <section class="card">
-      <h2>账户检查与管理</h2>
-      <div class="row" style="margin-bottom:10px;">
-        <input id="newAccountName" type="text" placeholder="输入新账号名，例如 acc2" />
-        <button id="addAccountBtn">添加账号</button>
-      </div>
-      <div id="accountSummary" class="muted">正在读取账号池…</div>
-      <div style="overflow:auto; margin-top:10px;">
-        <table class="table" id="accountTable">
-          <thead><tr><th>账号</th><th>状态</th><th>使用情况</th><th>建议</th><th>操作</th></tr></thead>
-          <tbody><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>运行配置</h2>
-      <div class="row"><button id="refreshConfigBtn" class="secondary">刷新配置</button><button id="saveConfigBtn">保存配置</button></div>
-      <label class="field"><span>headless（修改后需重启网关并重新登录）</span><input id="cfgHeadless" type="text" placeholder="true / false" /></label>
-      <label class="field"><span>maxConcurrent</span><input id="cfgConcurrent" type="number" min="1" max="5" /></label>
-      <label class="field"><span>maxPages</span><input id="cfgPages" type="number" min="1" max="8" /></label>
-      <label class="field"><span>maxTurnsPerChat</span><input id="cfgTurns" type="number" min="2" max="500" /></label>
-      <label class="field"><span>accountPool（true / false）</span><input id="cfgAccountPool" type="text" /></label>
-      <label class="field"><span>maxAccounts</span><input id="cfgMaxAccounts" type="number" min="1" max="8" /></label>
-      <label class="field"><span>autoRelogin（true / false）</span><input id="cfgAutoRelogin" type="text" /></label>
-      <label class="field"><span>quotaBackoffBaseMs</span><input id="cfgBackoffBase" type="number" min="60000" /></label>
-      <label class="field"><span>quotaBackoffMaxMs</span><input id="cfgBackoffMax" type="number" min="1800000" /></label>
-      <div id="configNote" class="footer">配置会通过 <code>/config</code> 立即生效。</div>
-    </section>
-
-    <section class="card">
-      <h2>诊断与维护</h2>
-      <div class="row">
-        <a class="btn secondary" href="/debug" target="_blank" rel="noreferrer">DOM 结构诊断</a>
-        <a class="btn secondary" href="/accounts" target="_blank" rel="noreferrer">账号 JSON</a>
-        <a class="btn secondary" href="/config" target="_blank" rel="noreferrer">配置 JSON</a>
-        <a class="btn secondary" href="/calibrate/list" target="_blank" rel="noreferrer">校准列表</a>
-      </div>
-      <div class="footer">
-        常见限制：多账号时并发会退化为串行；需要本机真实 Chrome；DeepSeek 网页改版时可能需要更新选择器或重做校准。
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>接口快照</h2>
-      <p class="muted">便于未来接入 DSH 原生设置卡片：本页面只是插件内前端，卡片数据以 JSON 接口为准。</p>
-      <pre id="snapshotPre"><code>正在加载…</code></pre>
-    </section>
-  </div>
+    <section class="panel"><div class="panel-head"><h2>运行快照</h2><a href="/health" target="_blank" rel="noreferrer"><button class="secondary">/health JSON</button></a></div><pre id="snapshotPre">正在读取…</pre></section>
+  </section>
 </div>
 <script>
 (() => {
+  const initialSetup = ${boot};
+  let selectedProviderId = null;
+  let latest = { setup: initialSetup, health: null, accounts: null, config: null };
   const $ = (id) => document.getElementById(id);
-  const boolText = (v) => v ? 'true' : 'false';
-  const fmtDuration = (ms) => {
-    const n = Math.max(0, Math.floor((ms || 0) / 1000));
-    const h = Math.floor(n / 3600); const m = Math.floor((n % 3600) / 60); const s = n % 60;
-    if (h) return h + 'h ' + m + 'm';
-    if (m) return m + 'm ' + s + 's';
-    return s + 's';
+  const esc = (value) => String(value == null ? '' : value).replace(/[&<>"]/g, (char) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' })[char]);
+  const api = async (url, options) => { const response = await fetch(url, options); const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error((body.error && body.error.message) || body.error || ('HTTP ' + response.status)); return body; };
+  const statusText = { ready:'已就绪', needs_login:'需要登录', challenge:'需要人工完成 challenge', cooling:'冷却中', disabled:'已禁用', unknown:'状态未知' };
+  const statusClass = (status) => status === 'ready' ? 'ok' : (status === 'challenge' || status === 'disabled' ? 'bad' : 'warn');
+  const bool = (value) => /^(true|1|yes|on)$/i.test(String(value));
+  const providerList = () => ((latest.setup || {}).providers || {}).providers || [];
+  const selectedProvider = () => providerList().find((provider) => provider.id === selectedProviderId) || providerList()[0] || null;
+  const chooseInitialProvider = () => {
+    const providers = providerList();
+    if (!providers.length) return null;
+    const attention = providers.find((provider) => ['challenge','needs_login','cooling','disabled'].includes(provider.status));
+    return (attention || providers.find((provider) => provider.id === 'deepseek') || providers[0]).id;
   };
-  const api = async (url, init) => {
-    const r = await fetch(url, Object.assign({ headers: { 'Content-Type': 'application/json' } }, init || {}));
-    const text = await r.text();
-    try { return JSON.parse(text); } catch (e) { throw new Error(text || ('HTTP ' + r.status)); }
-  };
-  const badge = (el, text, kind) => { el.textContent = text; el.className = 'badge ' + (kind || ''); };
-
-  async function refreshAll() {
-    const [setup, health, accounts, config] = await Promise.all([
-      api('/setup'), api('/health'), api('/accounts'), api('/config')
-    ]);
-    renderSetup(setup);
-    renderHealth(health);
-    renderAccounts(accounts);
-    renderConfig(config);
-    $('snapshotPre').innerHTML = '<code>' + escapeHtml(JSON.stringify({ setup, health: { summary: health.summary, config: health.config }, accounts: { summary: accounts.summary, total: accounts.total } }, null, 2)) + '</code>';
+  const loginUrl = (providerId, profile) => '/login?provider=' + encodeURIComponent(providerId) + (profile ? '&profile=' + encodeURIComponent(profile) : '');
+  function renderTop() {
+    const health = latest.health || {};
+    const summary = health.summary || {};
+    const gatewayReady = summary.gateway === 'ready' || summary.gateway === 'ok';
+    $('gatewayBadge').className = 'pill ' + (gatewayReady ? 'ok' : 'warn');
+    $('gatewayBadge').textContent = gatewayReady ? '● Gateway 在线' : '● Gateway 等待 driver';
+    $('runtimeBadge').className = 'pill ' + (health.driver && health.driver.ready ? 'ok' : 'warn');
+    $('runtimeBadge').textContent = '请求 ' + (health.requests || 0) + ' · 会话 ' + ((health.sessions || {}).count || 0) + ' · 通道 ' + ((health.sessions || {}).channels || 0);
   }
-
-  function escapeHtml(s) {
-    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  function renderProviderCards() {
+    const providers = providerList();
+    $('providerCards').innerHTML = providers.map((provider) => '<article class="provider-card ' + (provider.id === selectedProviderId ? 'selected' : '') + '" data-provider="' + esc(provider.id) + '" data-select-provider="' + esc(provider.id) + '">' +
+      '<div class="provider-head"><div><div class="provider-name">' + esc(provider.label) + '</div><div class="provider-meta">' + esc(provider.defaultProfile) + '</div></div><span class="pill ' + statusClass(provider.status) + '">' + esc(statusText[provider.status] || provider.status) + '</span></div>' +
+      '<div class="provider-count">' + provider.models.length + ' <span class="provider-meta">个模型</span></div><div class="provider-meta">账号 ' + provider.accounts.total + ' · active ' + provider.accounts.active + ' · cooling ' + provider.accounts.cooling + '</div>' +
+      '<button class="card-action" data-provider-action="' + esc(provider.action.kind) + '" data-provider-id="' + esc(provider.id) + '">' + esc(provider.action.label) + '</button></article>').join('') || '<div class="panel">尚未收到 provider 状态。</div>';
   }
-
-  function renderSetup(setup) {
-    badge($('gatewayBadge'), setup.cards.runtime.gateway === 'ready' ? '网关 ready' : '网关启动中', setup.cards.runtime.gateway === 'ready' ? 'ok' : 'warn');
-    badge($('loginBadge'), setup.cards.login.loggedIn ? '已登录' : '未登录', setup.cards.login.loggedIn ? 'ok' : 'warn');
-    $('loginHint').textContent = setup.cards.login.hint;
-    $('checklist').innerHTML = setup.setup.checklist.map((x) => '<div style="margin:6px 0;"><strong>' + (x.done ? '✅' : '⬜️') + ' ' + escapeHtml(x.label) + '</strong><div class="muted">' + escapeHtml(x.detail || '') + '</div></div>').join('');
+  function providerNotice(provider) {
+    if (provider.status === 'challenge') return '<div class="notice challenge">检测到网页 challenge。请点击“打开登录窗口”，在本机浏览器中手工完成 Cloudflare、Turnstile 或安全验证；管理台不会自动绕过挑战。</div>';
+    if (provider.status === 'needs_login') return '<div class="notice">尚未检测到可用登录态。打开对应 provider 的本机登录窗口并完成登录后，点击刷新状态。</div>';
+    if (provider.status === 'cooling') return '<div class="notice">该 provider 的账号池正在冷却；不会影响其他 provider。等待探测恢复，或使用该 provider 的其他账号。</div>';
+    if (provider.status === 'disabled') return '<div class="notice challenge">该 provider 的账号已禁用。请先启用账号，再重新登录。</div>';
+    if (provider.status === 'ready') return '<div class="notice ok">该 provider 已检测到可交互的网页会话，可从 DSH 选择下方模型进行文本/代码/SSE 请求。</div>';
+    return '<div class="notice">当前无法确认网页状态。点击刷新状态，必要时打开诊断页查看 DOM 与 driver 信息。</div>';
   }
-
-  function renderHealth(health) {
-    $('requestsText').textContent = String(health.requests || 0);
-    $('uptimeText').textContent = fmtDuration((health.uptime || 0) * 1000);
-    $('sessionText').textContent = [health.sessions.count || 0, health.sessions.channels || 0, health.sessions.freeChannels || 0].join(' / ');
-    $('driverText').textContent = (health.driver.ready ? 'ready' : (health.driver.running ? 'running' : 'down')) + (health.driver.pid ? ' · pid ' + health.driver.pid : '');
-    const ls = health.driver.lastStream || { text: '暂无', detail: '最近一次请求完成快照会显示在这里', kind: 'muted' };
-    $('lastStreamText').textContent = ls.text || '暂无';
-    $('lastStreamText').className = 'badge ' + (ls.kind || '');
-    $('lastStreamDetail').textContent = ls.detail || '最近一次请求完成快照会显示在这里';
-    const lastError = $('lastErrorNotice');
-    if (ls.kind === 'bad') {
-      lastError.style.display = 'block';
-      lastError.innerHTML = '<strong>最近失败：</strong>' + escapeHtml(ls.text || '请求失败') + '<div class="muted" style="margin-top:6px;">' + escapeHtml(ls.detail || '') + '</div>';
-    } else {
-      lastError.style.display = 'none';
-      lastError.textContent = '';
-    }
+  function renderProviderDetail() {
+    const provider = selectedProvider();
+    if (!provider) { $('providerDetail').innerHTML = '<div class="empty">没有可管理的 provider。</div>'; return; }
+    const accounts = ((latest.accounts || {}).accounts || []).filter((account) => account.providerId === provider.id);
+    const rows = accounts.map((account) => '<tr><td><strong>' + esc(account.name) + '</strong><div class="muted">' + esc(account.providerId) + '</div></td><td>' + esc(account.state) + (account.cooldownRemainText ? '<div class="muted">剩余 ' + esc(account.cooldownRemainText) + '</div>' : '') + '</td><td>请求 ' + (account.requestCount || 0) + '<div class="muted">' + esc(account.lastUsedAgo || '从未') + '</div></td><td><a href="' + loginUrl(provider.id, account.name) + '" target="_blank" rel="noreferrer"><button class="secondary">登录</button></a> ' + (account.state === 'disabled' ? '<button class="secondary" data-account-enable="' + esc(account.name) + '">启用</button>' : '<button class="secondary" data-account-disable="' + esc(account.name) + '">禁用</button>') + (/(^default$|-default$)/.test(account.name) ? '' : ' <button class="danger" data-account-remove="' + esc(account.name) + '">删除</button>') + '</td></tr>').join('');
+    $('providerDetail').innerHTML = '<div class="panel-head"><div><h2>' + esc(provider.label) + '</h2><div class="muted">' + esc(provider.siteUrl) + ' · 默认 profile：' + esc(provider.defaultProfile) + '</div></div><div class="actions"><a href="' + loginUrl(provider.id) + '" target="_blank" rel="noreferrer"><button>打开登录窗口</button></a><button class="secondary" data-provider-refresh="' + esc(provider.id) + '">刷新状态</button></div></div>' +
+      '<div class="detail-columns"><div class="subpanel"><h3>登录与风险</h3>' + providerNotice(provider) + '<div class="actions"><a href="' + loginUrl(provider.id) + '" target="_blank" rel="noreferrer"><button class="secondary">' + esc(provider.action.label) + '</button></a></div></div><div class="subpanel"><h3>模型与 Beta 能力</h3><div class="models">' + provider.models.map((model) => '<span class="model">' + esc(model.id) + '</span>').join('') + '</div><p class="muted">文本、代码块与基础 SSE。ChatGPT challenge 需人工完成；Qwen thinking/search 不可用时返回 mode_unavailable。</p></div></div>' +
+      '<div class="panel-head" style="margin-top:15px"><h3>账号池（仅 ' + esc(provider.label) + '）</h3><span class="muted">active ' + provider.accounts.active + ' · cooling ' + provider.accounts.cooling + ' · needs_login ' + provider.accounts.needsLogin + '</span></div>' +
+      '<div class="account-toolbar"><input id="newAccountName" placeholder="新增账号名，例如 acc2"><button id="addAccountBtn">添加 ' + esc(provider.label) + ' 账号</button><span class="muted">操作自动携带 provider=' + esc(provider.id) + '</span></div><table><thead><tr><th>账号</th><th>状态</th><th>统计</th><th>操作</th></tr></thead><tbody>' + (rows || '<tr><td colspan="4" class="empty">尚无已记录账号。可以直接登录默认 profile，或添加一个账号。</td></tr>') + '</tbody></table>';
   }
-
-  function renderAccounts(accounts) {
-    $('accountSummary').textContent = '总账号 ' + accounts.total + ' · active ' + accounts.summary.active + ' · cooling ' + accounts.summary.cooling + ' · needs_login ' + accounts.summary.needsLogin + ' · disabled ' + accounts.summary.disabled;
-    const tbody = $('accountTable').querySelector('tbody');
-    tbody.innerHTML = accounts.accounts.map((a) => '<tr>' +
-      '<td><strong>' + escapeHtml(a.name) + '</strong></td>' +
-      '<td>' + escapeHtml(a.state) + (a.cooldownRemainText ? '<div class="muted">剩余 ' + escapeHtml(a.cooldownRemainText) + '</div>' : '') + '</td>' +
-      '<td>请求 ' + (a.requestCount || 0) + '<div class="muted">最近使用 ' + escapeHtml(a.lastUsedAgo || '从未') + '</div></td>' +
-      '<td>' + escapeHtml(a.actionHint || '') + '</td>' +
-      '<td class="row">' +
-        '<a class="btn secondary" target="_blank" rel="noreferrer" href="/login?profile=' + encodeURIComponent(a.name) + '">登录</a>' +
-        (a.state === 'disabled' ? '<button class="secondary" data-enable="' + escapeHtml(a.name) + '">启用</button>' : '<button class="secondary" data-disable="' + escapeHtml(a.name) + '">禁用</button>') +
-        (a.name === 'default' ? '' : '<button class="bad" data-remove="' + escapeHtml(a.name) + '">删除</button>') +
-      '</td>' +
-    '</tr>').join('') || '<tr><td colspan="5" class="muted">暂无账号</td></tr>';
+  function renderQueue() {
+    const provider = selectedProvider();
+    const action = provider && provider.action || { kind:'refresh', label:'刷新状态' };
+    const steps = provider ? [
+      { text: action.label, active: true },
+      { text: '刷新 ' + provider.label + ' 状态', active: action.kind !== 'manage' },
+      { text: '在 DSH 用 ' + (provider.models[0] && provider.models[0].id || '模型') + ' 做文本烟测', active: false },
+      { text: '必要时查看最近流和 /debug', active: false },
+    ] : [];
+    $('actionQueue').innerHTML = '<div class="panel-head"><h2>操作队列</h2><span class="pill ' + (provider ? statusClass(provider.status) : 'warn') + '">' + esc(provider ? statusText[provider.status] : '等待') + '</span></div><p class="muted">当前聚焦：' + esc(provider ? provider.label : '—') + '</p><ol class="queue">' + steps.map((step) => '<li class="' + (step.active ? 'active' : '') + '">' + esc(step.text) + '</li>').join('') + '</ol><div class="subpanel" style="margin-top:15px"><h3>全局运行</h3><div class="muted">Driver ' + (((latest.health || {}).driver || {}).ready ? '已就绪' : '等待中') + '<br>空闲通道 ' + (((latest.health || {}).sessions || {}).freeChannels || 0) + '<br>最近流：' + esc(((((latest.health || {}).driver || {}).lastStream || {}).text) || '暂无') + '</div><div class="actions"><a href="/debug" target="_blank" rel="noreferrer"><button class="secondary">打开 /debug</button></a><a href="/health" target="_blank" rel="noreferrer"><button class="secondary">查看 /health</button></a></div></div>';
   }
-
-  function renderConfig(configResp) {
-    const cfg = configResp.config || {};
-    $('cfgHeadless').value = boolText(!!cfg.headless);
-    $('cfgConcurrent').value = cfg.maxConcurrent ?? 2;
-    $('cfgPages').value = cfg.maxPages ?? 4;
-    $('cfgTurns').value = cfg.maxTurnsPerChat ?? 50;
-    $('cfgAccountPool').value = boolText(cfg.accountPool !== false);
-    $('cfgMaxAccounts').value = cfg.maxAccounts ?? 3;
-    $('cfgAutoRelogin').value = boolText(cfg.autoRelogin !== false);
-    $('cfgBackoffBase').value = cfg.quotaBackoffBaseMs ?? 300000;
-    $('cfgBackoffMax').value = cfg.quotaBackoffMaxMs ?? 21600000;
-    $('configNote').textContent = configResp.note || '配置会通过 /config 立即生效。';
-  }
-
-  function parseBool(v) {
-    return /^(1|true|yes|on)$/i.test(String(v).trim());
-  }
-
-  $('saveConfigBtn').addEventListener('click', async () => {
-    const payload = {
-      headless: parseBool($('cfgHeadless').value),
-      maxConcurrent: Number($('cfgConcurrent').value),
-      maxPages: Number($('cfgPages').value),
-      maxTurnsPerChat: Number($('cfgTurns').value),
-      accountPool: parseBool($('cfgAccountPool').value),
-      maxAccounts: Number($('cfgMaxAccounts').value),
-      autoRelogin: parseBool($('cfgAutoRelogin').value),
-      quotaBackoffBaseMs: Number($('cfgBackoffBase').value),
-      quotaBackoffMaxMs: Number($('cfgBackoffMax').value),
-    };
-    const r = await api('/config', { method: 'POST', body: JSON.stringify(payload) });
-    renderConfig(r);
-    await refreshAll();
-  });
-  $('refreshConfigBtn').addEventListener('click', () => refreshAll());
-  $('addAccountBtn').addEventListener('click', async () => {
-    const name = $('newAccountName').value.trim();
-    if (!name) return alert('请先输入账号名');
-    const r = await api('/accounts/add', { method: 'POST', body: JSON.stringify({ name }) });
-    if (!r.ok) return alert(r.error || '添加失败');
-    $('newAccountName').value = '';
-    alert(r.message || '账号已添加');
-    await refreshAll();
-  });
-  $('loginOtherBtn').addEventListener('click', () => {
-    const name = window.prompt('请输入账号名，例如 acc2');
-    if (!name) return;
-    window.open('/login?profile=' + encodeURIComponent(name.trim()), '_blank', 'noopener');
-  });
-  document.addEventListener('click', async (e) => {
-    const t = e.target;
-    if (!(t instanceof HTMLElement)) return;
-    if (t.dataset.enable) {
-      const r = await api('/accounts/enable', { method: 'POST', body: JSON.stringify({ name: t.dataset.enable }) });
-      if (!r.ok) alert(r.error || '启用失败');
-      await refreshAll();
-    }
-    if (t.dataset.disable) {
-      const r = await api('/accounts/disable', { method: 'POST', body: JSON.stringify({ name: t.dataset.disable }) });
-      if (!r.ok) alert(r.error || '禁用失败');
-      await refreshAll();
-    }
-    if (t.dataset.remove) {
-      if (!window.confirm('确认删除账号 ' + t.dataset.remove + ' 吗？浏览器 profile 目录会保留。')) return;
-      const r = await api('/accounts/remove', { method: 'POST', body: JSON.stringify({ name: t.dataset.remove, confirm: true }) });
-      if (!r.ok) alert(r.error || '删除失败');
-      await refreshAll();
-    }
-  });
-
-  refreshAll().catch((e) => {
-    $('snapshotPre').innerHTML = '<code>' + escapeHtml(String(e && e.message || e)) + '</code>';
-    badge($('gatewayBadge'), '页面加载失败', 'bad');
-  });
-  setInterval(() => refreshAll().catch(() => {}), 15000);
+  function renderConfig(configResponse) { const cfg = (configResponse || {}).config || {}; $('cfgHeadless').value=String(!!cfg.headless); $('cfgConcurrent').value=cfg.maxConcurrent ?? 2; $('cfgPages').value=cfg.maxPages ?? 4; $('cfgTurns').value=cfg.maxTurnsPerChat ?? 50; $('cfgAccountPool').value=String(cfg.accountPool !== false); $('cfgMaxAccounts').value=cfg.maxAccounts ?? 3; $('cfgAutoRelogin').value=String(cfg.autoRelogin !== false); $('cfgBackoffBase').value=cfg.quotaBackoffBaseMs ?? 300000; $('cfgBackoffMax').value=cfg.quotaBackoffMaxMs ?? 21600000; $('configNote').textContent=configResponse.note || '配置会通过 /config 立即生效。'; }
+  function renderSnapshot() { $('snapshotPre').textContent=JSON.stringify({ gateway:(latest.health || {}).summary, providers:providerList().map((provider)=>({id:provider.id,status:provider.status,accounts:provider.accounts})), recentStream:((latest.health || {}).driver || {}).lastStream || null }, null, 2); }
+  function renderAll() { if (!selectedProviderId || !providerList().some((provider)=>provider.id===selectedProviderId)) selectedProviderId=chooseInitialProvider(); renderTop(); renderProviderCards(); renderProviderDetail(); renderQueue(); renderConfig(latest.config || {}); renderSnapshot(); }
+  async function refreshAll() { const results = await Promise.all([api('/setup'), api('/health'), api('/accounts'), api('/config')]); latest = { setup:results[0], health:results[1], accounts:results[2], config:results[3] }; renderAll(); }
+  async function mutateAccount(path, body) { try { await api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); await refreshAll(); } catch(error) { alert(error.message || String(error)); } }
+  $('refreshAllBtn').addEventListener('click', () => refreshAll().catch((error)=>alert(error.message || String(error))));
+  $('refreshConfigBtn').addEventListener('click', () => refreshAll().catch(()=>{}));
+  $('saveConfigBtn').addEventListener('click', async () => { try { latest.config=await api('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({headless:bool($('cfgHeadless').value),maxConcurrent:Number($('cfgConcurrent').value),maxPages:Number($('cfgPages').value),maxTurnsPerChat:Number($('cfgTurns').value),accountPool:bool($('cfgAccountPool').value),maxAccounts:Number($('cfgMaxAccounts').value),autoRelogin:bool($('cfgAutoRelogin').value),quotaBackoffBaseMs:Number($('cfgBackoffBase').value),quotaBackoffMaxMs:Number($('cfgBackoffMax').value)})}); await refreshAll(); } catch(error) { alert(error.message || String(error)); } });
+  document.addEventListener('click', async (event) => { const target=event.target; if (!(target instanceof HTMLElement)) return; const providerAction=target.closest('[data-provider-action]'); const providerRefresh=target.closest('[data-provider-refresh]'); if (providerAction || providerRefresh) { const node=providerAction || providerRefresh; const id=node.dataset.providerId || node.dataset.providerRefresh; if (node.dataset.providerAction === 'login' || node.dataset.providerAction === 'challenge') window.open(loginUrl(id),'_blank','noopener'); else { selectedProviderId=id; await refreshAll(); } return; } const providerCard=target.closest('[data-select-provider]'); if (providerCard) { selectedProviderId=providerCard.dataset.selectProvider; renderAll(); return; } if (target.closest('#addAccountBtn')) { const name=$('newAccountName').value.trim(); if (!name) return alert('请输入账号名'); await mutateAccount('/accounts/add',{name,provider: selectedProviderId}); return; } const enable=target.closest('[data-account-enable]'); if (enable) return mutateAccount('/accounts/enable',{name:enable.dataset.accountEnable,provider: selectedProviderId}); const disable=target.closest('[data-account-disable]'); if (disable) return mutateAccount('/accounts/disable',{name:disable.dataset.accountDisable,provider: selectedProviderId}); const remove=target.closest('[data-account-remove]'); if (remove && window.confirm('确认删除账号 '+remove.dataset.accountRemove+' 吗？浏览器 profile 目录会保留。')) return mutateAccount('/accounts/remove',{name:remove.dataset.accountRemove,provider: selectedProviderId,confirm:true}); });
+  renderAll();
+  refreshAll().catch((error)=>{ $('snapshotPre').textContent=String(error && error.message || error); });
+  setInterval(()=>refreshAll().catch(()=>{}),60000);
 })();
 </script>
 </body>
 </html>`;
 }
-
 
 /* ---------- HTTP 服务 ---------- */
 /** 设置 CORS 响应头（本机调试场景，放开全部来源）。 */
@@ -2125,14 +2006,20 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/') {
       gatewayRequestCount++;
       const health = await buildHealthPayload();
-      const setup = buildSetupPayload(health, buildAccountsPayload());
+      const providers = await buildProvidersPayload();
+      const setup = buildSetupPayload(health, buildAccountsPayload(), providers);
       return sendHtml(res, renderManagementPage(setup));
     }
     if (req.method === 'GET' && p === '/setup') {
       gatewayRequestCount++;
       const health = await buildHealthPayload();
-      const payload = buildSetupPayload(health, buildAccountsPayload());
+      const providers = await buildProvidersPayload();
+      const payload = buildSetupPayload(health, buildAccountsPayload(), providers);
       return sendJson(res, payload);
+    }
+    if (req.method === 'GET' && p === '/providers') {
+      gatewayRequestCount++;
+      return sendJson(res, await buildProvidersPayload());
     }
     /* 登录（支持 ?provider=deepseek|chatgpt|qwen 与 ?profile=xxx）。 */
     if (req.method === 'GET' && p === '/login') {
