@@ -2394,8 +2394,11 @@ handlers.inspect = async (params) => {
   const adapter = resolveProviderAdapter(providerId);
   const taskPage = params && params.taskId ? (tasks.get(params.taskId) || {}).pageId : null;
   /* A generic first tab may belong to another provider/profile. For provider status,
-   * always create/reuse the page bound to the requested provider profile. */
-  const pid = taskPage || await ensurePage({ name: profileKey(adapter.id, params && params.profile), headless: true }, adapter.id);
+   * always create/reuse the page bound to the requested provider profile. The check
+   * must use the same headless mode as actual requests, otherwise login cookies or
+   * anti-bot presentation can differ from the DSH execution page. */
+  const inspectHeadless = params && params.headless !== undefined ? !!params.headless : false;
+  const pid = taskPage || await ensurePage({ name: profileKey(adapter.id, params && params.profile), headless: inspectHeadless }, adapter.id);
   const info = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.domDebug) : { url: providerUrl(adapter.id), providerId: adapter.id };
   const buttons = adapter.id === 'deepseek' ? await evalJs(pid, EXPR.buttons) : [];
   const login = await ensureLoggedIn(pid, adapter.id);

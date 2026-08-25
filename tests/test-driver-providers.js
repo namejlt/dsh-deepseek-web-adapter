@@ -23,7 +23,8 @@ function check(name, fn) {
 check('inspect does not reuse an arbitrary provider tab for a profile-specific login check', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'resources', 'driver.js'), 'utf8');
   assert(!/const pid = taskPage \|\| \(\[\.\.\.browser\.pages\.keys\(\)\]\[0\]\)/.test(source));
-  assert(/const pid = taskPage \|\| await ensurePage\(\{ name: profileKey\(adapter\.id, params && params\.profile\), headless: true \}, adapter\.id\)/.test(source));
+  assert(/const inspectHeadless = params && params\.headless !== undefined \? !!params\.headless : false;/.test(source));
+  assert(/const pid = taskPage \|\| await ensurePage\(\{ name: profileKey\(adapter\.id, params && params\.profile\), headless: inspectHeadless \}, adapter\.id\)/.test(source));
 });
 
 check('exports pure provider identity helpers', () => {

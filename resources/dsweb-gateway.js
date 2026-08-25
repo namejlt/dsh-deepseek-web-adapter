@@ -1738,7 +1738,7 @@ async function getLoginSnapshot(providerId) {
   let st = { needsLogin: true };
   const id = providerId || 'deepseek';
   try {
-    const insp = await rpc('inspect', { providerId: id, profile: providerProfile(id) }, 8000);
+    const insp = await rpc('inspect', { providerId: id, profile: providerProfile(id), headless: state.headless }, 8000);
     st = (insp && insp.login) || { needsLogin: true };
   } catch (e) { /* driver not ready */ }
   return st;
