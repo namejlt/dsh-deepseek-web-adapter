@@ -147,6 +147,14 @@ check('1e 折叠后正文正常', rC.indexOf(BODY_TEXT) >= 0);
 const rD = runExpr(extractLastExpr, docD);
 check('1f 普通模式不回归', rD.indexOf(PLAIN_ANSWER) >= 0);
 
+/* 场景 D2：快速模式可能只返回一个字符（例如 1+1=? → 2）。强助手正文容器不应设长度门槛。 */
+const SHORT_ANSWER = '2';
+const mainD2 = el({ cls: 'ds-assistant-message-main-content', children: [
+  el({ cls: 'ds-markdown', children: [tx(SHORT_ANSWER)] }),
+] });
+const rD2 = runExpr(extractLastExpr, makeDoc({ '.ds-assistant-message-main-content': [mainD2] }));
+check('1f2 快速模式单字符正文不被提取阈值丢弃', rD2 === SHORT_ANSWER, JSON.stringify(rD2));
+
 const rE = runExpr(extractLastExpr, docE);
 check('1g 正文含"思考"字样不误杀', rE.indexOf('经过思考，我认为答案是 42。') >= 0);
 
@@ -264,6 +272,12 @@ check('3a streamAsk 完成判定含 !thinking && !searching', /lastChange > 0 &&
 check('3b 兜底稳定超时即完成（gen=true 时 30s，gen=false 时 5s，防搜索阶段误判）', /lastChange > 0 && !searching && \(!thinking \|\| thinkStalled\) && Date\.now\(\) - lastChange >= \(gen \? 30000 : 5000\)/.test(SRC));
 check('3b2 gen=true 假阳性时，非思考/非搜索且正文稳定 5s 也要结束', /lastChange > 0 && lastText\.length > 10 && gen && !searching && \(!thinking \|\| thinkStalled\) && Date\.now\(\) - lastChange >= 5000/.test(SRC));
 check('3c waitForResponse 思考防线 + gen 独立兜底（稳定≥5s 即完成）', /if \(!thinking\) \{[\s\S]*?!gen \|\| Date\.now\(\) - stableStart >= Math\.max\(stableDelayMs, 5000\)\) break;/.test(SRC));
+
+/* 快速回复在 click Send 后可能已完成：旧文本快照必须在发送前建立，
+ * 否则 "2" 会成为 beforeClean，整轮永远看不到 firstSeen。 */
+const initialSendPos = SRC.indexOf('await sendMessage(pageId, payload, {});');
+const firstBaselinePos = SRC.indexOf("const beforeText = await evalJs(pageId, EXPR.extractLast).catch(() => '');");
+check('3c2 新回复基线在首次发送前捕获（避免极快回答被吞）', firstBaselinePos >= 0 && firstBaselinePos < initialSendPos, 'baseline=' + firstBaselinePos + ', send=' + initialSendPos);
 check('3d walk 排除思考容器（think/reasoning 且非 markdown/answer，排除列表精简防误判）', /cls && \/think\|reasoning\/\.test\(cls\) && !\/markdown\|answer\/\.test\(cls\)/.test(SRC));
 check('3e EXPR.doneActions 定义（完成态正信号：复制/重新生成按钮）', /doneActions: `\(\(\) => \{/.test(SRC));
 check('3e2 完成态按钮检测不再依赖 !gen（修复 gen=true 误判卡死）', /if \(!searching\) \{ try \{ doneActions = await evalJs\(pageId, EXPR\.doneActions\); \} catch \(e\) \{ \/\* ignore \*\/ \} \}/.test(SRC));

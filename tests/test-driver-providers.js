@@ -24,6 +24,28 @@ check('exports pure provider identity helpers', () => {
   assert.strictEqual(typeof driver.resolveProviderAdapter, 'function');
 });
 
+check('finishes a stable adapter response when a stale generating control persists', () => {
+  assert.strictEqual(typeof driver.shouldFinishAdapterResponse, 'function');
+  assert.strictEqual(driver.shouldFinishAdapterResponse({
+    sawText: true, generating: true, lastChangeAt: 1000, now: 6000,
+  }), true);
+});
+
+check('does not finish an adapter response without extracted text', () => {
+  assert.strictEqual(driver.shouldFinishAdapterResponse({
+    sawText: false, generating: false, lastChangeAt: 1000, now: 6000,
+  }), false);
+});
+
+check('waits for the short normal stability window after a confirmed stop', () => {
+  assert.strictEqual(driver.shouldFinishAdapterResponse({
+    sawText: true, generating: false, lastChangeAt: 1000, now: 2199,
+  }), false);
+  assert.strictEqual(driver.shouldFinishAdapterResponse({
+    sawText: true, generating: false, lastChangeAt: 1000, now: 2200,
+  }), true);
+});
+
 check('uses provider-default profiles without breaking explicit legacy DeepSeek default', () => {
   assert.strictEqual(driver.profileKey('chatgpt'), 'chatgpt-default');
   assert.strictEqual(driver.profileKey('qwen'), 'qwen-default');

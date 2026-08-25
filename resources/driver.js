@@ -625,7 +625,11 @@ const EXPR = {
     }
     function fullText(el) { const out = []; walk(el, out); return out.join('').trim(); }
     const direct = ['.ds-assistant-message-main-content','[class*="assistant-message-main"]','.ds-markdown','[class*="assistant"] [class*="markdown"]','[class*="assistant"] [class*="content"]','[data-role="assistant"] [class*="content"]','[class*="ai-message"] [class*="content"]','[class*="bot-message"] [class*="content"]','[class*="response-content"]','[class*="answer-content"]','[class*="reply-content"]','[class*="message-body"]','[class*="message-content"]','[class*="chat-message"] [class*="text"]','[class*="conversation"] [class*="item"]:last-child'];
-    for (const s of direct) { const els = document.querySelectorAll(s); if (els.length) { const t = fullText(els[els.length - 1]); if (t.length > 10) return t; } }
+    /* Only DeepSeek's explicitly assistant-scoped containers may return a short
+     * final answer such as "2". Keep the broader cross-site fallbacks conservative
+     * so composer/UI fragments cannot be mistaken for a response. */
+    const shortDirect = new Set(['.ds-assistant-message-main-content', '[class*="assistant-message-main"]']);
+    for (const s of direct) { const els = document.querySelectorAll(s); if (els.length) { const t = fullText(els[els.length - 1]); if (t.length > 10 || (shortDirect.has(s) && t.length > 0)) return t; } }
     const md = document.querySelectorAll('[class*="markdown"], [class*="prose"], [class*="rendered"], [class*="text-content"], [class*="answer"]');
     if (md.length) { const t = fullText(md[md.length - 1]); if (t.length > 10) return t; }
     const blocks = Array.from(document.querySelectorAll('[class*="message"], [class*="chat-item"], [class*="turn"], [class*="chat-row"], [class*="conversation-item"]'));
@@ -2940,6 +2944,14 @@ async function openAdapterNewChat(pageId, adapter) {
   await waitReady(pageId, 30000);
 }
 
+function shouldFinishAdapterResponse({ sawText, generating, lastChangeAt, now }) {
+  if (!sawText || !lastChangeAt) return false;
+  const stableFor = now - lastChangeAt;
+  /* Stop control is the normal completion signal. A bounded fallback prevents a stale
+   * provider control from keeping ChatGPT/Qwen in DSH's "thinking" state forever. */
+  return (!generating && stableFor >= 1200) || stableFor >= 5000;
+}
+
 async function streamAdapterAsk(params, adapter, profile) {
   const streamId = 's' + (++streamSeqs.n);
   const hasChannel = !!(params && params.pageKey);
@@ -2988,7 +3000,7 @@ async function streamAdapterAsk(params, adapter, profile) {
           sawText = true;
         }
         const generating = await evalJs(pageId, adapter.expressions.detectGenerating).catch(() => true);
-        if (sawText && !generating && Date.now() - lastChange >= 1200) break;
+        if (shouldFinishAdapterResponse({ sawText, generating, lastChangeAt: lastChange, now: Date.now() })) break;
         if (Date.now() - started > timeoutMs) throw providerError('unavailable', adapter.id + ' response timed out');
         await sleep(350);
       }
@@ -3142,6 +3154,13 @@ handlers.streamAsk = async (params) => {
           if (applied) log('applyCalibration fallback: ' + applied + ' 步回放');
         }
       } catch (e) { log('applyConfig warn', e.message); }
+      /* Snapshot before clicking Send: a fast reply can otherwise arrive before the
+       * first poll and be mistaken for the old-message baseline. */
+      const snapshotBeforeSend = async () => {
+        const beforeText = await evalJs(pageId, EXPR.extractLast).catch(() => '');
+        return cleanText(beforeText);
+      };
+      let beforeClean = await snapshotBeforeSend();
       await sendMessage(pageId, payload, {});
       const timeoutMs = (params && params.timeoutMs) || 240000;
       /* 参考 deepseek-browser-agent agent.js 的容错循环：
@@ -3171,6 +3190,7 @@ handlers.streamAsk = async (params) => {
           if (retrySamePayload) {
             log('streamAsk 未见新回复 → 重发原问题重试 ' + attempt + '/2');
             retrySamePayload = false;
+            beforeClean = await snapshotBeforeSend();
             await sendMessage(pageId, payload, {});
           } else if (lengthHit) {
             /* 对话过长 → 迁移+摘要：提取当前会话摘要 → newChat → 注入摘要重发原问题。
@@ -3192,17 +3212,17 @@ handlers.streamAsk = async (params) => {
                 search: params && params.search,
               });
             } catch (e) { log('applyConfig warn', e.message); }
+            beforeClean = await snapshotBeforeSend();
+            await sendMessage(pageId, payload, {});
           } else {
             log('streamAsk 安全网: 像工具调用但解析失败，发纠正消息重试 ' + attempt + '/2');
+            beforeClean = await snapshotBeforeSend();
             await sendMessage(pageId, RETRY_PROMPT, {});
           }
         }
         const start = Date.now();
-        /* 发送前旧文本（仅用于检测"新回复出现"的基线，绝不当作本轮结果）。
-         * cleanText 后比较——与流式增量/终态 result 同一清洗基准，
-         * 网关侧前缀对齐补尾的前提（v3 真流式）。 */
-        const beforeText = await evalJs(pageId, EXPR.extractLast).catch(() => '');
-        const beforeClean = cleanText(beforeText);
+        /* beforeClean is captured immediately before the send that started this attempt.
+         * It is only a new-reply baseline and is never returned as this attempt's result. */
         let lastText = ''; /* 本轮新回复的累计文本（cleanText 后；firstSeen 后才有效） */
         let lastThink = ''; /* 思考流累计快照（思考增量差分基线；每 attempt 重置） */
         let thinkSent = ''; /* 已发送的思考全量文本（用于正文去重：正文不应重复输出思考内容） */
@@ -3888,4 +3908,4 @@ if (IS_MAIN) {
   emitEvent('ready', { version: VERSION, baseDir: CFG.baseDir, pid: process.pid });
 }
 
-module.exports = { profileKey, channelKey, resolveProviderAdapter, providerUrl, ProviderDriverError };
+module.exports = { profileKey, channelKey, resolveProviderAdapter, providerUrl, ProviderDriverError, shouldFinishAdapterResponse };
