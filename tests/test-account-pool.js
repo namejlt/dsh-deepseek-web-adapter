@@ -159,6 +159,18 @@ const PAYLOAD_FIRST = {
     check('1g2 落盘恢复：cooling 状态与退避字段', r2.state === 'cooling' && r2.backoffCount === 1 && Math.abs(r2.cooldownUntil - saved.accounts.find((x) => x.name === 'acc2').cooldownUntil) === 0);
     check('1g3 FF8 落盘无凭据字段', !/password|cookie|token/i.test(fs.readFileSync(path.join(tmp, 'accounts.json'), 'utf8')));
 
+    /* 旧 v1 文件没有 providerId：升级后必须保留 DeepSeek 账号名和状态。 */
+    const legacy = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-pool-v1-'));
+    fs.writeFileSync(path.join(legacy, 'accounts.json'), JSON.stringify({ version: 1, accounts: [
+      { name: 'default', state: 'active', requestCount: 7 },
+      { name: 'acc2', state: 'cooling', backoffCount: 1, cooldownUntil: Date.now() + 60000 },
+    ] }));
+    const legacyGw = makeGateway(legacy);
+    const legacyDefault = legacyGw.pool.accounts.get('default');
+    const legacyAcc2 = legacyGw.pool.accounts.get('acc2');
+    check('1g4 v1 账号池升级后保留为 DeepSeek 独立账号', legacyDefault && legacyAcc2 && legacyDefault.providerId === 'deepseek' && legacyAcc2.providerId === 'deepseek' && legacyAcc2.state === 'cooling' && legacyDefault.requestCount === 7, JSON.stringify([...legacyGw.pool.accounts.values()]));
+    fs.rmSync(legacy, { recursive: true, force: true });
+
     /* 1h 调度（§5.2）：轮转（最旧优先）/ 粘性 / exclude / suspect 绕开 */
     gw2.poolMarkOk('acc2'); /* acc2 → active */
     const d1 = gw2.pool.accounts.get('default');
@@ -195,6 +207,22 @@ const PAYLOAD_FIRST = {
     check('1k3 删除需二次确认', /confirm/.test(err || ''));
     try { gw2.poolRemove('default', true); } catch (e) { err = e.message; }
     check('1k4 default 不可删', /不可删除/.test(err || ''));
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  console.log('== 1l. Provider 账号状态隔离 ==');
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-provider-pool-'));
+    const gw = makeGateway(tmp);
+    const chatgpt = gw.poolPick(null, null, 'chatgpt');
+    check('1l1 ChatGPT 首次调度创建独立默认账号', chatgpt && chatgpt.name === 'chatgpt-default' && chatgpt.providerId === 'chatgpt', chatgpt && JSON.stringify(chatgpt));
+    gw.poolMarkQuota(chatgpt && chatgpt.name);
+    gw.poolMarkQuota(chatgpt && chatgpt.name);
+    check('1l2 ChatGPT quota 仅冷却其自身默认账号', gw.pool.accounts.get('chatgpt-default') && gw.pool.accounts.get('chatgpt-default').state === 'cooling', JSON.stringify(gw.pool.accounts.get('chatgpt-default')));
+    const qwen = gw.poolPick(null, null, 'qwen');
+    check('1l3 Qwen 默认账号不受 ChatGPT quota 影响', qwen && qwen.name === 'qwen-default' && qwen.state === 'active' && qwen.providerId === 'qwen', qwen && JSON.stringify(qwen));
+    const deepseek = gw.poolPick(null, null, 'deepseek');
+    check('1l4 旧 DeepSeek default 账号保持独立可用', deepseek && deepseek.name === 'default' && deepseek.state === 'active' && deepseek.providerId === 'deepseek', deepseek && JSON.stringify(deepseek));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
@@ -349,6 +377,10 @@ const PAYLOAD_FIRST = {
     check('2g5 空 messages 返回 400', emptyMessages.statusCode === 400, String(emptyMessages.statusCode));
     check('2g6 空 messages 返回 JSON 错误', /\"code\":\"invalid_messages\"/.test(sseText(emptyMessages)) && !/data: /.test(sseText(emptyMessages)), sseText(emptyMessages));
     check('2g7 无效请求不启动 driver 或 streamAsk', getEnsureCount() === 0 && calls.filter((c) => c.method === 'streamAsk').length === 0, 'ensure=' + getEnsureCount() + ' calls=' + JSON.stringify(calls));
+    const rolelessMessage = makeResMock();
+    await gw.handleChatCompletion({}, rolelessMessage, { model: 'deepseek-chat', messages: [{ content: '缺少 role' }] });
+    check('2g8 缺少 role 的消息返回 400 JSON 错误', rolelessMessage.statusCode === 400 && /\"code\":\"invalid_messages\"/.test(sseText(rolelessMessage)) && !/data: /.test(sseText(rolelessMessage)), sseText(rolelessMessage));
+    check('2g9 所有无效请求均不启动 driver 或 streamAsk', getEnsureCount() === 0 && calls.filter((c) => c.method === 'streamAsk').length === 0, 'ensure=' + getEnsureCount() + ' calls=' + JSON.stringify(calls));
     fs.rmSync(tmp, { recursive: true, force: true });
   }
   {

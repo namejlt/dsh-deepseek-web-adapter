@@ -158,6 +158,9 @@ function driverRecords() {
     await waitFor(() => driverRecords().some((record) => record.method === 'login' && record.params.providerId === 'qwen'));
     const loginRpc = driverRecords().filter((record) => record.method === 'login' && record.params.providerId === 'qwen').at(-1);
     assert.strictEqual(loginRpc.params.profile, 'qwen-default');
+    const accountsAfterQwenLogin = JSON.parse((await request(port, 'GET', '/accounts')).text);
+    assert(accountsAfterQwenLogin.accounts.some((account) => account.name === 'qwen-default' && account.providerId === 'qwen'), 'Qwen login must persist a provider-scoped account record');
+    assert(accountsAfterQwenLogin.accounts.some((account) => account.name === 'default' && account.providerId === 'deepseek'), 'Qwen login must not replace the legacy DeepSeek default account');
     assert.strictEqual((await request(port, 'GET', '/login-status?provider=chatgpt')).status, 200);
     assert.strictEqual((await request(port, 'GET', '/login?provider=missing')).status, 400);
 

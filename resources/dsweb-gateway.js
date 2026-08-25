@@ -292,20 +292,44 @@ const pool = {
   loginBusy: null,     /* 登录互斥：同时只允许一个登录窗口（Promise 链） */
 };
 
-/** 新建账号记录（内部）。 */
-function newAcct(name) {
+/** 将逻辑账号名映射到 provider 独立的池/profile 键。
+ * DeepSeek 继续使用历史 `default`/`acc2` 键，避免升级后丢失既有账号状态；
+ * 新 provider 则始终使用 `chatgpt-*` / `qwen-*`，使限流和登录失效不会跨站传播。 */
+function providerAccountName(providerId, requestedName) {
+  const id = getProvider(providerId) ? providerId : 'deepseek';
+  const requested = String(requestedName || 'default').trim() || 'default';
+  if (id === 'deepseek') return requested; // legacy DeepSeek names remain stable across the upgrade
+  return requested.startsWith(id + '-') ? requested : id + '-' + requested;
+}
+
+/** 新建账号记录（内部）。`name` 是唯一池键，也是对应的浏览器 profile 名。 */
+function newAcct(name, providerId) {
   return {
-    name, state: 'active', addedAt: Date.now(),
+    name, providerId: getProvider(providerId) ? providerId : 'deepseek', state: 'active', addedAt: Date.now(),
     backoffCount: 0, cooldownUntil: 0, quotaHits: 0, lastQuotaAt: 0,
     lastUsedAt: 0, requestCount: 0,
   };
 }
 
+/** 确保 provider 的逻辑账号存在。首次访问 ChatGPT/Qwen 时创建各自 default，
+ * 不把一个站点的 quota/captcha 状态复用于另一个站点。 */
+function poolEnsure(providerId, requestedName) {
+  const id = getProvider(providerId) ? providerId : 'deepseek';
+  const name = providerAccountName(id, requestedName);
+  let acct = pool.accounts.get(name);
+  if (!acct) {
+    acct = newAcct(name, id);
+    pool.accounts.set(name, acct);
+    poolSave();
+  }
+  return acct;
+}
+
 /** 账号池落盘（原子写：tmp + rename，防写一半损坏）。 */
 function poolSave() {
   try {
-    const data = { version: 1, accounts: [...pool.accounts.values()].map((a) => ({
-      name: a.name, state: a.state, addedAt: a.addedAt, backoffCount: a.backoffCount,
+    const data = { version: 2, accounts: [...pool.accounts.values()].map((a) => ({
+      name: a.name, providerId: a.providerId, state: a.state, addedAt: a.addedAt, backoffCount: a.backoffCount,
       cooldownUntil: a.cooldownUntil, quotaHits: a.quotaHits, lastQuotaAt: a.lastQuotaAt,
       lastUsedAt: a.lastUsedAt, requestCount: a.requestCount,
     })) };
@@ -315,14 +339,15 @@ function poolSave() {
   } catch (e) { log('accounts.json 落盘失败: ' + e.message); }
 }
 
-/** 账号池加载（启动时；损坏/缺失 → 仅 default）。 */
+/** 账号池加载（启动时；v1 记录默认视作 DeepSeek，损坏/缺失 → 仅 default）。 */
 function poolLoad() {
   pool.accounts.clear();
   try {
     const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
     for (const a of data.accounts || []) {
       if (!a || !a.name) continue;
-      const acct = newAcct(a.name);
+      const providerId = getProvider(a.providerId) ? a.providerId : 'deepseek';
+      const acct = newAcct(providerAccountName(providerId, a.name), providerId);
       Object.assign(acct, {
         state: ['active', 'cooling', 'probing', 'needs_login', 'disabled'].includes(a.state) ? a.state : 'active',
         addedAt: a.addedAt || Date.now(), backoffCount: a.backoffCount || 0,
@@ -332,9 +357,9 @@ function poolLoad() {
       });
       pool.accounts.set(acct.name, acct);
     }
-    log('账号池加载: ' + [...pool.accounts.values()].map((a) => a.name + '(' + a.state + ')').join(', '));
+    log('账号池加载: ' + [...pool.accounts.values()].map((a) => a.name + '(' + a.providerId + '/' + a.state + ')').join(', '));
   } catch (e) { /* 首次运行无文件 */ }
-  if (!pool.accounts.size) pool.accounts.set('default', newAcct('default'));
+  if (!pool.accounts.has('default')) pool.accounts.set('default', newAcct('default', 'deepseek'));
 }
 
 /** 当前退避时长（指数：base × 2^(n-1)，封顶 max）。 */
@@ -353,15 +378,7 @@ function poolRefresh(acct) {
   return acct;
 }
 
-/**
- * 受限信号处理（动态风控核心）。
- * 退避次数语义：backoffCount = 已进入 cooling 的次数（首次确认=1 → base，之后每次翻倍）。
- * - 首次（active 且窗口外）：仅 suspect 标记（调度时窗口内绕开），保持 active——单次疑似不中断服务
- * - 窗口内二次确认（active）：第 1 次退避 → cooling(base)
- * - probing 探测失败：backoffCount++ → cooling(base×2^(n-1))
- * - cooling 中收到信号（在途旧请求残留）：只刷新 lastQuotaAt，不延长退避
- * @param {string} name 账号名
- */
+/** 受限信号处理（动态风控核心）。 */
 function poolMarkQuota(name) {
   const a = pool.accounts.get(name);
   if (!a) return null;
@@ -397,11 +414,11 @@ function poolMarkOk(name) {
     a.state = 'active';
     a.backoffCount = 0;
     a.cooldownUntil = 0;
-    a.lastQuotaAt = 0; /* suspect 窗口一并清除 */
+    a.lastQuotaAt = 0;
   }
   a.lastUsedAt = Date.now();
   a.requestCount++;
-  poolSave(); /* 统计持久化：重启后 requestCount/lastUsedAt 不回退 */
+  poolSave();
 }
 
 /** captcha / 登录失效标记。kind='captcha' → disabled（转人工）；'login' → needs_login。 */
@@ -414,29 +431,34 @@ function poolMarkDown(name, kind) {
 }
 
 /** 账号管理操作（/accounts API 用）。 */
-function poolAdd(name) {
+function poolAdd(name, providerId) {
   if (!name || !/^[\w-]{1,32}$/.test(name)) throw new Error('账号名无效（字母数字-_，≤32 字符）');
-  if (pool.accounts.has(name)) throw new Error('账号已存在: ' + name);
-  if (pool.accounts.size >= state.maxAccounts) throw new Error('账号数已达上限 ' + state.maxAccounts + '（可通过 /config 调大 maxAccounts）');
-  const a = newAcct(name);
-  a.state = 'needs_login'; /* 新账号需先登录 */
-  pool.accounts.set(name, a);
+  const id = getProvider(providerId) ? providerId : 'deepseek';
+  const accountName = providerAccountName(id, name);
+  if (pool.accounts.has(accountName)) throw new Error('账号已存在: ' + accountName);
+  const providerCount = [...pool.accounts.values()].filter((a) => a.providerId === id).length;
+  if (providerCount >= state.maxAccounts) throw new Error('账号数已达上限 ' + state.maxAccounts + '（可通过 /config 调大 maxAccounts）');
+  const a = newAcct(accountName, id);
+  a.state = 'needs_login';
+  pool.accounts.set(accountName, a);
   poolSave();
   return a;
 }
-function poolRemove(name, confirm) {
-  const a = pool.accounts.get(name);
-  if (!a) throw new Error('账号不存在: ' + name);
-  if (name === 'default') throw new Error('default 账号不可删除（可 disable）');
+function poolRemove(name, confirm, providerId) {
+  const accountName = providerAccountName(providerId || 'deepseek', name);
+  const a = pool.accounts.get(accountName);
+  if (!a) throw new Error('账号不存在: ' + accountName);
+  if (accountName === 'default' || /^(chatgpt|qwen)-default$/.test(accountName)) throw new Error('default 账号不可删除（可 disable）');
   if (!confirm) throw new Error('需 confirm=true（将删除该账号的浏览器 profile 目录，登录态不可恢复）');
-  pool.accounts.delete(name);
+  pool.accounts.delete(accountName);
   poolSave();
   return a;
 }
-function poolSetEnabled(name, enabled) {
-  const a = pool.accounts.get(name);
-  if (!a) throw new Error('账号不存在: ' + name);
-  a.state = enabled ? 'needs_login' : 'disabled'; /* 启用后需登录验证 */
+function poolSetEnabled(name, enabled, providerId) {
+  const accountName = providerAccountName(providerId || 'deepseek', name);
+  const a = pool.accounts.get(accountName);
+  if (!a) throw new Error('账号不存在: ' + accountName);
+  a.state = enabled ? 'needs_login' : 'disabled';
   poolSave();
   return a;
 }
@@ -449,42 +471,34 @@ function poolUsable(a) {
   return true;
 }
 
-/**
- * 调度选账号（SPEC-v2 §5.2）：sticky > 当前浏览器 profile（避免重启）> lastUsedAt 最旧。
- * profile 乒乓问题：单浏览器多账号下，若每次都轮转选不同账号，driver 会反复
- * 重启浏览器（每次 ~5-10s 且销毁全部通道历史）。调度优先当前 profile（currentProfile）
- * 中的可用账号，仅在切换重试（账号受限）时才真正换 profile。
- * @param {string} [stickyName] 会话粘性账号（其可用则优先，保网页版历史）
- * @param {Set<string>} [exclude] 本请求已试过且失败的账号（切换重试时排除）
- * @returns {object|null} 账号记录；null = 无可用
- */
-let currentProfile = 'default'; /* driver 当前浏览器绑定的 profile（最近一次成功请求的账号） */
+/** 调度选账号：provider 内 sticky > 当前浏览器 profile > lastUsedAt 最旧。 */
+let currentProfile = 'default';
 function poolPick(stickyName, exclude, providerId) {
-  if (!state.accountPool) {
-    const d = pool.accounts.get('default');
-    return d || null;
-  }
+  const id = getProvider(providerId) ? providerId : 'deepseek';
+  if (!state.accountPool) return poolEnsure(id, 'default');
+  const accounts = [...pool.accounts.values()].filter((a) => a.providerId === id);
+  if (!accounts.length) accounts.push(poolEnsure(id, 'default'));
   if (stickyName) {
-    const s = pool.accounts.get(stickyName);
-    if (s && poolUsable(s) && !(exclude && exclude.has(s.name))) return s;
+    const s = pool.accounts.get(providerAccountName(id, stickyName));
+    if (s && s.providerId === id && poolUsable(s) && !(exclude && exclude.has(s.name))) return s;
   }
   let best = null;
   let bestCur = null;
-  for (const a of pool.accounts.values()) {
+  for (const a of accounts) {
     if (!poolUsable(a)) continue;
     if (exclude && exclude.has(a.name)) continue;
     if (!best || a.lastUsedAt < best.lastUsedAt) best = a;
-    if (providerProfile(providerId || 'deepseek', a.name) === currentProfile && (!bestCur || a.lastUsedAt < bestCur.lastUsedAt)) bestCur = a;
+    if (providerProfile(id, a.name) === currentProfile && (!bestCur || a.lastUsedAt < bestCur.lastUsedAt)) bestCur = a;
   }
-  /* 当前浏览器 profile 的账号可用 → 优先（避免 profile 切换重启浏览器） */
   return bestCur || best;
 }
 
 /** 最早退避到期时间（全受限时给用户的提示信息用）。 */
-function poolEarliestRetry() {
+function poolEarliestRetry(providerId) {
+  const id = getProvider(providerId) ? providerId : 'deepseek';
   let min = null;
   for (const a of pool.accounts.values()) {
-    if (a.state !== 'cooling' && a.state !== 'probing') continue;
+    if (a.providerId !== id || (a.state !== 'cooling' && a.state !== 'probing')) continue;
     poolRefresh(a);
     if (a.state !== 'cooling') continue;
     if (!min || a.cooldownUntil < min.cooldownUntil) min = a;
@@ -500,7 +514,7 @@ function poolDescribe() {
     accounts: [...pool.accounts.values()].map((a) => {
       poolRefresh(a);
       return {
-        name: a.name, state: a.state, backoffCount: a.backoffCount,
+        name: a.name, providerId: a.providerId, state: a.state, backoffCount: a.backoffCount,
         cooldownRemainMs: a.state === 'cooling' ? Math.max(0, a.cooldownUntil - Date.now()) : 0,
         quotaHits: a.quotaHits, requestCount: a.requestCount,
         lastUsedAt: a.lastUsedAt, suspectWindowMs: (a.state === 'active' && a.lastQuotaAt && Date.now() - a.lastQuotaAt < state.quotaConfirmWindowMs) ? state.quotaConfirmWindowMs - (Date.now() - a.lastQuotaAt) : 0,
@@ -1063,6 +1077,40 @@ function looksLikeToolCallText(t, tools) {
   }
   return false;
 }
+
+/** 判断短缓冲是否仍可能拼成支持的工具调用标记。
+ * 仅在首个分片尚不完整时短暂延迟，避免将 `` ` `` / `<` / `tool_`
+ * 等前缀先作为 content 发出，后续又以 tool_calls 结束同一轮。 */
+function isPossibleToolCallPrefix(text) {
+  const s = String(text || '').trim().toLowerCase();
+  if (!s || s.length > 96) return false;
+  const prefixes = [
+    '`', '``', '```', '```t', '```to', '```too', '```tool', '```tool_', '```tool_c', '```tool_ca', '```tool_cal',
+    '```j', '```js', '```jso',
+    '<', '<t', '<to', '<too', '<tool', '<tool_', '<tool_c', '<tool_ca', '<tool_cal', '<tool_call', '<tool_call>', '<tool_calls', '<tool_calls>',
+    '<i', '<in', '<inv', '<invo', '<invok', '<invoke',
+    't', 'to', 'too', 'tool', 'tool_', 'tool_c', 'tool_ca', 'tool_cal', 'tool_call',
+    '{', '[',
+  ];
+  return prefixes.includes(s);
+}
+
+/** 校验 OpenAI chat/completions 请求。此校验必须发生在 SSE/driver 之前，
+ * 这样无效请求始终获得 JSON 错误，且不会启动浏览器或污染会话。 */
+function validateChatPayload(payload, allowWorkBuddy) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { status: 400, code: 'invalid_request', message: 'request body must be a JSON object' };
+  }
+  const isWorkBuddy = !!allowWorkBuddy && payload.model === 'workbuddy-agent';
+  if (typeof payload.model !== 'string' || (!isWorkBuddy && !resolveProviderModel(payload.model))) {
+    return { status: 404, code: 'model_not_found', message: 'model not found: ' + String(payload.model || '') };
+  }
+  const msgs = payload.messages;
+  if (!Array.isArray(msgs) || !msgs.length || msgs.some((m) => !m || typeof m !== 'object' || Array.isArray(m) || typeof m.role !== 'string' || !m.role)) {
+    return { status: 400, code: 'invalid_messages', message: 'messages must be a non-empty array of role-bearing objects' };
+  }
+  return null;
+}
 /**
  * 处理 /v1/chat/completions（网关主流程，OpenAI 兼容契约的唯一实现点）。
  * 流程：会话识别 → 会话锁/信号量 → 账号调度 → askOnce 循环
@@ -1075,8 +1123,14 @@ function looksLikeToolCallText(t, tools) {
  * @param {object} payload 已解析的请求体（model/messages/tools/stream）
  */
 async function handleChatCompletion(req, res, payload, resolvedModel) {
-  const model = payload.model || 'deepseek-chat';
-  const cfg = resolvedModel || resolveProviderModel(model);
+  const validation = validateChatPayload(payload);
+  if (validation) {
+    return sendJson(res, { error: { message: validation.message, type: 'invalid_request_error', code: validation.code } }, validation.status);
+  }
+  const model = payload.model;
+  /* `resolvedModel` is an optional server-side cache only; never let a mismatched
+   * caller-selected record route a request to another provider/model. */
+  const cfg = resolvedModel && resolvedModel.id === model ? resolvedModel : resolveProviderModel(model);
   if (!cfg) return sendJson(res, { error: { message: 'unknown model: ' + model, type: 'invalid_request_error', code: 'model_not_found' } }, 404);
   const created = Math.floor(Date.now() / 1000);
   const cid = 'chatcmpl-' + created;
@@ -1177,7 +1231,7 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
     /* 账号调度（SPEC-v2 §5.2）：会话粘性 → 当前浏览器 profile（避免重启）→ 最旧；无可用 → 429 语义提示 */
     let acct = poolPick(session.acctName, null, cfg.providerId);
     if (!acct) {
-      const er = poolEarliestRetry();
+      const er = poolEarliestRetry(cfg.providerId);
       const msg = er
         ? '[账号暂时受限] 所有账号均在指数退避中（动态风控无固定解冻时间，到期后由真实请求探测恢复）。最早探测时间约 ' + Math.max(1, Math.ceil((er.cooldownUntil - Date.now()) / 60000)) + ' 分钟后。可稍后重试，或通过 POST /accounts/add 添加账号。'
         : '[无可用账号] 全部账号未登录或已禁用。请打开 http://127.0.0.1:5688/login 登录，或通过 /accounts 管理账号。';
@@ -1254,6 +1308,9 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
                     silentStart = Date.now();
                     emitCurrentDelta = false;
                     log('toolMode → silent (toolBuf[:80]=' + toolBuf.slice(0, 80).replace(/\n/g, '\\n') + ')');
+                  } else if (isPossibleToolCallPrefix(toolBuf)) {
+                    /* 标记可能跨 delta 才完整；在此之前不能把前缀泄漏为 content。 */
+                    emitCurrentDelta = false;
                   } else {
                     toolMode = 'stream';
                     log('toolMode → stream (toolBuf len=' + toolBuf.length + ')');
@@ -2042,7 +2099,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {
       gatewayRequestCount++;
       const payload = JSON.parse((await readBody(req)) || '{}');
-      log('请求: model=' + (payload.model || '?') + ' msgs=' + (payload.messages || []).length + ' tools=' + ((payload.tools || []).length));
+      const validation = validateChatPayload(payload, true);
+      if (validation) return sendJson(res, { error: { message: validation.message, type: 'invalid_request_error', code: validation.code } }, validation.status);
+      log('请求: model=' + payload.model + ' msgs=' + payload.messages.length + ' tools=' + ((payload.tools || []).length));
       /* 诊断：记录工具名列表（首次记录到 baseDir/tools.log） */
       try {
         const tlog = path.join(BASE_DIR, 'tools.log');
@@ -2059,8 +2118,8 @@ const server = http.createServer(async (req, res) => {
       if (payload.model === 'workbuddy-agent') {
         return handleWorkBuddy(req, res, payload);
       }
-      const resolvedModel = resolveProviderModel(payload.model || 'deepseek-chat');
-      if (!resolvedModel) return sendJson(res, { error: { message: 'unknown model: ' + (payload.model || ''), type: 'invalid_request_error', code: 'model_not_found' } }, 404);
+      const resolvedModel = resolveProviderModel(payload.model);
+      if (!resolvedModel) return sendJson(res, { error: { message: 'unknown model: ' + payload.model, type: 'invalid_request_error', code: 'model_not_found' } }, 404);
       return handleChatCompletion(req, res, payload, resolvedModel);
     }
     if (req.method === 'GET' && p === '/') {
@@ -2080,12 +2139,13 @@ const server = http.createServer(async (req, res) => {
       const providerId = providerFromQuery(u.searchParams);
       if (!providerId) return sendJson(res, { error: { message: 'unknown provider', type: 'invalid_request_error', code: 'provider_not_found' } }, 400);
       const accountName = (u.searchParams.get('profile') || 'default').trim() || 'default';
-      const profileName = providerProfile(providerId, accountName);
+      const account = poolEnsure(providerId, accountName);
+      const profileName = providerProfile(providerId, account.name);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end('<!doctype html><html><body style="font-family:sans-serif;padding:24px;background:#17181c;color:#ddd"><h2>' + getProvider(providerId).label + ' 网页版登录（账号: ' + profileName + '）</h2><p>已打开浏览器窗口，请在其中登录该提供方网站。登录完成后会自动检测。</p><p><a href="/">返回插件管理页</a> · <a href="/login-status?provider=' + providerId + '">查看登录状态</a> · <a href="/accounts">账号列表</a></p></body></html>');
       await ensureDriver();
       poolLogin(profileName, 300000, providerId)
-        .then((r) => { if (r && r.ok) poolMarkOk(accountName); log('登录结果(' + providerId + '/' + profileName + '):', JSON.stringify(r).slice(0, 160)); })
+        .then((r) => { if (r && r.ok) poolMarkOk(account.name); log('登录结果(' + providerId + '/' + profileName + '):', JSON.stringify(r).slice(0, 160)); })
         .catch((e) => log('登录失败(' + providerId + '/' + profileName + '):', e.message));
       return;
     }
@@ -2098,29 +2158,36 @@ const server = http.createServer(async (req, res) => {
       gatewayRequestCount++;
       const b = JSON.parse((await readBody(req)) || '{}');
       try {
-        const a = poolAdd(String(b.name || '').trim());
-        log('添加账号: ' + a.name + '（触发登录窗口）');
+        const providerId = b.provider === undefined ? 'deepseek' : (getProvider(String(b.provider)) ? String(b.provider) : null);
+        if (!providerId) throw new Error('provider 不存在');
+        const a = poolAdd(String(b.name || '').trim(), providerId);
+        const profileName = providerProfile(providerId, a.name);
+        log('添加账号: ' + a.name + '（provider=' + providerId + '，触发登录窗口）');
         /* 异步触发登录（HTTP 立即返回；登录状态通过 /accounts 查看） */
-        ensureDriver().then(() => poolLogin(a.name, 300000))
-          .then((r) => { if (r && r.ok) { poolMarkOk(a.name); log('账号 ' + a.name + ' 登录成功'); } else log('账号 ' + a.name + ' 登录未完成（可打开 /login?profile=' + a.name + ' 重试）'); })
+        ensureDriver().then(() => poolLogin(profileName, 300000, providerId))
+          .then((r) => { if (r && r.ok) { poolMarkOk(a.name); log('账号 ' + a.name + ' 登录成功'); } else log('账号 ' + a.name + ' 登录未完成（可打开 /login?provider=' + providerId + '&profile=' + a.name + ' 重试）'); })
           .catch((e) => log('账号 ' + a.name + ' 登录异常: ' + e.message));
-        return sendJson(res, { ok: true, account: { name: a.name, state: a.state }, message: '账号已入池，浏览器登录窗口已打开（5 分钟超时）。登录状态请查看 /accounts' });
+        return sendJson(res, { ok: true, account: { name: a.name, providerId: a.providerId, state: a.state }, message: '账号已入池，浏览器登录窗口已打开（5 分钟超时）。登录状态请查看 /accounts' });
       } catch (e) { return sendJson(res, { ok: false, error: String(e.message || e) }); }
     }
     if ((p === '/accounts/disable' || p === '/accounts/enable') && req.method === 'POST') {
       gatewayRequestCount++;
       const b = JSON.parse((await readBody(req)) || '{}');
       try {
-        const a = poolSetEnabled(String(b.name || '').trim(), p === '/accounts/enable');
-        return sendJson(res, { ok: true, account: { name: a.name, state: a.state }, note: p === '/accounts/enable' ? '已启用，需登录验证（/login?profile=' + a.name + '）后才可恢复使用' : '已禁用' });
+        const providerId = b.provider === undefined ? 'deepseek' : (getProvider(String(b.provider)) ? String(b.provider) : null);
+        if (!providerId) throw new Error('provider 不存在');
+        const a = poolSetEnabled(String(b.name || '').trim(), p === '/accounts/enable', providerId);
+        return sendJson(res, { ok: true, account: { name: a.name, providerId: a.providerId, state: a.state }, note: p === '/accounts/enable' ? '已启用，需登录验证（/login?provider=' + providerId + '&profile=' + a.name + '）后才可恢复使用' : '已禁用' });
       } catch (e) { return sendJson(res, { ok: false, error: String(e.message || e) }); }
     }
     if (p === '/accounts/remove' && req.method === 'POST') {
       gatewayRequestCount++;
       const b = JSON.parse((await readBody(req)) || '{}');
       try {
-        const a = poolRemove(String(b.name || '').trim(), !!b.confirm);
-        return sendJson(res, { ok: true, removed: a.name, note: '账号已移出池。浏览器 profile 目录保留在 runtime/profiles/' + a.name + '（如需彻底删除请手动清理）' });
+        const providerId = b.provider === undefined ? 'deepseek' : (getProvider(String(b.provider)) ? String(b.provider) : null);
+        if (!providerId) throw new Error('provider 不存在');
+        const a = poolRemove(String(b.name || '').trim(), !!b.confirm, providerId);
+        return sendJson(res, { ok: true, removed: a.name, providerId: a.providerId, note: '账号已移出池。浏览器 profile 目录保留在 runtime/profiles/' + a.name + '（如需彻底删除请手动清理）' });
       } catch (e) { return sendJson(res, { ok: false, error: String(e.message || e) }); }
     }
     if (req.method === 'GET' && p === '/login-status') {

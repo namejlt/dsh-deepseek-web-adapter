@@ -11,7 +11,7 @@
 2. [环境要求](#2-环境要求)
 3. [五分钟上手](#3-五分钟上手)
 4. [支持的模型与 Beta 边界](#4-支持的模型与-beta-边界)
-5. [DeepSeek 多账号与限流自动切换](#5-deepseek-多账号与限流自动切换)
+5. [Provider 隔离的多账号与限流自动切换](#5-provider-隔离的多账号与限流自动切换)
 6. [日常运维（API 速查）](#6-日常运维api-速查)
 7. [故障排查 FAQ](#7-故障排查-faq)
 8. [卸载与数据清理](#8-卸载与数据清理)
@@ -130,7 +130,7 @@ ChatGPT 若出现 Cloudflare、Turnstile 或其他 challenge，网关返回需�
 
 请不要把该 Beta 通道用于附件、多模态输入、网页原生 artifact、iframe/web-dev 产物或挑战求解。ChatGPT challenge 必须由人在浏览器中完成；错误会明确提示手动登录路径，而不是伪装成 DOM 问题。
 
-## 5. DeepSeek 多账号与限流自动切换
+## 5. Provider 隔离的多账号与限流自动切换
 
 ### 5.1 为什么需要多账号
 
@@ -143,13 +143,20 @@ ChatGPT 若出现 Cloudflare、Turnstile 或其他 challenge，网关返回需�
 curl -X POST http://127.0.0.1:5688/accounts/add -d '{"name": "acc2"}'
 ```
 
-每个账号有独立的浏览器 profile（`runtime/profiles/<账号名>/`）。也可以直接用 URL 登录指定账号：
+账号池状态也按 provider 隔离：ChatGPT/Qwen 的 quota、cooling、登录失效不会冷却或禁用同名的 DeepSeek/Qwen/ChatGPT 账号。DeepSeek 的历史账号名和 `default` profile 保持兼容。
+
+每个 provider 账号有独立的浏览器 profile（`runtime/profiles/<provider>-<账号名>/`）。也可以直接用 URL 登录指定账号：
 
 ```
+# 保持旧 DeepSeek 入口兼容
 http://127.0.0.1:5688/login?profile=acc2
+
+# ChatGPT/Qwen 指定 provider；账号池 API 同样接受 provider 字段
+http://127.0.0.1:5688/login?provider=qwen&profile=acc2
+curl -X POST http://127.0.0.1:5688/accounts/add -d '{"provider":"qwen","name":"acc2"}'
 ```
 
-账号名规则：字母数字与 `-_`，≤ 32 字符。默认上限 3 个账号（`/config` 可调，最多 8）。
+账号名规则：字母数字与 `-_`，≤ 32 字符。默认每个 provider 上限 3 个账号（`/config` 可调，最多 8）。
 
 ### 5.3 受限时会发生什么（重要：正确预期）
 
