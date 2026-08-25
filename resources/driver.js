@@ -624,31 +624,27 @@ const EXPR = {
       if (['p','div','li','br','h1','h2','h3','h4','h5','h6'].includes(tag)) out.push('\\n');
     }
     function fullText(el) { const out = []; walk(el, out); return out.join('').trim(); }
-    const direct = ['.ds-assistant-message-main-content','[class*="assistant-message-main"]','.ds-markdown','[class*="assistant"] [class*="markdown"]','[class*="assistant"] [class*="content"]','[data-role="assistant"] [class*="content"]','[class*="ai-message"] [class*="content"]','[class*="bot-message"] [class*="content"]','[class*="response-content"]','[class*="answer-content"]','[class*="reply-content"]','[class*="message-body"]','[class*="message-content"]','[class*="chat-message"] [class*="text"]','[class*="conversation"] [class*="item"]:last-child'];
-    /* Only DeepSeek's explicitly assistant-scoped containers may return a short
-     * final answer such as "2". Keep the broader cross-site fallbacks conservative
-     * so composer/UI fragments cannot be mistaken for a response. */
-    const shortDirect = new Set(['.ds-assistant-message-main-content', '[class*="assistant-message-main"]']);
-    for (const s of direct) { const els = document.querySelectorAll(s); if (els.length) { const t = fullText(els[els.length - 1]); if (t.length > 10 || (shortDirect.has(s) && t.length > 0)) return t; } }
-    const md = document.querySelectorAll('[class*="markdown"], [class*="prose"], [class*="rendered"], [class*="text-content"], [class*="answer"]');
-    if (md.length) { const t = fullText(md[md.length - 1]); if (t.length > 10) return t; }
-    const blocks = Array.from(document.querySelectorAll('[class*="message"], [class*="chat-item"], [class*="turn"], [class*="chat-row"], [class*="conversation-item"]'));
-    const cands = blocks.filter((el) => {
-      const cls = String(el.className || '').toLowerCase();
-      return !cls.includes('input') && !cls.includes('user') && !cls.includes('question') && !el.querySelector('textarea, input[type="text"]') && ((el.innerText || '').length > 20);
-    });
-    if (cands.length) return fullText(cands[cands.length - 1]);
-    /* V4 最后兜底：限定在对话区域内搜索，避免匹配到用户输入或其他 UI 文本 */
-    const conv = document.querySelector('[class*="conversation"], [class*="chat-list"], [class*="message-list"], [class*="chat-history"], [class*="chat-content"], main, [role="main"]');
-    const scope = conv || document.body;
-    const items = scope.querySelectorAll('[class*="message"], [class*="chat-item"], [class*="turn"], [class*="chat-row"], [class*="conversation-item"], [class*="answer"], [class*="reply"]');
-    const assistantItems = Array.from(items).filter((el) => {
-      const cls = String(el.className || '').toLowerCase();
-      return !cls.includes('input') && !cls.includes('user') && !cls.includes('question') &&
-             !el.querySelector('textarea, input[type="text"]') &&
-             (el.innerText || '').length > 20;
-    });
-    if (assistantItems.length) return fullText(assistantItems[assistantItems.length - 1]);
+    /* Only extract from a root that explicitly identifies an assistant message.
+     * Unscoped markdown/content/message selectors can point to the user's latest
+     * input and must never enter DSH's content or tool-call parser. Returning an
+     * empty string when no verified root exists is safer than emitting a prompt. */
+    const assistantRoots = [
+      '.ds-assistant-message-main-content',
+      '[class*="assistant-message-main"]',
+      '[data-role="assistant"]',
+      '[data-message-author-role="assistant"]',
+      '[class*="assistant"][class*="message"]',
+      '[class*="ai-message"]',
+      '[class*="bot-message"]',
+    ];
+    for (const selector of assistantRoots) {
+      const nodes = document.querySelectorAll(selector);
+      if (!nodes.length) continue;
+      const text = fullText(nodes[nodes.length - 1]);
+      /* A verified assistant root may legitimately contain a one-character answer
+       * or a tool-call prefix, so do not impose a text-length threshold here. */
+      if (text) return text;
+    }
     return '';
   })()`,
 

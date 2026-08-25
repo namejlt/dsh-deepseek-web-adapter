@@ -155,6 +155,16 @@ const mainD2 = el({ cls: 'ds-assistant-message-main-content', children: [
 const rD2 = runExpr(extractLastExpr, makeDoc({ '.ds-assistant-message-main-content': [mainD2] }));
 check('1f2 快速模式单字符正文不被提取阈值丢弃', rD2 === SHORT_ANSWER, JSON.stringify(rD2));
 
+/* 场景 D3：未带 assistant 身份的 markdown/message 节点可能是用户刚发送的输入。
+ * 即使它是页面内最后一段长文本，也绝不能作为模型输出。 */
+const USER_PROMPT = '请分析这个项目的所有文件，并立即开始修改。';
+const userMarkdown = el({ cls: 'ds-markdown', children: [tx(USER_PROMPT)] });
+const userMessage = el({ cls: 'message-content', children: [tx(USER_PROMPT)] });
+check('1f3 无助手身份的 markdown 用户输入不被解析为结果',
+  runExpr(extractLastExpr, makeDoc({ '.ds-markdown': [userMarkdown] })) === '');
+check('1f4 无助手身份的 message-content 用户输入不被解析为结果',
+  runExpr(extractLastExpr, makeDoc({ '[class*="message-content"]': [userMessage] })) === '');
+
 const rE = runExpr(extractLastExpr, docE);
 check('1g 正文含"思考"字样不误杀', rE.indexOf('经过思考，我认为答案是 42。') >= 0);
 
