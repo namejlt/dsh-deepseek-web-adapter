@@ -2624,7 +2624,8 @@ function parseToolCalls(text, tools) {
         } catch (e) { /* keep raw text */ }
         args[key] = val;
       }
-      if (Object.keys(args).length) out.push({ name, arguments: JSON.stringify(normalizeArgsForTool(name, args)) });
+      /* 只返回原始候选；调用方必须经 pushCall() 校验授权工具名并规范化参数。 */
+      if (Object.keys(args).length) out.push({ name, arguments: args });
     }
     return out;
   }
@@ -2801,7 +2802,9 @@ function parseToolCalls(text, tools) {
     }
     if (!calls.length) {
       const xmlCalls = recoverInvokeXmlCalls(sourceText);
-      if (xmlCalls.length) calls.push(...xmlCalls);
+      for (const candidate of xmlCalls) {
+        if (pushCall(candidate)) break;
+      }
     }
     if (!calls.length) {
       /* 兜底：Python 风格函数调用（参考实现 Strategy 6）：```write_file(path="a.txt", content="hi")``` */
@@ -2819,7 +2822,8 @@ function parseToolCalls(text, tools) {
           else if (m[4] !== undefined) args[key] = parseFloat(m[4]);
           else if (m[5] !== undefined) args[key] = m[5] === 'true';
         }
-        if (fname && Object.keys(args).length) calls.push({ name: fname, arguments: JSON.stringify(args) });
+        /* Python 兼容格式也必须走统一的授权与 schema 推断，不转发模型编造的函数名。 */
+        if (fname && Object.keys(args).length) pushCall({ name: fname, arguments: args });
       }
     }
   }

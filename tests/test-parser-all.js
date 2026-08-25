@@ -170,6 +170,9 @@ if (g13d.length) {
 }
 const noWriteTools = tools.filter((t) => (t.function || t).name !== 'write');
 checkWith('G14 纯参数对象若目标工具未授权则拒绝恢复', '{"file_path": "a.txt", "content": "hi"}', '', noWriteTools);
+checkWith('G15 XML 未授权工具不转发', '<tool_calls><invoke name="fantasy_tool"><parameter name="x">1</parameter></invoke></tool_calls>', '', tools);
+checkWith('G16 Python 未授权工具不转发', '```\nfantasy_tool(x="1")\n```', '', tools);
+check('G17 Python 已授权工具仍可恢复', '```\nwrite(file_path="a.txt", content="hi")\n```', 'write');
 
 /* ============ H. looksLikeToolCall 辅助检测（安全网触发条件） ============ */
 const llc = eval('(' + src.slice(src.indexOf('function looksLikeToolCall'), src.indexOf('\nhandlers.streamAsk', src.indexOf('function looksLikeToolCall'))) + ')');

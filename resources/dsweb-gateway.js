@@ -1038,6 +1038,39 @@ function looksLikeToolCallText(t, tools) {
   }
   return false;
 }
+/** 判断短缓冲是否仍可能拼成支持的工具调用标记。
+ * 只在首个分片尚不完整时短暂延迟，避免将 `` ` `` / `<` / `tool_`
+ * 等前缀先作为 content 发出，后续又以 tool_calls 结束同一轮。 */
+function isPossibleToolCallPrefix(text) {
+  const s = String(text || '').trim().toLowerCase();
+  if (!s || s.length > 96) return false;
+  const prefixes = [
+    '`', '``', '```', '```t', '```to', '```too', '```tool', '```tool_', '```tool_c', '```tool_ca', '```tool_cal',
+    '```j', '```js', '```jso',
+    '<', '<t', '<to', '<too', '<tool', '<tool_', '<tool_c', '<tool_ca', '<tool_cal', '<tool_call', '<tool_call>', '<tool_calls', '<tool_calls>',
+    '<i', '<in', '<inv', '<invo', '<invok', '<invoke',
+    't', 'to', 'too', 'tool', 'tool_', 'tool_c', 'tool_ca', 'tool_cal', 'tool_call',
+    '{', '[',
+  ];
+  return prefixes.includes(s);
+}
+
+/** 校验 OpenAI chat/completions 请求。必须在 SSE/driver 之前执行，
+ * 以便调用方收到明确的 HTTP JSON 错误，而不是半截流或浏览器副作用。 */
+function validateChatPayload(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { status: 400, code: 'invalid_request', message: 'request body must be a JSON object' };
+  }
+  if (typeof payload.model !== 'string' || !Object.prototype.hasOwnProperty.call(MODELS, payload.model)) {
+    return { status: 404, code: 'model_not_found', message: 'model not found: ' + String(payload.model || '') };
+  }
+  const msgs = payload.messages;
+  if (!Array.isArray(msgs) || !msgs.length || msgs.some((m) => !m || typeof m !== 'object' || Array.isArray(m) || typeof m.role !== 'string' || !m.role)) {
+    return { status: 400, code: 'invalid_messages', message: 'messages must be a non-empty array of role-bearing objects' };
+  }
+  return null;
+}
+
 /**
  * 处理 /v1/chat/completions（网关主流程，OpenAI 兼容契约的唯一实现点）。
  * 流程：会话识别 → 会话锁/信号量 → 账号调度 → askOnce 循环
@@ -1050,8 +1083,13 @@ function looksLikeToolCallText(t, tools) {
  * @param {object} payload 已解析的请求体（model/messages/tools/stream）
  */
 async function handleChatCompletion(req, res, payload) {
-  const model = payload.model || 'deepseek-chat';
-  const cfg = MODELS[model] || MODELS['deepseek-chat'];
+  const validation = validateChatPayload(payload);
+  if (validation) {
+    sendJson(res, { error: { message: validation.message, type: 'invalid_request_error', code: validation.code } }, validation.status);
+    return;
+  }
+  const model = payload.model;
+  const cfg = MODELS[model];
   const created = Math.floor(Date.now() / 1000);
   const cid = 'chatcmpl-' + created;
   /* OpenAI 兼容：stream=false → 完整 JSON 响应（旧实现一律 SSE，非流式客户端解析必炸） */
@@ -1228,6 +1266,9 @@ async function handleChatCompletion(req, res, payload) {
                     silentStart = Date.now();
                     emitCurrentDelta = false;
                     log('toolMode → silent (toolBuf[:80]=' + toolBuf.slice(0, 80).replace(/\n/g, '\\n') + ')');
+                  } else if (isPossibleToolCallPrefix(toolBuf)) {
+                    /* 标记可能被拆在多个 delta 中；继续缓冲，不能先泄漏 content。 */
+                    emitCurrentDelta = false;
                   } else {
                     toolMode = 'stream';
                     log('toolMode → stream (toolBuf len=' + toolBuf.length + ')');
