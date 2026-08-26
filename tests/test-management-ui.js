@@ -76,7 +76,7 @@ function makeGateway(tmpBase) {
   const chatgpt = providers.providers.find((provider) => provider.id === 'chatgpt');
   check('3b ChatGPT challenge 优先显示人工操作状态', chatgpt && chatgpt.status === 'challenge' && chatgpt.action.kind === 'challenge' && chatgpt.defaultProfile === 'chatgpt-default' && chatgpt.models.length === 2, JSON.stringify(chatgpt));
   const qwen = providers.providers.find((provider) => provider.id === 'qwen');
-  check('3c Qwen 聚合含独立默认 profile 与三个模型', qwen && qwen.defaultProfile === 'qwen-default' && qwen.models.length === 3, JSON.stringify(qwen));
+  check('3c Qwen 聚合含独立默认 profile 与六个模型', qwen && qwen.defaultProfile === 'qwen-default' && qwen.models.length === 6, JSON.stringify(qwen));
 
   const health = await gw.buildHealthPayload();
   check('3d health payload 含 summary', health.summary && health.summary.gateway === 'down' && health.summary.login === 'logged_in', JSON.stringify(health.summary));

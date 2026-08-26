@@ -35,7 +35,7 @@ process.stdin.on('data', (chunk) => {
     const msg = JSON.parse(line); record(msg);
     if (msg.method === 'streamAsk') {
       const streamId = 'fake-' + msg.id;
-      const errorKinds = { 'chatgpt-thinking': 'mode_unavailable', 'qwen-chat': 'challenge_required', 'qwen-search': 'dom_unavailable' };
+      const errorKinds = { 'chatgpt-thinking': 'mode_unavailable', 'qwen-auto': 'challenge_required', 'qwen-fast': 'dom_unavailable' };
       const errorKind = msg.params && msg.params.model && errorKinds[msg.params.model.id];
       out({ id: msg.id, ok: true, result: { streamId } });
       setTimeout(() => out(errorKind
@@ -117,7 +117,7 @@ function driverRecords() {
 
     const modelsResponse = await request(port, 'GET', '/v1/models');
     const models = JSON.parse(modelsResponse.text).data;
-    assert.strictEqual(models.length, 13, 'all provider models must be advertised');
+    assert.strictEqual(models.length, 16, 'all provider models must be advertised');
     assert.deepStrictEqual(models.map((model) => model.owned_by), models.map((model) => model.id.split('-')[0] + '-web'));
 
     const providersResponse = await request(port, 'GET', '/providers');
@@ -125,7 +125,7 @@ function driverRecords() {
     const providers = JSON.parse(providersResponse.text).providers;
     assert.deepStrictEqual(providers.map((provider) => provider.id), ['deepseek', 'chatgpt', 'qwen']);
     assert.strictEqual(providers.find((provider) => provider.id === 'chatgpt').defaultProfile, 'chatgpt-default');
-    assert.strictEqual(providers.find((provider) => provider.id === 'qwen').models.length, 3);
+    assert.strictEqual(providers.find((provider) => provider.id === 'qwen').models.length, 6);
     const setupResponse = await request(port, 'GET', '/setup');
     assert.strictEqual(setupResponse.status, 200, setupResponse.text);
     assert.strictEqual(JSON.parse(setupResponse.text).providers.providers.length, 3, 'setup must embed provider aggregate for one-page refresh');
@@ -154,8 +154,8 @@ function driverRecords() {
 
     for (const expected of [
       { model: 'chatgpt-thinking', status: 422, code: 'provider_mode_unavailable' },
-      { model: 'qwen-chat', status: 403, code: 'provider_challenge_required' },
-      { model: 'qwen-search', status: 503, code: 'provider_dom_unavailable' },
+      { model: 'qwen-auto', status: 403, code: 'provider_challenge_required' },
+      { model: 'qwen-fast', status: 503, code: 'provider_dom_unavailable' },
     ]) {
       const response = await request(port, 'POST', '/v1/chat/completions', { model: expected.model, messages: [{ role: 'user', content: 'error route' }], stream: false });
       const body = JSON.parse(response.text);

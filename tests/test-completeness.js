@@ -50,7 +50,7 @@ const DOCS = Object.fromEntries([
   ['multisiteSpec', 'spec/SPEC-multisite.md'],
   ['multisiteDesign', 'docs/superpowers/specs/2026-08-24-multisite-web-provider-design.md'],
 ].map(([key, file]) => [key, fs.readFileSync(path.join(ROOT, file), 'utf8')]));
-const MULTISITE_MODEL_IDS = ['chatgpt-auto', 'chatgpt-thinking', 'qwen-chat', 'qwen-thinking', 'qwen-search'];
+const MULTISITE_MODEL_IDS = ['chatgpt-auto', 'chatgpt-thinking', 'qwen-auto', 'qwen-thinking', 'qwen-fast', 'qwen-auto-max', 'qwen-thinking-max', 'qwen-fast-max'];
 const publicDocs = [DOCS.readmeZh, DOCS.readmeEn, DOCS.userGuide].join('\n');
 check('Docs identify the Beta Web-to-OpenAI multisite gateway',
   /Beta/.test(publicDocs) && /Web-to-OpenAI|Web → OpenAI|Web-to-OpenAI/.test(publicDocs),

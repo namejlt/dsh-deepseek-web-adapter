@@ -85,9 +85,12 @@ dsweb:
         { id: deepseek-vision-reasoner, name: DeepSeek 识图+深度思考 },
         { id: chatgpt-auto, name: ChatGPT 自动（Beta） },
         { id: chatgpt-thinking, name: ChatGPT 思考（Beta） },
-        { id: qwen-chat, name: Qwen 对话（Beta） },
+        { id: qwen-auto, name: Qwen 自动（Beta） },
         { id: qwen-thinking, name: Qwen 思考（Beta） },
-        { id: qwen-search, name: Qwen 搜索（Beta） }
+        { id: qwen-fast, name: Qwen 快速（Beta） },
+        { id: qwen-auto-max, name: Qwen 自动 Max（Beta） },
+        { id: qwen-thinking-max, name: Qwen 思考 Max（Beta） },
+        { id: qwen-fast-max, name: Qwen 快速 Max（Beta） }
       ]
   }
 ```
@@ -126,7 +129,7 @@ ChatGPT 若出现 Cloudflare、Turnstile 或其他 challenge，网关返回需�
 |---|---|---|
 | DeepSeek | 既有 `deepseek-*` 八种组合 | 保持已有快速/思考/搜索/专家/识图能力 |
 | ChatGPT | `chatgpt-auto`、`chatgpt-thinking` | 文本、代码块、基础 SSE；thinking 仅在可靠控件可用时启用 |
-| Qwen | `qwen-chat`、`qwen-thinking`、`qwen-search` | 文本、代码块、基础 SSE；模式开关不可用时返回 `mode_unavailable` |
+| Qwen | `qwen-auto`、`qwen-thinking`、`qwen-fast`、`qwen-auto-max`、`qwen-thinking-max`、`qwen-fast-max` | 文本、代码块、基础 SSE；模式开关不可用时返回 `mode_unavailable` |
 
 请不要把该 Beta 通道用于附件、多模态输入、网页原生 artifact、iframe/web-dev 产物或挑战求解。ChatGPT challenge 必须由人在浏览器中完成；错误会明确提示手动登录路径，而不是伪装成 DOM 问题。
 

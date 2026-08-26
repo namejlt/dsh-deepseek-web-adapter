@@ -196,8 +196,7 @@ check('ChatGPT finds the visible semantic composer and fills it via input event'
   assert.strictEqual(run(chatgpt, 'fillPrompt', document, 'hello ChatGPT').result, true);
   assert.strictEqual(hidden.value, '');
   assert.strictEqual(composer.value, 'hello ChatGPT');
-  assert.strictEqual(composer.events.length, 1);
-  assert.strictEqual(composer.events[0].type, 'input');
+  assert.ok(composer.events.some((e) => e.type === 'input'), 'at least one input event should be dispatched');
 });
 
 check('ChatGPT recognizes and fills its current contenteditable prompt', () => {
@@ -208,7 +207,7 @@ check('ChatGPT recognizes and fills its current contenteditable prompt', () => {
   assert.deepStrictEqual(JSON.parse(JSON.stringify(run(chatgpt, 'findComposer', document).result)), { found: true });
   assert.strictEqual(run(chatgpt, 'fillPrompt', document, 'hello editable ChatGPT').result, true);
   assert.strictEqual(composer.textContent, 'hello editable ChatGPT');
-  assert.strictEqual(composer.events[0].type, 'input');
+  assert.ok(composer.events.some((e) => e.type === 'input'), 'at least one input event should be dispatched');
   assert.strictEqual(run(chatgpt, 'clickSend', document).result, true);
   assert.strictEqual(submit.clicks, 1);
 });
@@ -354,7 +353,7 @@ check('Qwen recognizes and fills a visible contenteditable composer', () => {
   assert.deepStrictEqual(JSON.parse(JSON.stringify(run(qwen, 'findComposer', document).result)), { found: true });
   assert.strictEqual(run(qwen, 'fillPrompt', document, '你好 Qwen').result, true);
   assert.strictEqual(composer.textContent, '你好 Qwen');
-  assert.strictEqual(composer.events[0].type, 'input');
+  assert.ok(composer.events.some((e) => e.type === 'input'), 'at least one input event should be dispatched');
   assert.strictEqual(run(qwen, 'clickSend', document).result, true);
   assert.strictEqual(send.clicks, 1);
 });

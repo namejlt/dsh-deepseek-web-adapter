@@ -78,30 +78,31 @@ check('preserves all eight DeepSeek models with provider ownership', () => {
   });
 });
 
-check('lists all public models with the final five in defined order', () => {
+check('lists all public models with the final six in defined order', () => {
   const listed = listModels();
-  assert.strictEqual(listed.length, 13);
-  assert.deepStrictEqual(listed.slice(-5), [
-    { id: 'chatgpt-auto', providerId: 'chatgpt', name: 'ChatGPT 自动（网页版）', mode: 'auto' },
-    { id: 'chatgpt-thinking', providerId: 'chatgpt', name: 'ChatGPT 思考（网页版）', mode: 'thinking' },
-    { id: 'qwen-chat', providerId: 'qwen', name: 'Qwen 对话（网页版）', mode: 'chat', thinking: false, search: false },
-    { id: 'qwen-thinking', providerId: 'qwen', name: 'Qwen 思考（网页版）', mode: 'chat', thinking: true, search: false },
-    { id: 'qwen-search', providerId: 'qwen', name: 'Qwen 搜索（网页版）', mode: 'chat', thinking: false, search: true },
+  assert.strictEqual(listed.length, 16);
+  assert.deepStrictEqual(listed.slice(-6), [
+    { id: 'qwen-auto', providerId: 'qwen', name: 'Qwen 自动（网页版）', mode: 'auto', modelName: 'Qwen3.7-Plus' },
+    { id: 'qwen-thinking', providerId: 'qwen', name: 'Qwen 思考（网页版）', mode: 'thinking', modelName: 'Qwen3.7-Plus' },
+    { id: 'qwen-fast', providerId: 'qwen', name: 'Qwen 快速（网页版）', mode: 'fast', modelName: 'Qwen3.7-Plus' },
+    { id: 'qwen-auto-max', providerId: 'qwen', name: 'Qwen 自动 Max（网页版）', mode: 'auto', modelName: 'Qwen3.8-Max' },
+    { id: 'qwen-thinking-max', providerId: 'qwen', name: 'Qwen 思考 Max（网页版）', mode: 'thinking', modelName: 'Qwen3.8-Max' },
+    { id: 'qwen-fast-max', providerId: 'qwen', name: 'Qwen 快速 Max（网页版）', mode: 'fast', modelName: 'Qwen3.8-Max' },
   ]);
   assert.strictEqual(listed[0].id, 'deepseek-chat');
   assert.strictEqual(listed[0].provider, undefined);
 });
 
 check('resolves models with a fresh record and matching provider metadata', () => {
-  const resolved = resolveModel('qwen-search');
+  const resolved = resolveModel('qwen-fast');
   assert.deepStrictEqual(resolved, {
-    id: 'qwen-search', providerId: 'qwen', name: 'Qwen 搜索（网页版）', mode: 'chat', thinking: false, search: true,
+    id: 'qwen-fast', providerId: 'qwen', name: 'Qwen 快速（网页版）', mode: 'fast', modelName: 'Qwen3.7-Plus',
     provider: PROVIDERS.qwen,
   });
-  assert.strictEqual(resolved.search, true);
-  assert.notStrictEqual(resolved, MODELS['qwen-search']);
+  assert.strictEqual(resolved.mode, 'fast');
+  assert.notStrictEqual(resolved, MODELS['qwen-fast']);
   resolved.name = 'changed only here';
-  assert.strictEqual(MODELS['qwen-search'].name, 'Qwen 搜索（网页版）');
+  assert.strictEqual(MODELS['qwen-fast'].name, 'Qwen 快速（网页版）');
   assert.strictEqual(resolveModel('missing-model'), null);
 });
 

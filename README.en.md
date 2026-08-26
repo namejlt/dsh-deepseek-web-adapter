@@ -9,7 +9,7 @@
 The DSH plugin still starts one local gateway exposing `/v1/models` and `/v1/chat/completions` (SSE). Existing DeepSeek models remain available; the Beta adds:
 
 - ChatGPT: `chatgpt-auto`, `chatgpt-thinking`
-- Qwen: `qwen-chat`, `qwen-thinking`, `qwen-search`
+- Qwen: `qwen-auto`, `qwen-thinking`, `qwen-fast`, `qwen-auto-max`, `qwen-thinking-max`, `qwen-fast-max`
 - Each provider has an independent browser profile, session, and login state; cookies and sessions are never shared across providers.
 
 **Conservative boundary:** text, code blocks, and basic SSE only. No attachments or multimodal input; no challenge solving or bypassing (CAPTCHA, Turnstile, etc.); no translation of native artifacts, tool cards, traces, or iframes into OpenAI-native artifacts.
@@ -68,9 +68,12 @@ dsweb:
         { id: deepseek-vision-reasoner, name: DeepSeek Vision + Deep Think },
         { id: chatgpt-auto, name: ChatGPT Auto (Beta) },
         { id: chatgpt-thinking, name: ChatGPT Thinking (Beta) },
-        { id: qwen-chat, name: Qwen Chat (Beta) },
+        { id: qwen-auto, name: Qwen Auto (Beta) },
         { id: qwen-thinking, name: Qwen Thinking (Beta) },
-        { id: qwen-search, name: Qwen Search (Beta) }
+        { id: qwen-fast, name: Qwen Fast (Beta) },
+        { id: qwen-auto-max, name: Qwen Auto Max (Beta) },
+        { id: qwen-thinking-max, name: Qwen Thinking Max (Beta) },
+        { id: qwen-fast-max, name: Qwen Fast Max (Beta) }
       ]
   }
 ```

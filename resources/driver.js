@@ -268,18 +268,31 @@ function makeWsClient(socket) {
 /* ------------------------------------------------------------------ */
 /* CDP client                                                          */
 /* ------------------------------------------------------------------ */
+const CDP_CALL_TIMEOUT_MS = 30000;
+
 class CdpClient {
   constructor(ws) {
     this.ws = ws;
     this.seq = 0;
     this.pending = new Map();
     this.listeners = [];
+    this.closed = false;
     ws.onMessage((m) => this._onMessage(m));
+    this._closeUnsub = ws.onMessage ? null : null;
+    this._onClose = () => {
+      this.closed = true;
+      for (const [id, p] of this.pending) {
+        p.reject(new Error('cdp connection closed'));
+      }
+      this.pending.clear();
+    };
   }
   _onMessage(m) {
+    if (m.method === '_closed') { this._onClose(); return; }
     if (m.id !== undefined) {
       const p = this.pending.get(m.id);
       if (p) {
+        clearTimeout(p.timer);
         this.pending.delete(m.id);
         if (m.error) p.reject(new Error(m.error.message || 'cdp error'));
         else p.resolve(m.result || {});
@@ -289,13 +302,18 @@ class CdpClient {
     }
   }
   call(method, params = {}, sessionId) {
+    if (this.closed) return Promise.reject(new Error('cdp connection closed'));
     const id = ++this.seq;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('cdp call timeout: ' + method + ' (' + (CDP_CALL_TIMEOUT_MS / 1000) + 's)'));
+      }, CDP_CALL_TIMEOUT_MS);
+      this.pending.set(id, { resolve, reject, timer });
       const msg = { id, method, params };
       if (sessionId) msg.sessionId = sessionId;
       try { this.ws.sendText(JSON.stringify(msg)); }
-      catch (e) { this.pending.delete(id); reject(e); }
+      catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
     });
   }
   on(listener) { this.listeners.push(listener); return () => { this.listeners = this.listeners.filter((l) => l !== listener); }; }
@@ -363,7 +381,7 @@ async function launchBrowser(profile) {
   /* 单一常驻浏览器原则：只要 profile 相同就复用同一 Chrome 实例，
    * 绝不因 headless 参数差异重建（重建会导致 DeepSeek 会话 cookie 丢失）。
    * 首次启动的 headless 状态决定窗口可见性；登录/推理/校准共用该实例。 */
-  if (browser.proc && browser.profile && browser.profile.name === profile.name && browser.cdp) return;
+  if (browser.proc && browser.profile && browser.profile.name === profile.name && browser.cdp && !browser.cdp.closed) return;
   /* profile 切换重启：所有通道页面的网页版历史将随旧浏览器销毁。
    * 通知网关把全部会话标记为 epoch 失配 → 各会话下一请求强制 recovery 重建，
    * 否则 delta 增量发进空白页面，模型文不对题。 */
@@ -416,7 +434,6 @@ async function launchBrowser(profile) {
           browser.ws = null;
           browser.pages.clear();
         }
-        browser.launching = null;
       });
       const portFile = path.join(dir, 'DevToolsActivePort');
       const content = await waitForFile(portFile, 25000);
@@ -535,12 +552,14 @@ async function evalJs(pageId, expression, opts) {
   return r.result && r.result.value;
 }
 
-/** 导航到 URL 并等待页面就绪（document.body 出现）。 */
+/** 导航到 URL 并等待页面就绪（document.body 出现）。
+ * CDP 调用自带 30s 超时；waitReady 额外轮询确保页面实际渲染。 */
 async function navigate(pageId, url) {
   const p = pageInfo(pageId);
   if (!p) throw new Error('page gone');
   await browser.cdp.call('Page.navigate', { url }, p.sessionId);
-  await waitReady(pageId, 30000);
+  const ready = await waitReady(pageId, 30000);
+  if (!ready) log('navigate waitReady timed out for ' + pageId + ' url=' + String(url).slice(0, 80));
 }
 
 /** 轮询等待页面就绪（readyState + body 存在），超时返回 false（导航中间态异常吞掉继续等）。 */
@@ -2489,11 +2508,23 @@ async function ensureChannelPage(pageKey, profile, providerId) {
     subPages.length = 0;
     channels.clear();
   }
+  /* 冷启动兜底：driver 刚拉起（或 Chrome 被外部关闭）时浏览器尚未运行，
+   * 必须先拉起浏览器再建通道页——否则 newPage() 抛 'browser not running'，
+   * 模型访问直接失败且不弹窗（/login 走 ensurePage 所以正常）。
+   * launchBrowser 内部会等待进行中的启动，天然串行化并发首请求。 */
+  if (!browser.cdp || browser.cdp.closed) {
+    log('ensureChannelPage: browser not running, launching profile ' + wantProfile);
+    await launchBrowser(profile || { name: wantProfile, headless: false });
+    thePage = null;
+    subPages.length = 0;
+    channels.clear();
+  }
   if (pageKey === 'main' && id === 'deepseek') return ensurePage(profile || { name: 'default', headless: false }, id);
   let ch = channels.get(key);
   if (ch && pageInfo(ch.pageId)) {
-    /* 健康检查：页面可能已崩溃/关闭 → 重建 */
     try { await evalJs(ch.pageId, '1'); return ch.pageId; } catch (e) { /* fallthrough: rebuild */ }
+    try { await closePage(ch.pageId); } catch (e2) { /* ignore */ }
+    channels.delete(key);
   }
   const pageId = subPages.pop() || await newPage();
   try { await navigate(pageId, siteUrl); } catch (e) { log('ensureChannelPage navigate warn', e.message); }
@@ -2504,8 +2535,8 @@ async function ensureChannelPage(pageKey, profile, providerId) {
 }
 
 /** 确保主 Agent 常驻页面（thePage）可用（任务模式用）：
- * 健康检查（evalJs('1')）连续 2 次失败 → 重建；否则复用。
- * 新建流程：开 tab → 导航 DeepSeek → 复核 URL 确实到达（防 about:blank 误判未登录）。 */
+ * 健康检查（evalJs('1')）失败 → 立即重建；不复用可能已损坏的页面。
+ * 新建流程：开 tab → 导航 → 复核 URL 确实到达（防 about:blank 误判未登录）。 */
 async function ensurePage(profile, providerId) {
   const id = resolveProviderAdapter(providerId).id;
   const siteUrl = providerUrl(id);
@@ -2514,22 +2545,15 @@ async function ensurePage(profile, providerId) {
     thePage = null; subPages.length = 0; channels.clear();
   }
   if (thePage && pageInfo(thePage)) {
-    /* 健康检查：页面可能看似存在但已崩溃（OOM/Navigation），连续 evalJs 失败则重建 */
     try {
       await evalJs(thePage, '1');
       thePageHealthFails = 0;
+      return thePage;
     } catch (e) {
       thePageHealthFails++;
-      log('ensurePage health check fail #' + thePageHealthFails, e.message);
-      if (thePageHealthFails >= 2) {
-        log('ensurePage thePage unhealthy, rebuilding');
-        try { await closePage(thePage); } catch (e2) { /* ignore */ }
-        thePage = null;
-      }
-    }
-    if (thePage) {
-      try { await waitReady(thePage, 15000); } catch (e) { /* ignore */ }
-      return thePage;
+      log('ensurePage health check fail #' + thePageHealthFails + ', rebuilding', e.message);
+      try { await closePage(thePage); } catch (e2) { /* ignore */ }
+      thePage = null;
     }
   }
   thePageHealthFails = 0;
@@ -2678,7 +2702,33 @@ function parseToolCalls(text, tools) {
       out[alias] = adaptValue(alias, v);
     }
     /* 保留规范参数；当完全无法规范化时回退原对象（保持旧行为）。 */
-    return Object.keys(out).length ? out : argsObj;
+    const normalized = Object.keys(out).length ? out : argsObj;
+    /* 必填参数补全（提示词与解析一致性）：模型经常只给 command 而漏掉
+     * description/justification 等说明型必填参数，DSH 执行端 required 校验会报
+     * 'missing required property xxx' 并作为工具错误回传，对话卡死。
+     * 按 schema 的 required 列表补齐缺失键（已有键绝不覆盖）：
+     * - 说明型参数（description/justification/reason...）用参数描述或工具名生成说明
+     * - 其余按类型默认值（string 空串 / boolean false / number 0 / array [] / object {}） */
+    const req = (fn.parameters && fn.parameters.required) || [];
+    if (req.length) {
+      for (const k of req) {
+        if (normalized[k] !== undefined) continue;
+        const def = props[k] || {};
+        const t = def.type || 'string';
+        if (t === 'string') {
+          if (/description|justification|reason|purpose|explanation|comment/i.test(k)) {
+            normalized[k] = def.description ? String(def.description).slice(0, 48) : ('执行 ' + name + ' 操作（自动补充）');
+          } else {
+            normalized[k] = def.description ? String(def.description).slice(0, 48) : '';
+          }
+        } else if (t === 'boolean') normalized[k] = false;
+        else if (t === 'number' || t === 'integer') normalized[k] = 0;
+        else if (t === 'array') normalized[k] = [];
+        else if (t === 'object') normalized[k] = {};
+        else normalized[k] = '';
+      }
+    }
+    return normalized;
   }
   function recoverInvokeXmlCalls(text) {
     const t = String(text || '');
@@ -2953,10 +3003,35 @@ async function adapterSignals(pageId, adapter) {
 }
 
 async function sendAdapterMessage(pageId, adapter, text) {
+  const cdp = browser.cdp;
+  const p = pageInfo(pageId);
+  if (!p) throw new Error('page gone');
   const filled = await evalJs(pageId, '(' + adapter.expressions.fillPrompt + ')(' + JSON.stringify(String(text)) + ')');
   if (!filled) throw providerError('dom_unavailable', adapter.id + ' composer not found');
-  const sent = await evalJs(pageId, adapter.expressions.clickSend);
-  if (!sent) throw providerError('dom_unavailable', adapter.id + ' send button not found');
+  await sleep(CFG.sendDelayMs);
+  let sendReady = false;
+  for (let i = 0; i < 10; i++) {
+    await sleep(300);
+    try {
+      sendReady = await evalJs(pageId, `(() => {
+        const sels = ['button[aria-label*="Send" i]','button[aria-label*="发送" i]','[data-testid="send-button"]','button[type="submit"]','[class*="send-btn"]','[class*="sendBtn"]','[class*="send-button"]','[class*="send-icon"]'];
+        for (const s of sels) { const el = document.querySelector(s); if (el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && !el.disabled && el.getAttribute('aria-disabled') !== 'true'; } }
+        return false;
+      })()`);
+    } catch (e) { /* ignore */ }
+    if (sendReady) break;
+  }
+  if (!sendReady) log('sendAdapterMessage: send button not ready after 3s, trying anyway');
+  const clicked = await evalJs(pageId, adapter.expressions.clickSend);
+  if (!clicked) {
+    const enterKeys = [
+      { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+      { type: 'char', text: '\r', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+      { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+    ];
+    for (const k of enterKeys) { await cdp.call('Input.dispatchKeyEvent', k, p.sessionId); }
+  }
+  await sleep(500);
 }
 
 async function openAdapterNewChat(pageId, adapter) {
@@ -3031,10 +3106,15 @@ async function streamAdapterAsk(params, adapter, profile) {
         baselineText = before && typeof before.text === 'string' ? before.text : '';
       } catch (e) { /* ignore */ }
       const model = (params && params.model) || {};
-      const mode = await evalJs(pageId, '(' + adapter.expressions.applyMode + ')(' + JSON.stringify({
-        thinking: model.mode === 'thinking' || model.thinking === true,
-        search: model.search === true,
-      }) + ')');
+      if (adapter.expressions.selectModel && model.modelName) {
+        const sel = await evalJs(pageId, '(' + adapter.expressions.selectModel + ')(' + JSON.stringify(model.modelName) + ')');
+        if (!sel || sel.ok !== true) log('selectModel: ' + adapter.id + ' model selection issue: ' + JSON.stringify(sel));
+      }
+      const modeOptions = {};
+      if (model.search === true) modeOptions.search = true;
+      if (model.mode === 'thinking') modeOptions.thinking = true;
+      else if (model.mode === 'fast') modeOptions.thinking = false;
+      const mode = await evalJs(pageId, '(' + adapter.expressions.applyMode + ')(' + JSON.stringify(modeOptions) + ')');
       if (!mode || mode.ok !== true) throw providerError('mode_unavailable', adapter.id + ' mode unavailable: ' + ((mode && mode.mode) || 'requested'));
       await sendAdapterMessage(pageId, adapter, params.question);
       const timeoutMs = (params && params.timeoutMs) || 240000;

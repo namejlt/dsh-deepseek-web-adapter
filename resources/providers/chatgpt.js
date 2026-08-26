@@ -68,19 +68,43 @@ module.exports = {
           if (typeof composer.focus === 'function') composer.focus();
           if (document.execCommand) {
             document.execCommand('selectAll', false, null);
+            try { document.execCommand('delete', false, null); } catch (e2) {}
             document.execCommand('insertText', false, value);
           }
         } catch (e) { /* fall through to DOM text assignment */ }
-        if (String(composer.innerText || composer.textContent || '') !== value) {
+        if (String(composer.innerText || composer.textContent || '').trim() !== value.trim()) {
           composer.textContent = value;
           if ('innerText' in composer) composer.innerText = value;
         }
+        try {
+          if (typeof InputEvent !== 'undefined') {
+            composer.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
+            composer.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
+          } else {
+            composer.dispatchEvent(new Event('beforeinput', { bubbles: true }));
+            composer.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          composer.dispatchEvent(new Event('change', { bubbles: true }));
+        } catch (e) {}
       } else {
-        const descriptor = typeof HTMLTextAreaElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
-        if (descriptor && typeof descriptor.set === 'function') descriptor.set.call(composer, value);
-        else composer.value = value;
+        let setOk = false;
+        try {
+          const descriptor = typeof HTMLTextAreaElement !== 'undefined' && Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+          if (descriptor && typeof descriptor.set === 'function') {
+            descriptor.set.call(composer, value);
+            setOk = true;
+          }
+        } catch (e) {}
+        if (!setOk) { composer.value = value; }
+        try {
+          if (typeof InputEvent !== 'undefined') {
+            composer.dispatchEvent(new InputEvent('input', { bubbles: true, data: value }));
+          } else {
+            composer.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          composer.dispatchEvent(new Event('change', { bubbles: true }));
+        } catch (e) {}
       }
-      composer.dispatchEvent(new Event('input', { bubbles: true }));
       return true;
     })`,
 

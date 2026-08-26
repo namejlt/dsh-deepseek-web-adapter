@@ -39,9 +39,12 @@ const MODELS = Object.freeze({
   'deepseek-vision-reasoner': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 识图+深度思考（网页版）', mode: 'vision', deepThink: true, search: false }),
   'chatgpt-auto': Object.freeze({ providerId: 'chatgpt', name: 'ChatGPT 自动（网页版）', mode: 'auto' }),
   'chatgpt-thinking': Object.freeze({ providerId: 'chatgpt', name: 'ChatGPT 思考（网页版）', mode: 'thinking' }),
-  'qwen-chat': Object.freeze({ providerId: 'qwen', name: 'Qwen 对话（网页版）', mode: 'chat', thinking: false, search: false }),
-  'qwen-thinking': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考（网页版）', mode: 'chat', thinking: true, search: false }),
-  'qwen-search': Object.freeze({ providerId: 'qwen', name: 'Qwen 搜索（网页版）', mode: 'chat', thinking: false, search: true }),
+  'qwen-auto': Object.freeze({ providerId: 'qwen', name: 'Qwen 自动（网页版）', mode: 'auto', modelName: 'Qwen3.7-Plus' }),
+  'qwen-thinking': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考（网页版）', mode: 'thinking', modelName: 'Qwen3.7-Plus' }),
+  'qwen-fast': Object.freeze({ providerId: 'qwen', name: 'Qwen 快速（网页版）', mode: 'fast', modelName: 'Qwen3.7-Plus' }),
+  'qwen-auto-max': Object.freeze({ providerId: 'qwen', name: 'Qwen 自动 Max（网页版）', mode: 'auto', modelName: 'Qwen3.8-Max' }),
+  'qwen-thinking-max': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考 Max（网页版）', mode: 'thinking', modelName: 'Qwen3.8-Max' }),
+  'qwen-fast-max': Object.freeze({ providerId: 'qwen', name: 'Qwen 快速 Max（网页版）', mode: 'fast', modelName: 'Qwen3.8-Max' }),
 });
 
 function getProvider(id) {

@@ -919,6 +919,7 @@ function buildToolsText(tools) {
     '关键规则：',
     '- 需要工具时整个回复 ONLY 代码块（无散文）；不需要工具时直接用纯文本回答。',
     '- 一次只调用一个工具。必须包含 "name" 和 "args" 两个键，参数值类型按下方标注。',
+    '- args 必须包含该工具全部 (必填) 参数，缺少任何一个（如 description）都会导致工具执行失败。',
     '- 工具执行结果会以 [工具结果] 标签回传给你；收到后继续调用下一个工具或给出最终回答。',
     '- 任务完成后用纯文本作答（不要输出代码块）。',
     '',
@@ -945,7 +946,9 @@ function buildToolsText(tools) {
   if (body.length > BUDGET) body = buildBody(30);
   if (body.length > BUDGET) body = buildBody(0);
 
-  /* 示例：从真实工具生成（参数最简单的优先），构造类型合法的 args */
+  /* 示例：从真实工具生成，构造类型合法的 args。
+   * 优先选 bash——DSH 最常用工具，且其必填参数含说明型 description，
+   * 示例能演示「说明型必填参数也不能省略」；无 bash 时选必填参数最少的工具。 */
   function realExample() {
     let best = null;
     let bestN = Infinity;
@@ -954,8 +957,9 @@ function buildToolsText(tools) {
       if (!fn.name) continue;
       const props = (fn.parameters && fn.parameters.properties) || {};
       const req = (fn.parameters && fn.parameters.required) || [];
-      /* 只要必填参数个数最少的（且 ≤3，示例简洁） */
-      if (req.length < bestN && req.length <= 3) { best = { fn, props, req }; bestN = req.length; }
+      /* bash 优先（必填参数 ≤4，示例仍简洁）；无 bash 时取必填参数最少的 */
+      const score = fn.name === 'bash' ? -1 : req.length;
+      if (score < bestN && req.length <= 4) { best = { fn, props, req }; bestN = score; }
     }
     if (!best) return '';
     const args = {};
@@ -964,6 +968,7 @@ function buildToolsText(tools) {
       if (Array.isArray(p.enum) && p.enum.length) args[k] = p.enum[0];
       else if (p.type === 'number' || p.type === 'integer') args[k] = 1;
       else if (p.type === 'boolean') args[k] = false;
+      else if (/description|justification|reason|purpose|explanation|comment/i.test(k)) args[k] = '说明本次操作的目的（示例）';
       else if (p.description) args[k] = String(p.description).slice(0, 20); /* 描述当值：比"示例值"更有信息量 */
       else args[k] = '示例值';
     }
