@@ -128,11 +128,28 @@ module.exports = {
       return true;
     })`,
 
-    extractLatest: `(() => {${sharedHelpers}
-      const candidates = Array.from(document.querySelectorAll('.qwen-markdown, .markdown, [class*="markdown"], [data-message-author-role="assistant"], .message-content, .chat-answers-card-wrap'))
-        .filter(isVisible)
-        .filter((element) => String(element.getAttribute('data-message-author-role') || '').toLowerCase() !== 'user');
-      const latest = candidates[candidates.length - 1];
+    extractLatest: String.raw`(() => {${sharedHelpers}
+      /* Qwen 的单条回复根卡片会包含多个嵌套 Markdown 节点。流式轮询必须始终
+       * 取同一张最新 assistant 卡片，而不是从所有 .markdown 后代中取最后一个，
+       * 否则 React 重渲染时快照会换根，driver 会把整段文本当成新的 delta 再发一次。 */
+      const responseRootSelectors = [
+        '.chat-answers-card-wrap',
+        '[data-message-author-role="assistant"]',
+        '[data-message-role="assistant"]',
+      ];
+      let latest = null;
+      for (const selector of responseRootSelectors) {
+        const roots = Array.from(document.querySelectorAll(selector))
+          .filter(isVisible)
+          .filter((element) => String(element.getAttribute('data-message-author-role') || '').toLowerCase() !== 'user');
+        if (roots.length) { latest = roots[roots.length - 1]; break; }
+      }
+      if (!latest) {
+        const candidates = Array.from(document.querySelectorAll('.qwen-markdown, .markdown, [class*="markdown"], .message-content'))
+          .filter(isVisible)
+          .filter((element) => String(element.getAttribute('data-message-author-role') || '').toLowerCase() !== 'user');
+        latest = candidates[candidates.length - 1] || null;
+      }
       if (!latest) return { text: '', thinking: '' };
 
       const stripLineNumbers = (root) => {
@@ -157,27 +174,17 @@ module.exports = {
             if (txt) return txt;
           }
         } catch (e) {}
-        /* cloneNode 不可用时（测试环境 / 极简 DOM 实现）：递归收集文本，
-         * 遇到含 linenumber / line-number className 的节点跳过其内容。 */
         try {
-          const isLineNumberEl = (el) => {
-            if (!el || typeof el !== 'object') return false;
-            const cls = String(el.className || '');
-            if (!cls) return false;
-            return /linenumber|line-number|lineNumber/i.test(cls);
-          };
+          const isLineNumberEl = (el) => /linenumber|line-number|lineNumber/i.test(String((el && el.className) || ''));
           const walk = (node, buf) => {
-            if (!node) return;
-            if (isLineNumberEl(node)) return;
+            if (!node || isLineNumberEl(node)) return;
             if (node.nodeType === 3 || typeof node === 'string') {
               buf.push(String(node.nodeValue != null ? node.nodeValue : node));
               return;
             }
             const children = node.children || (node.childNodes && Array.from(node.childNodes).filter((c) => c && c.nodeType !== 3)) || [];
             for (const child of children) walk(child, buf);
-            if (typeof node.textContent === 'string' && (!children || !children.length)) {
-              buf.push(String(node.textContent));
-            }
+            if (typeof node.textContent === 'string' && !children.length) buf.push(String(node.textContent));
           };
           const buf = [];
           walk(root, buf);
@@ -202,152 +209,86 @@ module.exports = {
         return '';
       };
 
-      /* ===== 抽取 prose 正文时，不直接走 latest 的 innerText（它会把所有
-       * qw-md-code 内嵌表格 / 按钮 / 操作条 "下载为表格 导出为图片"
-       * 全量扁平化吐出），而是：
-       * 1) 先把所有被识别为 code 的块（qw-md-code / pre / code 等）用
-       *    WeakSet 标记，后续 prose 遍历中跳过这些子树；
-       * 2) 再通过 walkProse 递归拼 prose，表格 / 按钮文案仍保留，但不会
-       *    被 fence 循环再重复处理一次。 */
+      const BT = String.fromCharCode(96);
+      const FENCE3 = BT + BT + BT;
       const codeBlocks = Array.from(latest.querySelectorAll(
         '.qw-md-code, [class*="qw-md-code"], [class*="md-code"], [class*="codeBlock"], pre'
       )).filter(isVisible);
-      const seenCodeEls = new WeakSet();
-      /* 按 block 维度先建索引：任何命中 .qw-md-code 的节点，其内部所有
-       * <pre> / <code> 都算作 fenced 范畴，不再走 prose 通道。 */
-      for (let i = 0; i < codeBlocks.length; i++) {
-        const block = codeBlocks[i];
-        if (seenCodeEls.has(block)) continue;
-        seenCodeEls.add(block);
-        (block.querySelectorAll && block.querySelectorAll('pre, code') || []).forEach((n) => seenCodeEls.add(n));
-      }
-
-      /* ===== prose 正文专用：跳过真正的 tool_call fenced / 语法高亮 code 节点，
-       * 仍然保留一般 Markdown 胶囊（qw-md-code）中的表格 / 段落内容（只是它们在
-       * 正文只出现一次），并且不把 "下载为表格 导出为图片" 这类操作按钮文案
-       * 当正文重复收集。 */
-      /* 真正需要在 prose 中屏蔽的只有：明确识别为 tool_call/json 的代码胶囊
-       * 以及独立 pre（纯代码块）。表格类 qw-md-code 不走 seenCodeEls，让
-       * walkProse 正常读取其内容。 */
-      const fencedOnly = new WeakSet();
-      for (let i = 0; i < codeBlocks.length; i++) {
-        const block = codeBlocks[i];
+      /* 只给真正的代码块登记 fence；普通表格用的 qw-md-code 仍由 prose walker
+       * 按正文处理。WeakMap 的 key 是 DOM 根节点，walker 遇到它时先 flush 之前正文，
+       * 从而确保回复快照严格保持 DOM 顺序（也就是 append-only 流的前缀关系）。 */
+      const fenceByRoot = new WeakMap();
+      for (const block of codeBlocks) {
+        const codeEl = block.querySelector('code') || block;
         const lang = detectBlockLang(block) || '';
-        const standalonePre =
-          block.tagName === 'PRE' &&
-          !(block.closest && block.closest('.qw-md-code, [class*="md-code"]'));
-        if (lang || standalonePre) {
-          fencedOnly.add(block);
-          (block.querySelectorAll && block.querySelectorAll('pre, code, table, thead, tbody, tr, td, th') || []).forEach((n) => fencedOnly.add(n));
-        }
-        seenCodeEls.add(block);
-        (block.querySelectorAll && block.querySelectorAll('pre, code') || []).forEach((n) => seenCodeEls.add(n));
+        const code = stripLineNumbers(codeEl).trim();
+        if (!code) continue;
+        const standalonePre = block.tagName === 'PRE' && !(block.closest && block.closest('.qw-md-code, [class*="md-code"]'));
+        const isCodeLike = !!lang || (code.slice(0, 3) === FENCE3 && code.slice(-3) === FENCE3) || standalonePre;
+        if (isCodeLike) fenceByRoot.set(block, FENCE3 + (lang || '') + '\n' + code + '\n' + FENCE3);
       }
 
-      const BAD_ACTION_RE = /^(下载为|导出为|复制|复制为|分享|插入)/;
-      const walkProse = (node, buf) => {
-        if (!node) return;
-        if (fencedOnly.has(node)) return;
-        if (node.nodeType === 3 || typeof node === 'string') {
-          buf.push(String(node.nodeValue != null ? node.nodeValue : node));
-          return;
-        }
-        if (typeof node === 'object') {
-          const hidden = !!node.hidden || String(node.getAttribute && node.getAttribute('aria-hidden') || '') === 'true';
-          if (hidden) return;
-          const tag = String(node.tagName || '').toUpperCase();
-          const cls = String(node.className || '');
-          const role = String(node.getAttribute && node.getAttribute('role') || '').toLowerCase();
-          if (/invisible|opacity-0|display-none|hidden|sr-only|aria[-_]?hidden/i.test(cls)) return;
-          /* 操作按钮：一律在正文跳过其文本（含"下载为表格""导出为图片""复制"） */
-          const isActionable =
-            tag === 'BUTTON' ||
-            role === 'button' ||
-            /\bcursor[-_]?pointer\b|\bclickable\b|\bbtn\b|\baction\b/i.test(cls) ||
-            (node.getAttribute && (node.getAttribute('data-role') === 'button' || node.getAttribute('aria-haspopup')));
-          if (isActionable) return;
-          const children = node.children || (node.childNodes && Array.from(node.childNodes).filter((c) => c && c.nodeType !== 3)) || [];
-          if (children && children.length) {
-            for (const child of children) walkProse(child, buf);
-            /* 块状 / 表格单元后补换行，保持语义分段 */
-            if (/^(H[1-6]|P|DIV|SECTION|LI|BR|HR|FIGCAPTION|BLOCKQUOTE|TABLE|THEAD|TBODY|TR)$/.test(tag)) buf.push(String.fromCharCode(10));
-          } else if (typeof node.textContent === 'string') {
-            buf.push(String(node.textContent));
-          }
-        }
-      };
-      const proseBuf = [];
-      walkProse(latest, proseBuf);
-      const proseRaw = proseBuf.join('');
-
-      const proseLines = [];
+      const outParts = [];
       const seenLine = new Set();
-      const pushProse = (raw) => {
-        String(raw || '').split(/\\r?\\n/).forEach((line) => {
-          const l = String(line).replace(/[ \\t\\xa0]+$/,'');
+      const seenFence = new Set();
+      let proseBuf = [];
+      const flushProse = () => {
+        if (!proseBuf.length) return;
+        const lines = [];
+        String(proseBuf.join('')).split(/\r?\n/).forEach((line) => {
+          const l = String(line).replace(/[ \t\xa0]+$/, '');
           const core = l.trim();
           if (!core) return;
-          /* 对疑似表格操作条的行再做一次冗余过滤：
-           * "表格下载为表格导出为图片" 这种拼接串不进入正文，
-           * 只保留真正有语义的行。 */
-          const striped = core.replace(/[ \\t]+/g, '');
+          const striped = core.replace(/[ \t]+/g, '');
           if (/^(表格|项目|下载为表格|导出为图片|复制为图片|插入到对话){2,}$/.test(striped)) return;
           if (seenLine.has(core) || seenLine.has(striped)) return;
           seenLine.add(core);
           seenLine.add(striped);
-          proseLines.push(l.replace(/^[ \\t\\xa0]+/, ''));
+          lines.push(l.replace(/^[ \t\xa0]+/, ''));
         });
+        if (lines.length) outParts.push(lines.join('\n'));
+        proseBuf = [];
       };
-
-      const BT = String.fromCharCode(96);
-      const FENCE3 = BT + BT + BT;
-      const fencedBlocks = [];
-      const seenFence = new Set();
-      const pushFence = (raw) => {
-        const s = String(raw || '');
-        if (!s.trim()) return;
-        const key = s.length + '|' + s.slice(0, 200);
-        if (seenFence.has(key)) return;
+      const appendFence = (raw) => {
+        const fence = String(raw || '');
+        const key = fence.length + '|' + fence.slice(0, 200);
+        if (!fence.trim() || seenFence.has(key)) return;
+        flushProse();
         seenFence.add(key);
-        fencedBlocks.push(s);
+        outParts.push(fence);
       };
-
-      /* 1) prose 通道：仅走 walkProse 过滤过的正文视图 */
-      pushProse(proseRaw);
-
-      /* 2) fence 通道：只处理明确识别为代码块的节点，
-       *    对 .qw-md-code 若 detectBlockLang 未返回 tool_call/json 等已知语言，
-       *    大概率是 qwen 的 markdown 表格块，不再围栏化，避免正文 + fence 两份重复。 */
-      for (let i = 0; i < codeBlocks.length; i++) {
-        const block = codeBlocks[i];
-        const codeEl = block.querySelector('code') || block;
-        if (!codeEl) continue;
-        const lang = detectBlockLang(block) || '';
-        const code = stripLineNumbers(codeEl).trim();
-        if (!code) continue;
-        const isCodeLike =
-          !!lang || /* 有语言标签 → 是代码块 */
-          (code.slice(0, 3) === FENCE3 && code.slice(-3) === FENCE3) || /* 内容本身已是 fenced */
-          (block.tagName === 'PRE' && !block.closest('.qw-md-code, [class*="md-code"]'));  /* 纯 pre，不在表格胶囊里 */
-        if (!isCodeLike) continue;
-        pushFence(FENCE3 + (lang || '') + '\\n' + code + '\\n' + FENCE3);
-      }
-
-      /* 兜底：未被收集到的 pre>code 再走 fence（极少命中，防止遗漏） */
-      Array.from(latest.querySelectorAll('pre code')).forEach((code) => {
-        if (seenCodeEls.has(code)) return;
-        const clean = stripLineNumbers(code).trim();
-        if (!clean) return;
-        pushFence(FENCE3 + '\\n' + clean + '\\n' + FENCE3);
-      });
-
-      /* ===== 最终串联 =====
-       * 顺序：prose 在前（人类可读正文），fences 在后（工具解析消费）。 */
-      const outParts = [];
-      if (proseLines.length) outParts.push(proseLines.join('\\n'));
-      if (fencedBlocks.length) outParts.push(fencedBlocks.join('\\n\\n'));
-      const text = outParts.join('\\n');
-      return { text, thinking: '' };
+      const walkReply = (node) => {
+        if (!node) return;
+        const fence = typeof node === 'object' && fenceByRoot.get(node);
+        if (fence) { appendFence(fence); return; }
+        if (node.nodeType === 3 || typeof node === 'string') {
+          proseBuf.push(String(node.nodeValue != null ? node.nodeValue : node));
+          return;
+        }
+        if (typeof node !== 'object') return;
+        const hidden = !!node.hidden || String(node.getAttribute && node.getAttribute('aria-hidden') || '') === 'true';
+        if (hidden) return;
+        const tag = String(node.tagName || '').toUpperCase();
+        const cls = String(node.className || '');
+        const role = String(node.getAttribute && node.getAttribute('role') || '').toLowerCase();
+        if (/invisible|opacity-0|display-none|hidden|sr-only|aria[-_]?hidden/i.test(cls)) return;
+        const isActionable =
+          tag === 'BUTTON' ||
+          role === 'button' ||
+          /\bcursor[-_]?pointer\b|\bclickable\b|\bbtn\b|\baction\b/i.test(cls) ||
+          (node.getAttribute && (node.getAttribute('data-role') === 'button' || node.getAttribute('aria-haspopup')));
+        if (isActionable) return;
+        const children = node.children || (node.childNodes && Array.from(node.childNodes).filter((c) => c && c.nodeType !== 3)) || [];
+        if (children.length) {
+          for (const child of children) walkReply(child);
+          if (/^(H[1-6]|P|DIV|SECTION|LI|BR|HR|FIGCAPTION|BLOCKQUOTE|TABLE|THEAD|TBODY|TR)$/.test(tag)) proseBuf.push(String.fromCharCode(10));
+        } else if (typeof node.textContent === 'string') {
+          proseBuf.push(String(node.textContent));
+        }
+      };
+      walkReply(latest);
+      flushProse();
+      return { text: outParts.join('\n'), thinking: '' };
     })()`,
 
 

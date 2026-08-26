@@ -39,6 +39,7 @@ check('computes the first adapter delta against the pre-send baseline', () => {
   assert.strictEqual(driver.computeAdapterDelta('old response', '', 'old response', false), '');
   assert.strictEqual(driver.computeAdapterDelta('old response\nnew line', '', 'old response', false), '\nnew line');
   assert.strictEqual(driver.computeAdapterDelta('brand new', '', 'old response', false), 'brand new');
+  assert.strictEqual(driver.computeAdapterDelta('第一段正文\n第二段正文', '第一段正文', '', true), '\n第二段正文');
 });
 
 check('exports pure provider identity helpers', () => {

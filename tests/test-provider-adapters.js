@@ -959,6 +959,25 @@ check('Qwen extractLatest does not duplicate a markdown weather answer with tabl
   );
 });
 
+
+check('Qwen extractLatest selects the latest assistant reply root and preserves DOM order for stream deltas', () => {
+  /* 流式阶段回答根卡片内的 Markdown 子树会不断重渲染；若直接从全部 `.markdown`
+   * 候选中取最后一个元素，会丢掉根卡片后续正文，且 prose/fence 分组会破坏前缀关系。
+   * 提取结果必须是根卡片按 DOM 顺序的累计快照，才能让 driver 只发送 append delta。 */
+  const root = new FakeElement('article', { className: 'chat-answers-card-wrap' });
+  root.append(new FakeElement('p', { text: '第一段正文' }));
+  const markdown = root.append(new FakeElement('div', { className: 'markdown body' }));
+  const pre = markdown.append(new FakeElement('pre'));
+  pre.append(new FakeElement('code', { text: 'const answer = 42;' }));
+  root.append(new FakeElement('p', { text: '第二段正文' }));
+
+  const text = String(run(qwen, 'extractLatest', makeDocument(root)).result.text || '');
+  const first = text.indexOf('第一段正文');
+  const code = text.indexOf('const answer = 42;');
+  const second = text.indexOf('第二段正文');
+  assert.ok(first >= 0 && code > first && second > code, 'expected root content in DOM order, got: ' + JSON.stringify(text));
+});
+
 check('DeepSeek adapter is compatibility metadata only', () => {
   assert.deepStrictEqual(
     { id: deepseek.id, label: deepseek.label, siteUrl: deepseek.siteUrl, defaultProfilePrefix: deepseek.defaultProfilePrefix },
