@@ -95,6 +95,26 @@ const q3 = gw.buildContext(turn1Future, 'first');
 check('2c1 特征全失配时仍取到用户问题（开头标记兜底）', q3.indexOf('[用户]\n' + QUESTION) >= 0, q3.slice(-200));
 check('2c2 特征全失配时 ctx 不进上下文段（isRuntimeContext=false）', q3.indexOf('redesigned wording') < 0);
 
+/* ---------- 2d. 系统设定全文下发（不再截断） ---------- */
+/* 回归背景：旧版 buildContext 把 [系统设定] clip 到 8000 字（recovery 4000），
+ * DSH 长系统设定（工具协议/teams 规则在尾部）被截掉 → 模型丢失关键规则、
+ * 行为系统性偏差。现改为全文下发，超长风险由 driver 超时/重试兜底。 */
+const SYS_LONG = SYS + '\n' + Array.from({ length: 200 }, (_, i) => 'RULE-' + String(i).padStart(3, '0') + ': 这是一条位于系统设定尾部的关键规则，绝不能被截断丢失。').join('\n') + '\nTAIL-MARKER-DO-NOT-LOSE';
+check('2d0 长系统设定确实超过旧 8000 限长（用例有效性）', SYS_LONG.length > 9000, 'len=' + SYS_LONG.length);
+const turnLong = { messages: [
+  { role: 'system', content: SYS_LONG },
+  { role: 'user', content: QUESTION },
+] };
+const qLong = gw.buildContext(turnLong, 'first');
+check('2d1 first 超长系统设定全文下发（尾部标记仍在）', qLong.indexOf('TAIL-MARKER-DO-NOT-LOSE') > 0, qLong.slice(-120));
+check('2d2 first 产物无「系统设定过长已截断」标记', qLong.indexOf('系统设定过长已截断') < 0);
+const recoverLong = { messages: turnLong.messages.concat([
+  { role: 'assistant', content: '好的。' },
+  { role: 'user', content: '继续' },
+]) };
+const qLongR = gw.buildContext(recoverLong, 'recovery');
+check('2d3 recovery 超长系统设定同样全文下发', qLongR.indexOf('TAIL-MARKER-DO-NOT-LOSE') > 0 && qLongR.indexOf('系统设定过长已截断') < 0);
+
 /* ---------- 3. delta 模式：轮中 ctx 更新跳过 ---------- */
 const deltaNever = { messages: [
   { role: 'system', content: SYS },

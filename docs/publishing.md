@@ -146,7 +146,7 @@ npm pack --dry-run
 离线 provider tests 不能证明真实网页登录态、挑战页或页面交互可用。发布前，在**已认证/已登录**的本机 profile 中逐项手工验收；完成前不得声称“live verified”：
 
 1. 分别打开并完成登录：`/login?provider=deepseek`、`/login?provider=chatgpt`、`/login?provider=qwen`。
-2. 用 `GET /v1/models` 确认包含 `chatgpt-auto`、`chatgpt-thinking`、`qwen-chat`、`qwen-thinking`、`qwen-search`。
+2. 用 `GET /v1/models` 确认包含 `chatgpt-auto`、`chatgpt-thinking`、`qwen-auto`、`qwen-thinking`、`qwen-fast`；并抽查一个非默认页面模型的请求（如 `qwen-fast-flash`），确认模型选择器已切换到对应页面模型。
 3. 每个 provider 至少验证一条短文本、一段代码请求和一个 SSE 流完成；确认 profile/cookie 没有跨 provider 复用。
 4. 验证 Qwen 无法切换 thinking/search 时返回 `mode_unavailable`；验证 ChatGPT challenge 返回需要人工操作的 provider 错误，而不是 DOM 错误。不要自动解题或绕过 challenge。
 5. 在发布记录中写明测试日期、已验收 provider、登录账号类型（不要写 cookie/账号标识）与未验收项。

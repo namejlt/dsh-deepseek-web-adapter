@@ -19,7 +19,7 @@ const PROVIDERS = Object.freeze({
   qwen: Object.freeze({
     id: 'qwen',
     label: 'Qwen',
-    siteUrl: 'https://chat.qwen.ai/',
+    siteUrl: 'https://www.qianwen.com/',
     defaultProfilePrefix: 'qwen',
   }),
 });
@@ -39,12 +39,20 @@ const MODELS = Object.freeze({
   'deepseek-vision-reasoner': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 识图+深度思考（网页版）', mode: 'vision', deepThink: true, search: false }),
   'chatgpt-auto': Object.freeze({ providerId: 'chatgpt', name: 'ChatGPT 自动（网页版）', mode: 'auto' }),
   'chatgpt-thinking': Object.freeze({ providerId: 'chatgpt', name: 'ChatGPT 思考（网页版）', mode: 'thinking' }),
-  'qwen-auto': Object.freeze({ providerId: 'qwen', name: 'Qwen 自动（网页版）', mode: 'auto', modelName: 'Qwen3.7-Plus' }),
-  'qwen-thinking': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考（网页版）', mode: 'thinking', modelName: 'Qwen3.7-Plus' }),
-  'qwen-fast': Object.freeze({ providerId: 'qwen', name: 'Qwen 快速（网页版）', mode: 'fast', modelName: 'Qwen3.7-Plus' }),
+  /* qianwen.com 模型选择器中可见的四个页面模型：
+   * Qwen3.7-千问（默认）、Qwen3.8-Max、Qwen3.7-Max、Qwen3.6-Flash。 */
+  'qwen-auto': Object.freeze({ providerId: 'qwen', name: 'Qwen 自动（网页版）', mode: 'auto', modelName: 'Qwen3.7-千问' }),
+  'qwen-thinking': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考（网页版）', mode: 'thinking', modelName: 'Qwen3.7-千问' }),
+  'qwen-fast': Object.freeze({ providerId: 'qwen', name: 'Qwen 快速（网页版）', mode: 'fast', modelName: 'Qwen3.7-千问' }),
   'qwen-auto-max': Object.freeze({ providerId: 'qwen', name: 'Qwen 自动 Max（网页版）', mode: 'auto', modelName: 'Qwen3.8-Max' }),
   'qwen-thinking-max': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考 Max（网页版）', mode: 'thinking', modelName: 'Qwen3.8-Max' }),
   'qwen-fast-max': Object.freeze({ providerId: 'qwen', name: 'Qwen 快速 Max（网页版）', mode: 'fast', modelName: 'Qwen3.8-Max' }),
+  'qwen-auto-max-37': Object.freeze({ providerId: 'qwen', name: 'Qwen 自动 Max 3.7（网页版）', mode: 'auto', modelName: 'Qwen3.7-Max' }),
+  'qwen-thinking-max-37': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考 Max 3.7（网页版）', mode: 'thinking', modelName: 'Qwen3.7-Max' }),
+  'qwen-fast-max-37': Object.freeze({ providerId: 'qwen', name: 'Qwen 快速 Max 3.7（网页版）', mode: 'fast', modelName: 'Qwen3.7-Max' }),
+  'qwen-auto-flash': Object.freeze({ providerId: 'qwen', name: 'Qwen 自动 Flash（网页版）', mode: 'auto', modelName: 'Qwen3.6-Flash' }),
+  'qwen-thinking-flash': Object.freeze({ providerId: 'qwen', name: 'Qwen 思考 Flash（网页版）', mode: 'thinking', modelName: 'Qwen3.6-Flash' }),
+  'qwen-fast-flash': Object.freeze({ providerId: 'qwen', name: 'Qwen 快速 Flash（网页版）', mode: 'fast', modelName: 'Qwen3.6-Flash' }),
 });
 
 function getProvider(id) {

@@ -111,9 +111,15 @@ check('D4 多 JSON 取最后一个', '{"file_path": "x.txt"} 然后 <tool_call>{
 check('E1 参数值含 }', '<tool_call>{"name": "write", "arguments": {"file_path": "a.txt", "content": "选 {a} 或 {b}"}}</tool_call>', 'write');
 check('E2 数字参数', '<tool_call>{"name": "job_output", "arguments": {"job_id": 42, "timeout_ms": 5000}}</tool_call>', 'job_output');
 check('E3 下划线工具名', '<tool_call>{"name": "subagent_fork", "arguments": {"description": "x", "prompt": "y"}}</tool_call>', 'subagent_fork');
-check('E4 两个连续 tool_call(取最后一个)', '<tool_call>{"name": "pwsh", "arguments": {"command": "pwd"}}</tool_call>\n<tool_call>{"name": "write", "arguments": {"file_path": "a.txt", "content": "x"}}</tool_call>', 'write');
+check('E4 两个连续 tool_call(只保留最先出现的一个)', '\u003ctool_call\u003e{"name": "pwsh", "arguments": {"command": "pwd"}}\u003c/tool_call\u003e\n\u003ctool_call\u003e{"name": "write", "arguments": {"file_path": "a.txt", "content": "x"}}\u003c/tool_call\u003e', 'pwsh');
 check('E5 XML 属性风格', '<tool_call name="write">\n{"file_path": "a.txt", "content": "hi"}\n</tool_call>', 'write');
-check('E6 arguments 为 null', '<tool_call>{"name": "write", "arguments": null}</tool_call>', 'write');
+check('E6 arguments 为 null', '\u003ctool_call\u003e{"name": "write", "arguments": null}\u003c/tool_call\u003e', 'write');
+/* 协议：一轮只执行一个工具调用——多个候选只保留最先出现的一个；
+ * 显式带 tool_call 标记的代码块优先于普通 ```json/裸代码块。 */
+check('E7 两个连续 ```tool_call 块(取第一个)', '```tool_call\n{"name": "pwsh", "arguments": {"command": "pwd"}}\n```\n```tool_call\n{"name": "write", "arguments": {"file_path": "a.txt", "content": "x"}}\n```', 'pwsh');
+check('E8 ```json 示例块在前 + ```tool_call 块在后(带标记者优先)', '配置示例：\n```json\n{"file_path": "demo.txt", "content": "示例"}\n```\n实际调用：\n```tool_call\n{"name": "pwsh", "arguments": {"command": "pwd"}}\n```', 'pwsh');
+const e9 = parseToolCalls('\u003ctool_call\u003e{"name": "pwsh", "arguments": {"command": "pwd"}}\u003c/tool_call\u003e\n\u003ctool_call\u003e{"name": "write", "arguments": {"file_path": "a.txt", "content": "x"}}\u003c/tool_call\u003e', tools);
+check('E9 多候选结果数组长度恒为 1', e9.length === 1, 'len=' + e9.length);
 
 /* ============ F. 参数别名（模型可能不用 schema 参数名） ============ */
 check('F1 path 别名', '<tool_call>{"name": "write", "arguments": {"path": "a.txt", "content": "hi"}}</tool_call>', 'write');

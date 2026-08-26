@@ -90,7 +90,13 @@ dsweb:
         { id: qwen-fast, name: Qwen 快速（Beta） },
         { id: qwen-auto-max, name: Qwen 自动 Max（Beta） },
         { id: qwen-thinking-max, name: Qwen 思考 Max（Beta） },
-        { id: qwen-fast-max, name: Qwen 快速 Max（Beta） }
+        { id: qwen-fast-max, name: Qwen 快速 Max（Beta） },
+        { id: qwen-auto-max-37, name: Qwen 自动 Max 3.7（Beta） },
+        { id: qwen-thinking-max-37, name: Qwen 思考 Max 3.7（Beta） },
+        { id: qwen-fast-max-37, name: Qwen 快速 Max 3.7（Beta） },
+        { id: qwen-auto-flash, name: Qwen 自动 Flash（Beta） },
+        { id: qwen-thinking-flash, name: Qwen 思考 Flash（Beta） },
+        { id: qwen-fast-flash, name: Qwen 快速 Flash（Beta） }
       ]
   }
 ```
@@ -129,7 +135,7 @@ ChatGPT 若出现 Cloudflare、Turnstile 或其他 challenge，网关返回需�
 |---|---|---|
 | DeepSeek | 既有 `deepseek-*` 八种组合 | 保持已有快速/思考/搜索/专家/识图能力 |
 | ChatGPT | `chatgpt-auto`、`chatgpt-thinking` | 文本、代码块、基础 SSE；thinking 仅在可靠控件可用时启用 |
-| Qwen | `qwen-auto`、`qwen-thinking`、`qwen-fast`、`qwen-auto-max`、`qwen-thinking-max`、`qwen-fast-max` | 文本、代码块、基础 SSE；模式开关不可用时返回 `mode_unavailable` |
+| Qwen | `qwen-auto`、`qwen-thinking`、`qwen-fast`（默认 Qwen3.7-千问），及 `*-max`（Qwen3.8-Max）、`*-max-37`（Qwen3.7-Max）、`*-flash`（Qwen3.6-Flash）共 12 个 | 文本、代码块、基础 SSE；页面入口 `https://www.qianwen.com/`；模式开关不可用时返回 `mode_unavailable` |
 
 请不要把该 Beta 通道用于附件、多模态输入、网页原生 artifact、iframe/web-dev 产物或挑战求解。ChatGPT challenge 必须由人在浏览器中完成；错误会明确提示手动登录路径，而不是伪装成 DOM 问题。
 

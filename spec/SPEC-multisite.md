@@ -47,27 +47,17 @@
 
 结论：**ChatGPT Web 支持可做，但应把“认证/挑战失败”作为一等错误类型处理，不能假定是普通 DOM 失配。**
 
-### 0.3 Qwen Web 页面结构侧
+### 0.3 Qwen Web 页面结构侧（qianwen.com 改版，2026-08 更新）
 
-公开 bundle/CSS 可识别出一批相对稳定的结构：
+页面已迁移到 `https://www.qianwen.com/`（radix + slate SPA），当前适配依赖的稳定结构：
 
-- 入口：`https://chat.qwen.ai/`
-- 输入框：
-  - `.message-input-textarea`
-  - `.qwen-chat-v2-input-textarea`
-- 发送/停止按钮：
-  - `.chat-prompt-send-button .send-button[aria-label="Send"]`
-  - `.chat-prompt-send-button .stop-button[aria-label="Stop"]`
-- 代码块：
-  - `.qwen-markdown-code`
-  - `.qwen-markdown-code-body`
-  - `.qwen-markdown-code-body-streaming`
-- 产物/iframe 类输出：
-  - `.artifact-container`
-  - `.artifact-iframe-render`
-- 公开 bundle 暗示有 thinking / search / deep research / artifact / web dev 等模式能力
-
-结论：**Qwen Web 比 ChatGPT Web 更适合作为第二个 provider 落地目标**，因为它至少有一批可见的、产品自有的稳定 class，可直接用于第一版适配。
+- 入口：`https://www.qianwen.com/`
+- 输入框：输入区 `[data-chat-input-shell="true"]` 内的 slate 编辑器 `[data-slate-editor="true"][contenteditable="true"]`（role="textbox"，data-placeholder="向千问提问"）
+- 发送/停止按钮：`button[data-session-switch-target="send-query"]`（aria-label="发送消息"，图标 `qwpcicon-sendChat`，输入为空时带 disabled；生成中由 stop 控件替换）
+- 模式开关：输入框底部胶囊按钮（aria-haspopup="menu"，aria-label 为当前模式名，如「快速」「思考研究」），弹出 `[data-radix-menu-content]` 菜单，菜单项为 `[role="menuitemcheckbox"]`（aria-checked / data-state 标记选中）
+- 模型选择：顶部 `[aria-haspopup="dialog"]` 触发器显示当前模型名（如 Qwen3.7-千问），点击弹出 `[role="dialog"]` 模型列表；列表项含 `.truncate` 模型名与 `qwpcicon-check` 图标（未选中带 `invisible`，选中项带 `bg-weaken`）
+- 页面模型清单：Qwen3.7-千问、Qwen3.8-Max、Qwen3.7-Max、Qwen3.6-Flash
+- 注意：输入区下方存在一份 `aria-hidden="true"` 的 measure-capsule 测量副本，所有可见性判断必须过滤该隐藏子树
 
 ---
 

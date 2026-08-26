@@ -86,7 +86,7 @@ check('keeps same named channels isolated by provider', () => {
 
 check('resolves adapter URLs and rejects unknown providers', () => {
   assert.strictEqual(driver.resolveProviderAdapter('chatgpt').siteUrl, 'https://chatgpt.com/');
-  assert.strictEqual(driver.resolveProviderAdapter('qwen').siteUrl, 'https://chat.qwen.ai/');
+  assert.strictEqual(driver.resolveProviderAdapter('qwen').siteUrl, 'https://www.qianwen.com/');
   assert.throws(() => driver.resolveProviderAdapter('missing'), /unknown provider: missing/);
 });
 

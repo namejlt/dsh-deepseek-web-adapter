@@ -9,7 +9,7 @@
 The DSH plugin still starts one local gateway exposing `/v1/models` and `/v1/chat/completions` (SSE). Existing DeepSeek models remain available; the Beta adds:
 
 - ChatGPT: `chatgpt-auto`, `chatgpt-thinking`
-- Qwen: `qwen-auto`, `qwen-thinking`, `qwen-fast`, `qwen-auto-max`, `qwen-thinking-max`, `qwen-fast-max`
+- Qwen (`https://www.qianwen.com/`): `qwen-auto`, `qwen-thinking`, `qwen-fast` (default Qwen3.7-千问), plus `*-max` (Qwen3.8-Max), `*-max-37` (Qwen3.7-Max), and `*-flash` (Qwen3.6-Flash) — 12 models in total
 - Each provider has an independent browser profile, session, and login state; cookies and sessions are never shared across providers.
 
 **Conservative boundary:** text, code blocks, and basic SSE only. No attachments or multimodal input; no challenge solving or bypassing (CAPTCHA, Turnstile, etc.); no translation of native artifacts, tool cards, traces, or iframes into OpenAI-native artifacts.
@@ -73,7 +73,13 @@ dsweb:
         { id: qwen-fast, name: Qwen Fast (Beta) },
         { id: qwen-auto-max, name: Qwen Auto Max (Beta) },
         { id: qwen-thinking-max, name: Qwen Thinking Max (Beta) },
-        { id: qwen-fast-max, name: Qwen Fast Max (Beta) }
+        { id: qwen-fast-max, name: Qwen Fast Max (Beta) },
+        { id: qwen-auto-max-37, name: Qwen Auto Max 3.7 (Beta) },
+        { id: qwen-thinking-max-37, name: Qwen Thinking Max 3.7 (Beta) },
+        { id: qwen-fast-max-37, name: Qwen Fast Max 3.7 (Beta) },
+        { id: qwen-auto-flash, name: Qwen Auto Flash (Beta) },
+        { id: qwen-thinking-flash, name: Qwen Thinking Flash (Beta) },
+        { id: qwen-fast-flash, name: Qwen Fast Flash (Beta) }
       ]
   }
 ```

@@ -117,7 +117,7 @@ function driverRecords() {
 
     const modelsResponse = await request(port, 'GET', '/v1/models');
     const models = JSON.parse(modelsResponse.text).data;
-    assert.strictEqual(models.length, 16, 'all provider models must be advertised');
+    assert.strictEqual(models.length, 22, 'all provider models must be advertised');
     assert.deepStrictEqual(models.map((model) => model.owned_by), models.map((model) => model.id.split('-')[0] + '-web'));
 
     const providersResponse = await request(port, 'GET', '/providers');
@@ -125,7 +125,7 @@ function driverRecords() {
     const providers = JSON.parse(providersResponse.text).providers;
     assert.deepStrictEqual(providers.map((provider) => provider.id), ['deepseek', 'chatgpt', 'qwen']);
     assert.strictEqual(providers.find((provider) => provider.id === 'chatgpt').defaultProfile, 'chatgpt-default');
-    assert.strictEqual(providers.find((provider) => provider.id === 'qwen').models.length, 6);
+    assert.strictEqual(providers.find((provider) => provider.id === 'qwen').models.length, 12);
     const setupResponse = await request(port, 'GET', '/setup');
     assert.strictEqual(setupResponse.status, 200, setupResponse.text);
     assert.strictEqual(JSON.parse(setupResponse.text).providers.providers.length, 3, 'setup must embed provider aggregate for one-page refresh');

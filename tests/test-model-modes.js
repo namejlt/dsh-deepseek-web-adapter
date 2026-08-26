@@ -170,7 +170,7 @@ if (mMatch) {
   /* 专家模式可选深度思考：expert-reasoner = 专家入口 + 开启 深度思考 pill；
    * 与模型名"专家+深度思考"及用户描述一致。 */
   check('3f2 deepseek-expert-reasoner = 专家 + 深度思考（expert 入口，deepThink=true）', MODELS['deepseek-expert-reasoner'] && MODELS['deepseek-expert-reasoner'].mode === 'expert' && MODELS['deepseek-expert-reasoner'].deepThink === true, JSON.stringify(MODELS['deepseek-expert-reasoner']));
-  check('3g registry 保留 8 个 DeepSeek 模型（总公开模型 16 个）', Object.keys(MODELS).filter((id) => id.startsWith('deepseek-')).length === 8 && Object.keys(MODELS).length === 16, 'count=' + Object.keys(MODELS).length);
+  check('3g registry 保留 8 个 DeepSeek 模型（总公开模型 22 个）', Object.keys(MODELS).filter((id) => id.startsWith('deepseek-')).length === 8 && Object.keys(MODELS).length === 22, 'count=' + Object.keys(MODELS).length);
   check('3h DeepSeek expert/vision 模型均不带 search（页面无此 pill）', Object.values(MODELS).filter((m) => m.providerId === 'deepseek').every((m) => m.mode === 'quick' || m.search === false));
 }
 

@@ -797,7 +797,10 @@ function buildContext(payload, mode, toolsText) {
   if (mode === 'first' || mode === 'recovery') {
     const { sysText, ctxText } = extractBaseline(msgs);
     const parts = [];
-    if (sysText) parts.push('[系统设定]\n' + clipText(sysText, mode === 'first' ? 8000 : 4000, '系统设定'));
+    /* 系统设定全文下发、绝不截断：被截掉的尾部恰恰是工具协议/goal/teams
+     * 等关键规则，模型行为会系统性偏差。超长发送失败风险交由 driver 侧
+     * 超时/重试机制兜底（各 provider 输入填充已走整段赋值路径，可承载长文本）。 */
+    if (sysText) parts.push('[系统设定]\n' + sysText);
     if (ctxText) parts.push(clipText(ctxText, mode === 'first' ? 6000 : 3000, '运行时上下文'));
     if (mode === 'recovery') {
       /* 压缩最近对话（assistant 短些，user/tool 长些，整体限长），让网页版恢复到中断前的状态 */
@@ -918,7 +921,7 @@ function buildToolsText(tools) {
     '',
     '关键规则：',
     '- 需要工具时整个回复 ONLY 代码块（无散文）；不需要工具时直接用纯文本回答。',
-    '- 一次只调用一个工具。必须包含 "name" 和 "args" 两个键，参数值类型按下方标注。',
+    '- 一次只调用一个工具（即使你输出了多个代码块，系统也只执行最先出现的一个）。必须包含 "name" 和 "args" 两个键，参数值类型按下方标注。',
     '- args 必须包含该工具全部 (必填) 参数，缺少任何一个（如 description）都会导致工具执行失败。',
     '- 工具执行结果会以 [工具结果] 标签回传给你；收到后继续调用下一个工具或给出最终回答。',
     '- 任务完成后用纯文本作答（不要输出代码块）。',

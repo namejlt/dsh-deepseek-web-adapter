@@ -2631,6 +2631,8 @@ async function applyCalibration(pageId, key) {
  * 的 key）推断工具名。
  * 解析策略（优先级）：tool_call 前缀 → ```tool_call 块 → ```json 块 → 裸 ``` 块
  * → <tool_call> XML → 平衡括号提取（schema 推断）→ Python 函数格式。
+ * 协议约定一轮只执行一个工具调用：命中多个候选时只保留最先出现的一个（显式
+ * tool_call 标记的代码块优先），其余忽略——与提示词「一次只调用一个工具」对齐。
  * @param {string} text 助手回复原文（含思考块亦可，内部会剥离）
  * @param {Array} tools OpenAI tools 数组（schema 推断用）
  * @returns {Array<{name: string, arguments: object|string}>} 工具调用列表（空数组=非工具回复）
@@ -2899,10 +2901,16 @@ function parseToolCalls(text, tools) {
   function parseFromText(sourceText) {
     const patterns = [
       { re: /tool_call\s*\n?\s*(\{[\s\S]*\})/gi, g: 1 },
-      { re: /```(?:tool_call|json)\s*\n([\s\S]*?)```/gi, g: 1 },
+      /* 显式带 tool_call 标注的代码块优先于普通 json/裸代码块：
+       * 同一轮输出多个块时先匹配执行带标记的那个（协议可信度最高）。 */
+      { re: /```tool_call\s*\n([\s\S]*?)```/gi, g: 1 },
+      { re: /```json\s*\n([\s\S]*?)```/gi, g: 1 },
       /* 无语言标注代码块（模型可能只输出 ``` 不写 json） */
       { re: /```\s*\n([\s\S]*?)```/gi, g: 1 },
-      /* 贪婪匹配到最后一个 }：arguments 是嵌套对象时非贪婪会在内层 } 截断 */
+      /* 逐块非贪婪：多个 <tool_call> 块时按出现顺序逐块匹配，先命中先执行；
+       * 尾部必须跟闭合标签，arguments 里的内层 } 不会误截（其后无闭合标签）。 */
+      { re: /<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/gi, g: 1 },
+      /* 贪婪兜底（无闭合标签/结尾处）：匹配到最后一个 }——arguments 是嵌套对象时非贪婪会在内层 } 截断 */
       { re: /<tool_call>\s*(\{[\s\S]*\})(?:\s*<\/tool_call>|\s*$)/gi, g: 1 },
     ];
     outer:
@@ -2961,7 +2969,8 @@ function parseToolCalls(text, tools) {
     parseFromText(sourceText);
     if (calls.length) break;
   }
-  return calls;
+  /* 硬性保证只保留一个调用（防御：后续任何策略改动也不得返回多个） */
+  return calls.slice(0, 1);
 }
 
 /* 提取文本中所有平衡的 JSON 对象（{...}），正确处理字符串内的 { } 与转义 */
@@ -3107,14 +3116,34 @@ async function streamAdapterAsk(params, adapter, profile) {
       } catch (e) { /* ignore */ }
       const model = (params && params.model) || {};
       if (adapter.expressions.selectModel && model.modelName) {
-        const sel = await evalJs(pageId, '(' + adapter.expressions.selectModel + ')(' + JSON.stringify(model.modelName) + ')');
+        /* 模型选择：radix dialog 渲染/关闭动画是异步的，失败或未确认（pending）
+         * 时间隔重试（幂等，已选中会直接返回），最多 3 次；全部失败只告警不
+         * 中断——按页面当前模型继续对话，避免页面模型清单与网关清单不一致时
+         * 所有请求直接报错。 */
+        let sel = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          sel = await evalJs(pageId, '(' + adapter.expressions.selectModel + ')(' + JSON.stringify(model.modelName) + ')')
+            .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+          if (sel && sel.ok === true && sel.pending !== true) break;
+          await sleep(800);
+        }
         if (!sel || sel.ok !== true) log('selectModel: ' + adapter.id + ' model selection issue: ' + JSON.stringify(sel));
       }
       const modeOptions = {};
       if (model.search === true) modeOptions.search = true;
       if (model.mode === 'thinking') modeOptions.thinking = true;
       else if (model.mode === 'fast') modeOptions.thinking = false;
-      const mode = await evalJs(pageId, '(' + adapter.expressions.applyMode + ')(' + JSON.stringify(modeOptions) + ')');
+      /* 模式切换：与 selectModel 同级的重试。模型切换完成后页面常见短暂重渲染，
+       * 模式胶囊（trigger）可能在 1~2 个 UI tick 内不可见；radix 菜单的打开动画
+       * 也会间歇性导致首次求值找不到菜单项。最多重试 3 次，间隔 800ms，与
+       * selectModel 节奏对齐。pending 状态（radix aria-checked 异步回写）视为需重试。 */
+      let mode = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        mode = await evalJs(pageId, '(' + adapter.expressions.applyMode + ')(' + JSON.stringify(modeOptions) + ')')
+          .catch((e) => ({ ok: false, kind: 'dom_unavailable', mode: (modeOptions && modeOptions.thinking === true) ? 'thinking' : 'requested', error: String((e && e.message) || e) }));
+        if (mode && mode.ok === true && mode.pending !== true) break;
+        await sleep(800);
+      }
       if (!mode || mode.ok !== true) throw providerError('mode_unavailable', adapter.id + ' mode unavailable: ' + ((mode && mode.mode) || 'requested'));
       await sendAdapterMessage(pageId, adapter, params.question);
       const timeoutMs = (params && params.timeoutMs) || 240000;

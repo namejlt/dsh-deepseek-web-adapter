@@ -9,7 +9,7 @@
 网关仍由 DSH 插件自动拉起，提供 `/v1/models` 与 `/v1/chat/completions`（SSE）接口。DeepSeek 保持既有模型；Beta 新增 ChatGPT 与 Qwen provider：
 
 - ChatGPT：`chatgpt-auto`、`chatgpt-thinking`
-- Qwen：`qwen-auto`、`qwen-thinking`、`qwen-fast`、`qwen-auto-max`、`qwen-thinking-max`、`qwen-fast-max`
+- Qwen（`https://www.qianwen.com/`）：`qwen-auto`、`qwen-thinking`、`qwen-fast`（默认 Qwen3.7-千问），另有 `*-max`（Qwen3.8-Max）、`*-max-37`（Qwen3.7-Max）、`*-flash`（Qwen3.6-Flash）共 12 个模型
 - 每个 provider 使用独立浏览器 profile、会话与登录态；不能跨站复用 cookie 或会话。
 
 **保守能力边界**：仅支持文本、代码块和基础 SSE。**不支持**附件、图像或其他多模态输入；不解决或绕过 CAPTCHA/Turnstile/其他挑战；不转换网页原生工具卡片、trace、iframe 或 native artifacts（原生产物）。
@@ -77,7 +77,13 @@ dsweb:
         { id: qwen-fast, name: Qwen 快速（Beta） },
         { id: qwen-auto-max, name: Qwen 自动 Max（Beta） },
         { id: qwen-thinking-max, name: Qwen 思考 Max（Beta） },
-        { id: qwen-fast-max, name: Qwen 快速 Max（Beta） }
+        { id: qwen-fast-max, name: Qwen 快速 Max（Beta） },
+        { id: qwen-auto-max-37, name: Qwen 自动 Max 3.7（Beta） },
+        { id: qwen-thinking-max-37, name: Qwen 思考 Max 3.7（Beta） },
+        { id: qwen-fast-max-37, name: Qwen 快速 Max 3.7（Beta） },
+        { id: qwen-auto-flash, name: Qwen 自动 Flash（Beta） },
+        { id: qwen-thinking-flash, name: Qwen 思考 Flash（Beta） },
+        { id: qwen-fast-flash, name: Qwen 快速 Flash（Beta） }
       ]
   }
 ```
