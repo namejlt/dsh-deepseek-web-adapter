@@ -18,7 +18,22 @@ const THINKING_MODELS = {
   chatgpt: 'chatgpt-thinking',
   qwen: 'qwen-thinking',
 };
-const SCENARIO_ORDER = ['basicStream', 'nonStream', 'codeBlock', 'thinking'];
+const SCENARIO_ORDER = ['basicStream', 'nonStream', 'codeBlock', 'thinking', 'toolCall'];
+const GATING_SCENARIOS = ['basicStream', 'nonStream', 'codeBlock', 'thinking'];
+const SAFE_TOOL = Object.freeze({
+  type: 'function',
+  function: {
+    name: 'echo_marker',
+    description: 'Return the marker string exactly as provided.',
+    parameters: {
+      type: 'object',
+      required: ['marker'],
+      properties: {
+        marker: { type: 'string', description: 'The exact live-smoke marker string.' },
+      },
+    },
+  },
+});
 
 function parseArgs(argv) {
   const out = Object.create(null);
@@ -60,8 +75,8 @@ function stableHash(value) {
 }
 
 async function request(url, token, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs || 120000);
+  const controller = options.controller || new AbortController();
+  const timer = options.controller ? null : setTimeout(() => controller.abort(), options.timeoutMs || 120000);
   try {
     const headers = {};
     if (!options.omitAuth) headers.Authorization = 'Bearer ' + token;
@@ -75,7 +90,7 @@ async function request(url, token, options = {}) {
     const text = await response.text();
     return { status: response.status, headers: Object.fromEntries(response.headers.entries()), text };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -109,11 +124,19 @@ function parseJsonCompletion(text) {
   const payload = JSON.parse(String(text || '{}'));
   const choice = payload.choices && payload.choices[0];
   const message = choice && choice.message;
+  const toolCalls = Array.isArray(message && message.tool_calls) ? message.tool_calls : [];
+  const firstTool = toolCalls[0] || {};
+  const fn = firstTool.function || {};
+  let parsedArgs = null;
+  try { parsedArgs = typeof fn.arguments === 'string' ? JSON.parse(fn.arguments) : (fn.arguments || null); } catch (_) { parsedArgs = null; }
   return {
     role: message && message.role || null,
     finishReason: choice && choice.finish_reason || null,
     content: message && typeof message.content === 'string' ? message.content : '',
-    toolCalls: Array.isArray(message && message.tool_calls) ? message.tool_calls.length : 0,
+    toolCalls: toolCalls.length,
+    functionName: fn.name || null,
+    parsedArguments: parsedArgs,
+    rawArgumentsSha256: stableHash(fn.arguments || ''),
     bodySha256: stableHash(text),
   };
 }
@@ -160,6 +183,17 @@ function buildScenarioSpec(providerId, name, models) {
       model: chooseModel(providerId, models, 'thinking'),
       expected: 'LIVE_SMOKE_' + upper + '_THINKING_OK',
       prompt: 'Reply with exactly this marker and no other text after completing the thinking-or-mode-switch request: LIVE_SMOKE_' + upper + '_THINKING_OK',
+    };
+  }
+  if (name === 'toolCall') {
+    return {
+      name,
+      transport: 'json',
+      model: chooseModel(providerId, models, 'default'),
+      expectedToolName: SAFE_TOOL.function.name,
+      expectedMarker: 'LIVE_TOOL_' + upper + '_OK',
+      tools: [SAFE_TOOL],
+      prompt: 'Call the tool echo_marker exactly once. Do not answer in prose. Pass marker="LIVE_TOOL_' + upper + '_OK".',
     };
   }
   throw new Error('unknown scenario: ' + name);
@@ -234,16 +268,51 @@ async function stableLoginState(url, token, providerId) {
   return { login: latest.response, snapshot: latest.snapshot || {}, ready: false, attempts: 3 };
 }
 
-async function runScenario(url, token, providerId, spec) {
+async function runScenario(url, token, providerId, spec, sessionKey) {
   if (!spec.model) {
     return { status: 'skipped', reason: spec.name === 'thinking' ? 'thinking_model_not_advertised' : 'model_not_advertised' };
   }
-  const send = (prompt, forceStream) => request(url, token, {
+  const send = (prompt, forceStream, tools) => request(url, token, {
     pathname: '/v1/chat/completions',
     method: 'POST',
     timeoutMs: 180000,
-    body: { model: spec.model.id, stream: forceStream, messages: [{ role: 'user', content: prompt }] },
+    body: {
+      model: spec.model.id,
+      stream: forceStream,
+      tools: tools || undefined,
+      tool_choice: tools ? 'auto' : undefined,
+      metadata: { dsweb_session_key: sessionKey },
+      messages: [{ role: 'user', content: prompt }],
+    },
   });
+
+  if (spec.name === 'toolCall') {
+    const response = await send(spec.prompt, false, spec.tools);
+    const parsed = parseJsonCompletion(response.text);
+    const marker = parsed.parsedArguments && parsed.parsedArguments.marker;
+    const status = response.status === 200
+      && parsed.role === 'assistant'
+      && parsed.finishReason === 'tool_calls'
+      && parsed.toolCalls === 1
+      && parsed.functionName === spec.expectedToolName
+      && marker === spec.expectedMarker;
+    const unsupported = !status && response.status === 200 && parsed.finishReason === 'stop' && parsed.toolCalls === 0;
+    return {
+      status: status ? 'passed' : (unsupported ? 'unsupported' : 'failed'),
+      model: spec.model.id,
+      transport: 'json',
+      httpStatus: response.status,
+      role: parsed.role,
+      finishReason: parsed.finishReason,
+      toolCalls: parsed.toolCalls,
+      functionName: parsed.functionName,
+      markerSha256: stableHash(marker || ''),
+      argumentsSha256: parsed.rawArgumentsSha256,
+      bodySha256: parsed.bodySha256,
+      reason: status ? undefined : (unsupported ? 'provider_did_not_return_tool_calls' : 'tool_call_contract_not_met'),
+    };
+  }
+
   let response = await send(spec.prompt, spec.transport === 'sse');
   if (spec.transport === 'sse') {
     let parsed = parseSse(response.text);
@@ -284,12 +353,16 @@ async function runScenario(url, token, providerId, spec) {
       reason: passed ? undefined : 'sse_contract_not_met',
     };
   }
+
   const parsed = parseJsonCompletion(response.text);
   const match = summarizeMatch(parsed.content, spec.expected);
-  const status = response.status === 200 && parsed.role === 'assistant' && parsed.finishReason === 'stop' && match.exactMatch && parsed.toolCalls === 0
-    ? 'passed' : 'failed';
+  const status = response.status === 200
+    && parsed.role === 'assistant'
+    && parsed.finishReason === 'stop'
+    && match.exactMatch
+    && parsed.toolCalls === 0;
   return {
-    status,
+    status: status ? 'passed' : 'failed',
     model: spec.model.id,
     transport: spec.transport,
     httpStatus: response.status,
@@ -298,7 +371,7 @@ async function runScenario(url, token, providerId, spec) {
     toolCalls: parsed.toolCalls,
     bodySha256: parsed.bodySha256,
     ...match,
-    reason: status === 'passed' ? undefined : 'json_contract_not_met',
+    reason: status ? undefined : 'json_contract_not_met',
   };
 }
 
@@ -335,6 +408,90 @@ async function runErrorContracts(url, token) {
   };
 }
 
+async function fetchHealthBusy(url, token) {
+  const response = await request(url, token, { pathname: '/health', timeoutMs: 15000 });
+  let busyCount = null;
+  let sessionCount = null;
+  if (response.status === 200) {
+    try {
+      const payload = JSON.parse(response.text);
+      const rows = (((payload || {}).sessions || {}).list) || [];
+      busyCount = rows.filter((row) => row && row.busy).length;
+      sessionCount = (((payload || {}).sessions || {}).count);
+    } catch (_) { /* keep nulls */ }
+  }
+  return { status: response.status, busyCount, sessionCount, bodySha256: stableHash(response.text) };
+}
+
+async function runCancelContract(url, token, providerId, modelId, sessionKey) {
+  if (!providerId || !modelId) return { status: 'skipped', reason: 'no_ready_provider' };
+  const controller = new AbortController();
+  let aborted = false;
+  try {
+    const response = await fetch(new URL('/v1/chat/completions', url), {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        stream: true,
+        metadata: { dsweb_session_key: sessionKey },
+        messages: [{ role: 'user', content: 'cancel smoke: begin a longer response so the client can cancel after the first chunk' }],
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body || typeof response.body.getReader !== 'function') {
+      return { status: 'failed', reason: 'cancel_stream_unavailable', httpStatus: response.status };
+    }
+    const reader = response.body.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const text = Buffer.from(value || []).toString('utf8');
+      if (text.includes('data: ')) {
+        controller.abort();
+        aborted = true;
+        break;
+      }
+    }
+  } catch (error) {
+    const message = String(error && error.name || error && error.message || error);
+    if (!/AbortError/i.test(message)) return { status: 'failed', reason: sanitizeString(message) };
+    aborted = true;
+  }
+  const started = Date.now();
+  let latest = null;
+  while (Date.now() - started < 35000) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    latest = await fetchHealthBusy(url, token);
+    if (latest.status === 200 && latest.busyCount === 0) {
+      return {
+        status: 'passed',
+        providerId,
+        model: modelId,
+        aborted,
+        healthRecovered: true,
+        busyCount: latest.busyCount,
+        sessionCount: latest.sessionCount,
+        bodySha256: latest.bodySha256,
+      };
+    }
+  }
+  return {
+    status: 'failed',
+    providerId,
+    model: modelId,
+    aborted,
+    healthRecovered: false,
+    busyCount: latest && latest.busyCount,
+    sessionCount: latest && latest.sessionCount,
+    bodySha256: latest && latest.bodySha256,
+    reason: 'health_busy_after_cancel',
+  };
+}
+
 async function run(options) {
   const url = String(options.url || '').replace(/\/+$/, '');
   const stateDir = options.stateDir;
@@ -343,7 +500,7 @@ async function run(options) {
   const requestedProviders = String(options.providers || DEFAULT_PROVIDERS.join(','))
     .split(',').map((item) => item.trim()).filter(Boolean);
   const report = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     startedAt: new Date().toISOString(),
     gateway: { url, stateDir: '<state-dir>' },
     providers: [],
@@ -361,11 +518,18 @@ async function run(options) {
   if (!report.preflightConfig.ok) throw new Error('preflight /config failed with HTTP ' + report.preflightConfig.status);
   report.errorContracts = await runErrorContracts(url, token);
 
+  let cancelTarget = null;
   for (const providerId of requestedProviders) {
     const entry = { providerId };
     try {
       const loginState = await stableLoginState(url, token, providerId);
-      entry.login = { status: loginState.login.status, bodySha256: stableHash(loginState.login.text), attempts: loginState.attempts, ready: loginState.ready };
+      entry.login = {
+        status: loginState.login.status,
+        bodySha256: stableHash(loginState.login.text),
+        attempts: loginState.attempts,
+        ready: loginState.ready,
+        challengeObserved: loginState.snapshot && loginState.snapshot.challenge === true,
+      };
       if (loginState.login.status !== 200) throw new Error('login status HTTP ' + loginState.login.status);
       const snapshot = loginState.snapshot || {};
       if (!entry.login.ready) {
@@ -375,14 +539,17 @@ async function run(options) {
         continue;
       }
 
+      entry.sessionKey = 'live-smoke-' + stableHash(report.startedAt + ':' + providerId).slice(0, 16);
       entry.scenarios = {};
       for (const scenarioName of SCENARIO_ORDER) {
         const spec = buildScenarioSpec(providerId, scenarioName, models);
-        entry.scenarios[scenarioName] = await runScenario(url, token, providerId, spec);
+        const scenarioSessionKey = scenarioName === 'toolCall' ? entry.sessionKey + '-tools' : entry.sessionKey;
+        entry.scenarios[scenarioName] = await runScenario(url, token, providerId, spec, scenarioSessionKey);
       }
-      const scenarioStates = Object.values(entry.scenarios).map((scenario) => scenario.status);
+      const scenarioStates = GATING_SCENARIOS.map((name) => entry.scenarios[name] && entry.scenarios[name].status);
       entry.status = scenarioStates.includes('failed') ? 'failed' : 'passed';
       if (entry.status !== 'passed') entry.reason = 'scenario_failure';
+      if (!cancelTarget) cancelTarget = { providerId, modelId: chooseModel(providerId, models, 'default') && chooseModel(providerId, models, 'default').id, sessionKey: entry.sessionKey + '-cancel' };
     } catch (error) {
       entry.status = 'failed';
       entry.reason = sanitizeString(error && error.message, stateDir);
@@ -390,11 +557,19 @@ async function run(options) {
     report.providers.push(entry);
   }
 
+  report.cancelContract = await runCancelContract(url, token, cancelTarget && cancelTarget.providerId, cancelTarget && cancelTarget.modelId, cancelTarget && cancelTarget.sessionKey);
+  const toolCallRows = report.providers.filter((entry) => entry.scenarios && entry.scenarios.toolCall).map((entry) => ({ providerId: entry.providerId, status: entry.scenarios.toolCall.status, reason: entry.scenarios.toolCall.reason || null, model: entry.scenarios.toolCall.model || null }));
+  report.toolCallContract = {
+    status: toolCallRows.some((row) => row.status === 'passed') ? 'passed' : 'failed',
+    providers: toolCallRows,
+  };
   report.finishedAt = new Date().toISOString();
   report.ok = report.providers.length > 0
     && report.providers.every((entry) => entry.status === 'passed')
     && report.errorContracts.unauthenticatedModels.status === 401
-    && report.errorContracts.invalidModel.status === 404;
+    && report.errorContracts.invalidModel.status === 404
+    && report.cancelContract.status === 'passed'
+    && report.toolCallContract.status === 'passed';
   const artifactDir = path.join(ROOT, 'output', 'live-smoke', report.startedAt.replace(/[:.]/g, '-'));
   fs.mkdirSync(artifactDir, { recursive: true });
   fs.writeFileSync(path.join(artifactDir, 'report.json'), JSON.stringify(sanitizeReport(report, stateDir), null, 2) + '\n', { mode: 0o600 });
@@ -408,7 +583,7 @@ async function main() {
   const stateDir = process.env.DSWEB_LIVE_BASE;
   if (!stateDir) throw new Error('DSWEB_LIVE_BASE must point to the isolated gateway state directory');
   const { report, artifactDir } = await run({ url: args.url, providers: args.providers, stateDir });
-  console.log(JSON.stringify(sanitizeReport({ ok: report.ok, artifactDir, preflightConfig: report.preflightConfig, errorContracts: report.errorContracts, providers: report.providers }, stateDir), null, 2));
+  console.log(JSON.stringify(sanitizeReport({ ok: report.ok, artifactDir, preflightConfig: report.preflightConfig, errorContracts: report.errorContracts, cancelContract: report.cancelContract, toolCallContract: report.toolCallContract, providers: report.providers }, stateDir), null, 2));
   if (!report.ok) process.exitCode = 1;
 }
 
@@ -423,5 +598,7 @@ module.exports = {
   applySmokeConfig,
   normalizeCodeResponse,
   analyzeCodeBlockContent,
+  runCancelContract,
+  fetchHealthBusy,
 };
 if (require.main === module) main().catch((error) => { console.error('live-smoke failed: ' + (error.stack || error)); process.exitCode = 1; });

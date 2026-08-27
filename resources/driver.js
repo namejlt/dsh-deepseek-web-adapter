@@ -3200,8 +3200,9 @@ async function streamAdapterAsk(params, adapter, profile) {
         if (Date.now() - started > timeoutMs) throw providerError('unavailable', adapter.id + ' response timed out');
         await sleep(350);
       }
-      updateLastStreamSummary({ streamId, profile: profile.name, pageKey: (params && params.pageKey) || null, pageId, finishBy: 'adapter', ok: true, resultLen: lastText.length });
-      emitEvent('stream-end', { streamId, ok: true, result: lastText });
+      const adapterToolCalls = parseToolCalls(lastText, params && params.tools, { protocol: (params && params.toolProtocol) || (process.env.DSWEB_TOOL_PROTOCOL === 'compat' ? 'compat' : 'strict') });
+      updateLastStreamSummary({ streamId, profile: profile.name, pageKey: (params && params.pageKey) || null, pageId, finishBy: 'adapter', ok: true, resultLen: lastText.length, toolCalls: adapterToolCalls.length });
+      emitEvent('stream-end', adapterToolCalls.length ? { streamId, ok: true, result: lastText, toolCalls: adapterToolCalls } : { streamId, ok: true, result: lastText });
     } catch (e) {
       const kind = e && e.kind ? e.kind : 'dom_unavailable';
       updateLastStreamSummary({ streamId, profile: profile.name, pageKey: (params && params.pageKey) || null, pageId, finishBy: 'exception', ok: false, errorKind: kind, error: String(e.message || e) });

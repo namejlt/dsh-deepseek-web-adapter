@@ -242,5 +242,21 @@ check('6c assistant 仅 tool_calls 也算非新会话（避免误判首轮）', 
 check('7a content blocks 数组格式', gw.blockText([{ type: 'text', text: QUESTION }]) === QUESTION);
 check('7b 纯字符串', gw.blockText(QUESTION) === QUESTION);
 
+/* ---------- 8. 显式 metadata 会话键（live-smoke/受控客户端可稳定复用会话） ---------- */
+const smokeFpA = gw.sessionFingerprint({
+  metadata: { dsweb_session_key: 'live-smoke-qwen-20260827' },
+  messages: [{ role: 'user', content: 'first prompt' }],
+}, 'qwen');
+const smokeFpB = gw.sessionFingerprint({
+  metadata: { dsweb_session_key: 'live-smoke-qwen-20260827' },
+  messages: [{ role: 'user', content: 'second prompt with different contents' }],
+}, 'qwen');
+const smokeFpOther = gw.sessionFingerprint({
+  metadata: { dsweb_session_key: 'live-smoke-qwen-other' },
+  messages: [{ role: 'user', content: 'first prompt' }],
+}, 'qwen');
+check('8a metadata 会话键忽略后续 prompt 差异，稳定复用同一会话', smokeFpA.full === smokeFpB.full && smokeFpA.loose === smokeFpB.loose);
+check('8b 不同 metadata 会话键必须隔离', smokeFpA.full !== smokeFpOther.full && smokeFpA.loose !== smokeFpOther.loose);
+
 console.log('\n结果: ' + pass + ' 通过, ' + fail + ' 失败');
 process.exit(fail ? 1 : 0);

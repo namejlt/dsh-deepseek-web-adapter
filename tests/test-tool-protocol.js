@@ -40,3 +40,13 @@ assert.strictEqual(sandbox.__toolMode({ tools }), 'strict');
 assert.strictEqual(sandbox.__toolMode({ tools: [] }), 'disabled');
 
 console.log('PASS strict tool protocol rejects prose JSON and honors tool_choice none');
+
+const qwenToolText = '```tool_call\n{\n  "name": "echo_marker",\n  "args": {\n    "marker": "LIVE_TOOL_QWEN_OK"\n  }\n}\n```';
+const echoTools = [{ type: 'function', function: { name: 'echo_marker', parameters: { type: 'object', required: ['marker'], properties: { marker: { type: 'string' } } } } }];
+const qwenParsed = parseToolCalls(qwenToolText, echoTools, { protocol: 'strict' });
+assert.strictEqual(qwenParsed.length, 1, 'Qwen explicit tool block must parse on adapter finalization');
+assert.strictEqual(qwenParsed[0].name, 'echo_marker');
+assert.deepStrictEqual(JSON.parse(qwenParsed[0].arguments), { marker: 'LIVE_TOOL_QWEN_OK' });
+assert.match(driverSource, /const adapterToolCalls = parseToolCalls\(lastText, params && params\.tools/);
+
+console.log('PASS adapter finalization parses strict Qwen tool-call blocks');

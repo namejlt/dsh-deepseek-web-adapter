@@ -610,7 +610,17 @@ function hashText(s) {
  * full  = hash(system + 首条非 ctx user 全文) —— 精确匹配；
  * loose = hash(system + 首条非 ctx user 前 300 字符) —— 宽松匹配，
  *         抗 runtime-context 拼接在首条 user 里且每轮变化导致的指纹漂移。 */
+function explicitSessionKey(payload) {
+  const key = payload && payload.metadata && typeof payload.metadata === 'object' ? String(payload.metadata.dsweb_session_key || '').trim() : '';
+  return /^[A-Za-z0-9_.:-]{1,128}$/.test(key) ? key : '';
+}
+
 function sessionFingerprint(payload, providerId) {
+  const metaKey = explicitSessionKey(payload);
+  if (metaKey) {
+    const stable = hashText(String(providerId || 'deepseek') + '\x00metadata\x00' + metaKey);
+    return { full: stable, loose: stable };
+  }
   const msgs = payload.messages || [];
   const { sysText } = extractBaseline(msgs);
   const inputs = [];
@@ -690,7 +700,8 @@ async function allocPageKey() {
  */
 async function resolveSession(payload, providerId) {
   const fp = sessionFingerprint(payload, providerId);
-  if (!isNewConversation(payload)) {
+  const explicitKey = explicitSessionKey(payload);
+  if (explicitKey || !isNewConversation(payload)) {
     for (const s of sessions.values()) {
       if (s.fpFull === fp.full || s.fpLoose === fp.loose) {
         const mode = s.epoch !== driverEpoch ? 'recovery' : 'delta';
