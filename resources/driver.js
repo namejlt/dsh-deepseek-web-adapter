@@ -55,6 +55,20 @@ const DEBUG = !!process.env.DS_WEB_DEBUG;
 function log(...a) { console.error('[dsweb]', ...a); }
 function logErr(...a) { console.error('[dsweb][err]', ...a); }
 function logDbg(...a) { if (DEBUG) console.error('[dsweb][dbg]', ...a); }
+function summarizeTextForLog(text) {
+  const value = String(text == null ? '' : text);
+  return {
+    length: value.length,
+    sha256: crypto.createHash('sha256').update(value).digest('hex'),
+  };
+}
+function summarizeToolCallsForLog(toolCalls) {
+  const rows = Array.isArray(toolCalls) ? toolCalls : [];
+  return {
+    count: rows.length,
+    names: rows.map((call) => String((((call || {}).function || {}).name) || call.name || '?')).slice(0, 20),
+  };
+}
 
 /* ------------------------------------------------------------------ */
 /* config                                                              */
@@ -3760,11 +3774,11 @@ handlers.streamAsk = async (params) => {
       }
       /* 诊断日志：工具调用解析失败时打印实际输出与工具列表，方便定位 */
       if (toolCalls.length) {
-        log('streamAsk toolCalls: ' + JSON.stringify(toolCalls).slice(0, 400));
+        log('streamAsk toolCalls summary: ' + JSON.stringify(summarizeToolCallsForLog(toolCalls)));
         logDbg('streamAsk emitting stream-end with toolCalls=' + toolCalls.length + ' resultLen=' + finalText.length);
       } else {
         const names = (params.tools || []).map((t) => ((t.function || t).name || '?')).join(',');
-        log('streamAsk NO-toolCalls | 输出[:1500]: ' + String(finalText).slice(0, 1500).replace(/\n/g, '\\n') + ' | tools: ' + names.slice(0, 400));
+        log('streamAsk NO-toolCalls summary: ' + JSON.stringify({ result: summarizeTextForLog(finalText), tools: names.slice(0, 400) }));
         logDbg('streamAsk emitting stream-end ok=true resultLen=' + finalText.length);
       }
       if (limitHit) {
@@ -4090,4 +4104,4 @@ if (IS_MAIN) {
   emitEvent('ready', { version: VERSION, baseDir: CFG.baseDir, pid: process.pid });
 }
 
-module.exports = { profileKey, channelKey, resolveProviderAdapter, providerUrl, ProviderDriverError, shouldFinishAdapterResponse, shouldSkipAdapterBaseline, computeAdapterDelta };
+module.exports = { profileKey, channelKey, resolveProviderAdapter, providerUrl, ProviderDriverError, shouldFinishAdapterResponse, shouldSkipAdapterBaseline, computeAdapterDelta, summarizeTextForLog, summarizeToolCallsForLog };
