@@ -250,3 +250,9 @@ dsh plugin --profile web update
 - [ ] README（中英）安装命令与实际包名一致
 - [ ] 版本号符合 SemVer
 - [ ] 已认证手工 smoke test：分别登录 DeepSeek/ChatGPT/Qwen → 模型列表 → 文本/代码/SSE；记录未验收项，未完成时不得宣称 live verified
+
+## 9. 安全与 live-smoke 发布门禁
+
+发布候选必须执行 `npm run check && npm test && npm run pack:check`。`npm pack --dry-run` 不得包含 `resources/runtime/`、测试、local artifacts 或任何 token/profile 数据。
+
+使用 `tests/live/README.md` 所述的隔离 state 目录登录三个 provider 后，以 `DSWEB_LIVE_TEST=1` 运行真实 smoke。发布记录仅保存脱敏报告、commit SHA、日期、provider/model 与 pass/fail；不得保存账号标识、cookie、token、prompt 或原始回复。

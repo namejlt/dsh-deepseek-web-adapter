@@ -99,6 +99,7 @@ function makeGateway(tmpBase) {
   const sandbox = {
     require: (m) => {
       if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry.js'));
+      if (m === './state-store') return require(path.join(ROOT, 'resources', 'state-store.js'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },

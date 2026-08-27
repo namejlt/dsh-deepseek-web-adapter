@@ -29,3 +29,7 @@ Thumbs.db
 # Local browser QA artifacts
 .playwright-cli/
 /output/playwright/
+
+# Local authenticated verification state and artifacts
+.local/
+output/live-smoke/

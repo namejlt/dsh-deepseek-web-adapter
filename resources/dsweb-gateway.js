@@ -32,6 +32,7 @@ const http = require('http');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { PROVIDERS, MODELS, resolveModel, listModels, getProvider, defaultProfile } = require('./provider-registry');
+const { ensurePrivateDir, readOrCreateSecret, writeJsonAtomic, migrateLegacyState } = require('./state-store');
 
 /* ---------- 配置 ---------- */
 const args = process.argv.slice(2);
@@ -45,6 +46,21 @@ function argVal(name) {
 }
 const PORT = parseInt(argVal('--port') || '5688', 10) || 5688;
 const BASE_DIR = argVal('--base') || path.join(__dirname, '.gw');
+const LEGACY_RUNTIME_DIR = path.join(__dirname, 'runtime');
+const PROTOCOL_VERSION = '2';
+const INSTANCE_ID = crypto.randomUUID();
+const MANAGEMENT_SESSION_TTL_MS = 30 * 60 * 1000;
+const managementSessions = new Map();
+const shouldInitializeState = (typeof module !== 'undefined' && require.main === module) || process.env.DSWEB_INIT_STATE === '1';
+const skipLegacyMigration = argVal('--no-migrate') === 'true' || args.includes('--no-migrate') || process.env.DSWEB_SKIP_LEGACY_MIGRATION === '1';
+let stateMigration = { copied: [], skipped: [] };
+let GATEWAY_TOKEN = process.env.DSWEB_TOKEN || '';
+if (shouldInitializeState) {
+  ensurePrivateDir(BASE_DIR);
+  if (!skipLegacyMigration) stateMigration = migrateLegacyState({ legacyDir: LEGACY_RUNTIME_DIR, destinationDir: BASE_DIR });
+  GATEWAY_TOKEN = GATEWAY_TOKEN || readOrCreateSecret(path.join(BASE_DIR, 'gateway-token'));
+}
+if (!GATEWAY_TOKEN) GATEWAY_TOKEN = 'test-only-no-listener';
 /* DRIVER_PATH 默认指向 resources/driver.js（单一源码；测试/诊断均读此文件）。
  * 历史上曾在 BASE_DIR 下维护一份 runtime/driver.js 副本，易与源分叉（修复失效），
  * 现已统一为单一文件：网关直接执行源，本地数据仍经 DS_WEB_BASE=BASE_DIR 落在 runtime/。
@@ -333,9 +349,7 @@ function poolSave() {
       cooldownUntil: a.cooldownUntil, quotaHits: a.quotaHits, lastQuotaAt: a.lastQuotaAt,
       lastUsedAt: a.lastUsedAt, requestCount: a.requestCount,
     })) };
-    const tmp = ACCOUNTS_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-    fs.renameSync(tmp, ACCOUNTS_FILE);
+    writeJsonAtomic(ACCOUNTS_FILE, data);
   } catch (e) { log('accounts.json 落盘失败: ' + e.message); }
 }
 
@@ -990,7 +1004,6 @@ function buildToolsText(tools) {
 /** 写 SSE 响应头（text/event-stream，附 CORS）。只能在响应开始前调用一次
  * —— headersSent 守卫依赖此约定（异常路径二次 writeHead 会抛错导致连接悬挂）。 */
 function sseHeaders(res) {
-  cors(res);
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     /* no-transform 防反代压缩改写 SSE 帧；no-cache 防中间缓存 */
@@ -1105,6 +1118,12 @@ function isPossibleToolCallPrefix(text) {
 
 /** 校验 OpenAI chat/completions 请求。此校验必须发生在 SSE/driver 之前，
  * 这样无效请求始终获得 JSON 错误，且不会启动浏览器或污染会话。 */
+function resolveToolMode(payload) {
+  const tools = payload && payload.tools;
+  if (!Array.isArray(tools) || !tools.length || (payload && payload.tool_choice === 'none')) return 'disabled';
+  return process.env.DSWEB_TOOL_PROTOCOL === 'compat' ? 'compat' : 'strict';
+}
+
 function validateChatPayload(payload, allowWorkBuddy) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { status: 400, code: 'invalid_request', message: 'request body must be a JSON object' };
@@ -1204,6 +1223,8 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
   const cid = 'chatcmpl-' + created;
   /* OpenAI 兼容：stream=false → 完整 JSON 响应（旧实现一律 SSE，非流式客户端解析必炸） */
   const wantStream = payload.stream !== false;
+  const toolProtocol = resolveToolMode(payload);
+  const activeTools = toolProtocol === 'disabled' ? [] : payload.tools;
   const titleSource = sessionTitleSourceTexts(payload);
   if (titleSource) return sendLocalTitleCompletion(res, model, cid, created, wantStream, makeSessionTitle(titleSource));
   const sendChunk = (obj) => sseChunk(res, obj);
@@ -1327,7 +1348,7 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
       /* 工具提示词：first/recovery 随首包注入（网页版此时是空白会话），
        * delta 不重复携带——网页版历史里已有首轮的工具说明。
        * 工具块由 buildContext 内嵌到 [用户] 之前（位置优化），不再单独传 driver。 */
-      const toolsText = askMode === 'delta' ? '' : buildToolsText(payload.tools);
+      const toolsText = askMode === 'delta' ? '' : buildToolsText(activeTools);
       const q = buildContext(payload, askMode, toolsText);
       /* 无可发送内容（协议异常：末尾无新输入）→ 显式报错而非静默空回复。
        * 网页版页面从未收到消息，绝不能当成功（poolMarkOk 会污染账号统计，
@@ -1337,7 +1358,7 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
        * 无模型选择器）。calibKey=model 保留为 pill 未找到时的校准回放 fallback。 */
       const { streamId } = await rpc('streamAsk', {
         question: q, providerId: cfg.providerId, model: cfg, mode: cfg.mode, deepThink: cfg.deepThink, search: cfg.search === true,
-        headless: state.headless, tools: payload.tools,
+        headless: state.headless, tools: activeTools, toolProtocol,
         /* 会话亲和：driver 侧把 pageKey 固定映射到同一浏览器 tab */
         pageKey: session.pageKey,
         /* 多账号：driver 按 profile 绑定浏览器 user-data-dir（cookie 隔离） */
@@ -1373,7 +1394,7 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
                 let emitCurrentDelta = true;
                 if (toolMode === 'buffer') {
                   toolBuf += evt.delta;
-                  if (looksLikeToolCallText(toolBuf, payload.tools) && toolBuf.length < 400) {
+                  if (looksLikeToolCallText(toolBuf, activeTools) && toolBuf.length < 400) {
                     toolMode = 'silent';
                     silentStart = Date.now();
                     emitCurrentDelta = false;
@@ -1571,7 +1592,6 @@ async function handleWorkBuddy(req, res, payload) {
     return { id: tc.id || 'call_' + created, type: 'function', function: { name, arguments: argsStr } };
   });
   if (payload.stream) {
-    cors(res);
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
     const chunk = (obj) => res.write('data: ' + JSON.stringify(obj) + '\n\n');
     chunk({ id: cid, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
@@ -1612,8 +1632,8 @@ function providerSnippet() {
   return [
     'dsweb:',
     '  {',
-    '    displayName: DeepSeek 网页版 (免 API),',
-    '    apiKeyEnv: MOCK_LLM_KEY,',
+    '    displayName: Beta Web-to-OpenAI (local authenticated gateway),',
+    '    apiKeyEnv: DSWEB_GATEWAY_TOKEN,',
     '    api: openai-completions,',
     '    baseURL: ' + gatewayApiBaseURL() + ',',
     '    models:',
@@ -1624,7 +1644,7 @@ function providerSnippet() {
   ].join('\n');
 }
 function credentialsSnippet() {
-  return 'MOCK_LLM_KEY: sk-mock-any-value';
+  return 'DSWEB_GATEWAY_TOKEN: <copy the contents of gateway-token in DSWEB_STATE_DIR>';
 }
 function htmlEscape(s) {
   return String(s == null ? '' : s)
@@ -1742,12 +1762,21 @@ function buildAccountsPayload() {
     note: '受限信号只来自页面文案检测（动态风控无固定数值）；恢复=指数退避到期后真实请求探测',
   };
 }
+function publicLoginSnapshot(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const snapshot = { needsLogin: source.needsLogin !== false };
+  if (source.hasChatInput === true) snapshot.hasChatInput = true;
+  if (source.challenge === true) snapshot.challenge = true;
+  if (typeof source.limit === 'string') snapshot.limit = source.limit;
+  return snapshot;
+}
+
 async function getLoginSnapshot(providerId, passive) {
   let st = { needsLogin: true };
   const id = providerId || 'deepseek';
   try {
     const insp = await rpc('inspect', { providerId: id, profile: providerProfile(id), headless: state.headless, passive: !!passive }, 8000);
-    st = (insp && insp.login) || { needsLogin: true };
+    st = publicLoginSnapshot((insp && insp.login) || { needsLogin: true });
   } catch (e) { /* driver not ready */ }
   return st;
 }
@@ -1811,6 +1840,10 @@ async function buildHealthPayload() {
   const accounts = poolDescribe();
   const payload = {
     ok: true,
+    instanceId: INSTANCE_ID,
+    protocolVersion: PROTOCOL_VERSION,
+    startedAt: new Date(gatewayStartTime).toISOString(),
+    driverEpoch,
     uptime,
     requests: gatewayRequestCount,
     driver: { running: !!D, ready: !!(D && D.ready), pid: D && D.cp ? D.cp.pid : null, lastStreamSummary: inspect && inspect.lastStreamSummary ? inspect.lastStreamSummary : null },
@@ -1847,7 +1880,7 @@ function buildSetupPayload(health, accountsPayload, providersPayload) {
       checklist: [
         { key: 'gateway', label: '网关已启动', done: true, detail: gatewayBaseURL() },
         { key: 'provider', label: '已在 ~/.dsh/settings.yaml 添加 dsweb provider', done: false, detail: '复制下方 provider 片段到 llm-pi-ai.providers' },
-        { key: 'credentials', label: '已在 ~/.dsh/.credentials.yaml 添加 MOCK_LLM_KEY', done: false, detail: '网关不校验该值，只需存在即可' },
+        { key: 'credentials', label: '已在 ~/.dsh/.credentials.yaml 添加 DSWEB_GATEWAY_TOKEN', done: false, detail: '复制 DSWEB_STATE_DIR/gateway-token 的完整内容；不要提交或粘贴到日志' },
         { key: 'login', label: 'DeepSeek 已登录', done: summary.login === 'logged_in', detail: summary.login === 'logged_in' ? '当前检查通过' : '请点击“默认账号登录”或登录其它账号' },
       ],
       quickLinks: {
@@ -1881,8 +1914,7 @@ function buildSetupPayload(health, accountsPayload, providersPayload) {
   };
 }
 function sendHtml(res, html) {
-  cors(res);
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(html);
 }
 function renderManagementPage(setup) {
@@ -2015,16 +2047,74 @@ function renderManagementPage(setup) {
 }
 
 /* ---------- HTTP 服务 ---------- */
-/** 设置 CORS 响应头（本机调试场景，放开全部来源）。 */
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+function gatewayOrigin() { return 'http://127.0.0.1:' + PORT; }
+function parseCookies(req) {
+  const raw = String((req.headers && req.headers.cookie) || '');
+  const out = Object.create(null);
+  for (const part of raw.split(';')) {
+    const index = part.indexOf('=');
+    if (index < 1) continue;
+    out[part.slice(0, index).trim()] = part.slice(index + 1).trim();
+  }
+  return out;
 }
-/** 发送 JSON 响应（默认 200 + CORS）。 */
+function constantTimeEqual(left, right) {
+  const a = Buffer.from(String(left || ''), 'utf8');
+  const b = Buffer.from(String(right || ''), 'utf8');
+  return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+}
+function bearerToken(req) {
+  const raw = String((req.headers && req.headers.authorization) || '');
+  const match = /^Bearer\s+(.+)$/i.exec(raw);
+  return match ? match[1].trim() : '';
+}
+function hasBearerToken(req) { return constantTimeEqual(bearerToken(req), GATEWAY_TOKEN); }
+function pruneManagementSessions(now = Date.now()) {
+  for (const [id, expiresAt] of managementSessions) if (expiresAt <= now) managementSessions.delete(id);
+}
+function issueManagementSession(res) {
+  pruneManagementSessions();
+  const id = crypto.randomBytes(24).toString('base64url');
+  managementSessions.set(id, Date.now() + MANAGEMENT_SESSION_TTL_MS);
+  res.setHeader('Set-Cookie', 'dsweb_session=' + id + '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + Math.floor(MANAGEMENT_SESSION_TTL_MS / 1000));
+}
+function managementAuthorization(req) {
+  if (hasBearerToken(req)) return { ok: true, via: 'bearer' };
+  const id = parseCookies(req).dsweb_session;
+  const expiresAt = id && managementSessions.get(id);
+  if (!expiresAt || expiresAt <= Date.now()) {
+    if (id) managementSessions.delete(id);
+    return { ok: false, reason: 'missing_session' };
+  }
+  const origin = String((req.headers && req.headers.origin) || '');
+  if (origin && origin !== gatewayOrigin()) return { ok: false, reason: 'origin_not_allowed' };
+  if (req.method !== 'GET' && req.method !== 'HEAD' && origin !== gatewayOrigin()) return { ok: false, reason: 'origin_not_allowed' };
+  return { ok: true, via: 'management_session' };
+}
+function openAiError(message, type, code, param) {
+  return { error: { message: String(message || 'request failed'), type: type || 'api_error', param: param || null, code: code || null } };
+}
+function sendOpenAiError(res, statusCode, message, type, code, param) {
+  return sendJson(res, openAiError(message, type, code, param), statusCode);
+}
+function isApiPath(p) {
+  return p === '/v1/models' || p === '/models' || p === '/v1/chat/completions' || p === '/chat/completions';
+}
+function authorizeApi(req, res) {
+  if (hasBearerToken(req)) return true;
+  sendOpenAiError(res, 401, 'missing or invalid gateway bearer token', 'authentication_error', 'invalid_api_key');
+  return false;
+}
+function authorizeManagement(req, res) {
+  const auth = managementAuthorization(req);
+  if (auth.ok) return true;
+  if (auth.reason === 'origin_not_allowed') sendJson(res, { error: { message: 'management origin is not allowed', code: 'origin_not_allowed' } }, 403);
+  else sendJson(res, { error: { message: 'management authentication required', code: 'management_auth_required' } }, 401);
+  return false;
+}
+/** 发送 JSON 响应（默认 200；网关不对任意 Origin 开启 CORS）。 */
 function sendJson(res, obj, statusCode) {
-  cors(res);
-  res.writeHead(statusCode || 200, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.writeHead(statusCode || 200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(obj));
 }
 /** 读取请求体（字符串），8MB 上限防滥用。 */
@@ -2041,6 +2131,12 @@ const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://127.0.0.1');
   const p = u.pathname.replace(/\/+$/, '') || '/';
   try {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { 'Cache-Control': 'no-store' });
+      return res.end();
+    }
+    if (isApiPath(p) && !authorizeApi(req, res)) return;
+    if (p !== '/' && !isApiPath(p) && !authorizeManagement(req, res)) return;
     /* 模型列表 */
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       gatewayRequestCount++;
@@ -2051,7 +2147,7 @@ const server = http.createServer(async (req, res) => {
       gatewayRequestCount++;
       const payload = JSON.parse((await readBody(req)) || '{}');
       const validation = validateChatPayload(payload, true);
-      if (validation) return sendJson(res, { error: { message: validation.message, type: 'invalid_request_error', code: validation.code } }, validation.status);
+      if (validation) return sendOpenAiError(res, validation.status, validation.message, 'invalid_request_error', validation.code);
       log('请求: model=' + payload.model + ' msgs=' + payload.messages.length + ' tools=' + ((payload.tools || []).length));
       /* 诊断：记录工具名列表（首次记录到 baseDir/tools.log） */
       try {
@@ -2070,11 +2166,12 @@ const server = http.createServer(async (req, res) => {
         return handleWorkBuddy(req, res, payload);
       }
       const resolvedModel = resolveProviderModel(payload.model);
-      if (!resolvedModel) return sendJson(res, { error: { message: 'unknown model: ' + payload.model, type: 'invalid_request_error', code: 'model_not_found' } }, 404);
+      if (!resolvedModel) return sendOpenAiError(res, 404, 'unknown model: ' + payload.model, 'invalid_request_error', 'model_not_found');
       return handleChatCompletion(req, res, payload, resolvedModel);
     }
     if (req.method === 'GET' && p === '/') {
       gatewayRequestCount++;
+      issueManagementSession(res);
       const health = await buildHealthPayload();
       const providers = await buildProvidersPayload();
       const setup = buildSetupPayload(health, buildAccountsPayload(), providers);
@@ -2196,7 +2293,10 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'not found: ' + p } }));
   } catch (e) {
-    try { sendJson(res, { ok: false, error: String(e.message || e) }); } catch (e2) { /* ignore */ }
+    try {
+      if (isApiPath(p)) sendOpenAiError(res, 400, String(e.message || e), 'invalid_request_error', 'invalid_json');
+      else sendJson(res, { ok: false, error: { message: String(e.message || e), code: 'request_failed' } }, 400);
+    } catch (e2) { /* ignore */ }
   }
 });
 

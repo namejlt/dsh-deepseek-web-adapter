@@ -947,7 +947,6 @@ const EXPR = {
       needsLogin: url.includes('/auth') || url.includes('/login') || url.includes('/sign') || hasPasswordInput || hasLoginButton,
       url: url,
       hasChatInput: !!document.querySelector('#chat-input, textarea[placeholder], textarea, [contenteditable="true"]'),
-      bodySnippet: body.slice(0, 300),
     };
   })()`,
 
@@ -1020,15 +1019,15 @@ async function ensureLoggedIn(pageId, providerId) {
     const adapter = resolveProviderAdapter(providerId);
     await waitReady(pageId, 30000);
     const challenge = await evalJs(pageId, adapter.expressions.detectChallenge).catch(() => false);
-    if (challenge) return { needsLogin: false, hasChatInput: false, challenge: true, url: providerUrl(providerId), bodySnippet: 'provider challenge detected' };
+    if (challenge) return { needsLogin: false, hasChatInput: false, challenge: true, url: providerUrl(providerId) };
     const needsLogin = await evalJs(pageId, adapter.expressions.detectLogin).catch(() => true);
     const composer = await evalJs(pageId, adapter.expressions.findComposer).catch(() => ({ found: false }));
-    return { needsLogin: !!needsLogin, hasChatInput: !!(composer && composer.found), challenge: false, url: providerUrl(providerId), bodySnippet: '' };
+    return { needsLogin: !!needsLogin, hasChatInput: !!(composer && composer.found), challenge: false, url: providerUrl(providerId) };
   }
   await waitReady(pageId, 30000);
   const st = await evalJs(pageId, EXPR.loginState);
   if (st.needsLogin || !st.hasChatInput) {
-    log('ensureLoggedIn: needsLogin=' + st.needsLogin + ' hasChatInput=' + st.hasChatInput + ' url=' + st.url + ' bodySnippet=' + (st.bodySnippet || '').slice(0, 100));
+    log('ensureLoggedIn: needsLogin=' + st.needsLogin + ' hasChatInput=' + st.hasChatInput + ' provider=' + (providerId || 'deepseek'));
   }
   return st;
 }
@@ -2426,7 +2425,7 @@ handlers.inspect = async (params) => {
         providerId: adapter.id,
         dom: { url: providerUrl(adapter.id), providerId: adapter.id },
         buttons: [],
-        login: { needsLogin: false, hasChatInput: false, challenge: false, profileInactive: true, url: providerUrl(adapter.id), bodySnippet: 'provider profile is not active' },
+        login: { needsLogin: false, hasChatInput: false, challenge: false, profileInactive: true, url: providerUrl(adapter.id) },
         modelBadge: { text: '', tag: '' },
         channels: [...channels.keys()],
         freePages: subPages.length,
@@ -2637,8 +2636,9 @@ async function applyCalibration(pageId, key) {
  * @param {Array} tools OpenAI tools 数组（schema 推断用）
  * @returns {Array<{name: string, arguments: object|string}>} 工具调用列表（空数组=非工具回复）
  */
-function parseToolCalls(text, tools) {
+function parseToolCalls(text, tools, options) {
   const calls = [];
+  const strictProtocol = !!(options && options.protocol === 'strict');
   const t = String(text || '');
   if (!t) return calls;
   function buildParseInputs(raw) {
@@ -2859,6 +2859,14 @@ function parseToolCalls(text, tools) {
     } else if (!name) {
       argsObj = j;
     }
+    if (strictProtocol) {
+      const fn = toolSchemaByName(name);
+      if (!fn || !argsObj || typeof argsObj !== 'object' || Array.isArray(argsObj)) return false;
+      const required = (fn.parameters && fn.parameters.required) || [];
+      if (required.some((key) => argsObj[key] === undefined)) return false;
+      calls.push({ name, arguments: JSON.stringify(argsObj) });
+      return true;
+    }
     /* 工具名优先级：
      * 1) 模型给的 name 在工具列表里 → 直接用（可信）
      * 2) 否则用 schema 参数匹配推断（模型可能编造 name，如 write vs write_file；
@@ -2899,7 +2907,11 @@ function parseToolCalls(text, tools) {
     return calls.length > 0;
   };
   function parseFromText(sourceText) {
-    const patterns = [
+    const patterns = strictProtocol ? [
+      /* Strict mode accepts only the explicit formats injected into the web prompt. */
+      { re: /```tool_call\s*\n([\s\S]*?)```/gi, g: 1 },
+      { re: /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi, g: 1 },
+    ] : [
       { re: /tool_call\s*\n?\s*(\{[\s\S]*\})/gi, g: 1 },
       /* 显式带 tool_call 标注的代码块优先于普通 json/裸代码块：
        * 同一轮输出多个块时先匹配执行带标记的那个（协议可信度最高）。 */
@@ -2925,6 +2937,7 @@ function parseToolCalls(text, tools) {
         } catch (e) { /* keep scanning */ }
       }
     }
+    if (strictProtocol) return;
     if (!calls.length) {
       /* scavenger: 平衡括号提取所有完整 JSON 对象（正确处理嵌套——正则非贪婪会在内层 } 截断），
        * 从后往前扫描——有 name 的直接用，只有参数的按 schema 推断工具名 */
@@ -3267,7 +3280,7 @@ handlers.streamAsk = async (params) => {
         login = await ensureLoggedIn(pageId, adapter.id);
       }
       if (login.needsLogin || !login.hasChatInput) {
-        emitEvent('stream-end', { streamId, ok: false, errorKind: 'login', error: 'login required: 页面已关闭或未登录。请打开 http://127.0.0.1:5688/login 重新登录（建议勾选保持登录），登录后页面会保持常驻。 url=' + (login.url || '?') + ' body=' + (login.bodySnippet || '').slice(0, 80) });
+        emitEvent('stream-end', { streamId, ok: false, errorKind: 'login', error: 'login required: 页面已关闭或未登录。请从本地 Provider Console 重新登录（建议勾选保持登录）。' });
         return;
       }
       /* 模型切换由校准回放（applyCalibration）负责——不调用 applyConfig
@@ -3737,7 +3750,7 @@ handlers.streamAsk = async (params) => {
         finalGenSeen = genSeen;
         finalLastDoneReason = lastDoneReason;
         finalLastDoneState = lastDoneState;
-        toolCalls = parseToolCalls(finalText, params.tools);
+        toolCalls = parseToolCalls(finalText, params.tools, { protocol: (params && params.toolProtocol) || (process.env.DSWEB_TOOL_PROTOCOL === 'compat' ? 'compat' : 'strict') });
         const toolIntent = looksLikeToolCall(finalText, params.tools);
         logDbg('streamAsk attempt=' + attempt + ' finalTextLen=' + finalText.length + ' toolCalls=' + toolCalls.length + ' looksLikeTool=' + toolIntent);
         /* 解析成功 → 停止重试；

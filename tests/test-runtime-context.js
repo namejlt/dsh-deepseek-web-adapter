@@ -30,6 +30,7 @@ function loadGateway() {
   const sandbox = {
     require: (m) => {
       if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry'));
+      if (m === './state-store') return require(path.join(ROOT, 'resources', 'state-store'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },
@@ -99,8 +100,8 @@ check('2c2 特征全失配时 ctx 不进上下文段（isRuntimeContext=false）
 /* 回归背景：旧版 buildContext 把 [系统设定] clip 到 8000 字（recovery 4000），
  * DSH 长系统设定（工具协议/teams 规则在尾部）被截掉 → 模型丢失关键规则、
  * 行为系统性偏差。现改为全文下发，超长风险由 driver 超时/重试兜底。 */
-const SYS_LONG = SYS + '\n' + Array.from({ length: 200 }, (_, i) => 'RULE-' + String(i).padStart(3, '0') + ': 这是一条位于系统设定尾部的关键规则，绝不能被截断丢失。').join('\n') + '\nTAIL-MARKER-DO-NOT-LOSE';
-check('2d0 长系统设定确实超过旧 8000 限长（用例有效性）', SYS_LONG.length > 9000, 'len=' + SYS_LONG.length);
+const SYS_LONG = SYS + '\n' + Array.from({ length: 240 }, (_, i) => 'RULE-' + String(i).padStart(3, '0') + ': 这是一条位于系统设定尾部的关键规则，绝不能被截断丢失。').join('\n') + '\nTAIL-MARKER-DO-NOT-LOSE';
+check('2d0 长系统设定确实超过旧 8000 限长（用例有效性）', SYS_LONG.length > 8000, 'len=' + SYS_LONG.length);
 const turnLong = { messages: [
   { role: 'system', content: SYS_LONG },
   { role: 'user', content: QUESTION },

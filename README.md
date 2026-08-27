@@ -57,7 +57,7 @@ dsh plugin --profile web add github:你的用户名/dsh-deepseek-web-adapter
 dsweb:
   {
     displayName: Beta 多站点 Web-to-OpenAI (免 API),
-    apiKeyEnv: MOCK_LLM_KEY,
+    apiKeyEnv: DSWEB_GATEWAY_TOKEN,
     api: openai-completions,
     baseURL: http://127.0.0.1:5688/v1/,
     models:
@@ -88,7 +88,7 @@ dsweb:
   }
 ```
 
-并在 `~/.dsh/.credentials.yaml` 加：`MOCK_LLM_KEY: sk-mock-any-value`（任意值，网关不校验）。
+并在 `~/.dsh/.credentials.yaml` 加：`DSWEB_GATEWAY_TOKEN: <copy the contents of gateway-token in DSWEB_STATE_DIR>`（任意值，网关不校验）。
 DSH 配置热加载——模型选择器立即出现 DeepSeek 网页版。
 
 ## 登录
@@ -221,8 +221,8 @@ git clone https://github.com/huermi/dsh-deepseek-web-adapter.git
 # 3. 本地启动网关调试
 node resources/dsweb-gateway.js --port 5688 --base resources/runtime
 # 4. 跑回归测试（改动 driver.js / dsweb-gateway.js 后必须跑）
-node tests/test-parser-all.js    # 期望 54/54 通过
-node tests/test-account-pool.js  # 期望 61/61 通过
+node tests/test-parser-all.js    # 由 `npm test` 统一验证
+node tests/test-account-pool.js  # 由 `npm test` 统一验证
 ```
 
 **开发仓库**（含卡片 UI、host 自动拉起、完整回归套件）：见 `dsweb-plugin/` 目录说明或
@@ -236,3 +236,20 @@ node tests/test-account-pool.js  # 期望 61/61 通过
 ## License
 
 MIT —— 保留版权声明即可自由使用/修改/再分发。详细条款见 [LICENSE](LICENSE)。
+## 本地鉴权、状态目录与真实页面验证
+
+网关现在要求 bearer token：首次启动会在用户状态目录创建权限为当前用户私有的 `gateway-token`。将其完整内容写入 DSH 的 `DSWEB_GATEWAY_TOKEN` credential；不要把 token 写入 Git、终端日志、URL 或截图。
+
+默认状态目录为 macOS 的 `~/Library/Application Support/dsh-web-adapter`、Linux 的 `${XDG_STATE_HOME:-~/.local/state}/dsh-web-adapter`、Windows 的 `%LOCALAPPDATA%/dsh-web-adapter`；可用 `DSWEB_STATE_DIR` 覆盖。浏览器 profile、账号池、校准和日志均在该目录，**不再存放或发布在 npm 包内**。
+
+管理页仅允许同源浏览器会话访问。先打开 `http://127.0.0.1:5688/`，再从 Provider Console 点击对应 provider 的登录动作；不要把 `/login` 链接嵌入第三方网页。
+
+开发与发布前请执行：
+
+```bash
+npm run check
+npm test
+npm run pack:check
+```
+
+真实网页登录验证使用隔离目录和显式 opt-in：详见 [`tests/live/README.md`](tests/live/README.md)。

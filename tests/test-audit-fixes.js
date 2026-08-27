@@ -34,6 +34,7 @@ function loadGateway(exports) {
   const sandbox = {
     require: (m) => {
       if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry'));
+      if (m === './state-store') return require(path.join(ROOT, 'resources', 'state-store'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },
@@ -167,7 +168,7 @@ check('V6 网关实时转发 delta（不再攒到终态）', /if \(evt\.delta !=
 check('V7 thinking delta 不再转 reasoning_content chunk', !/delta: \{ reasoning_content: evt\.delta, reasoning: evt\.delta \}/.test(GW_SRC));
 check('V7b 非流式 message 不再带 reasoning_content 与 reasoning', !/reasoning_content: accThinking \|\| undefined, reasoning: accThinking \|\| undefined/.test(GW_SRC));
 check('V8 正文 delta → content chunk（流式直通）', /delta: \{ content: evt\.delta \}/.test(GW_SRC));
-check('V9 工具调用首段静默（JSON 不外泄进 content）', /looksLikeToolCallText\(toolBuf, payload\.tools\) && toolBuf\.length < 400/.test(GW_SRC) && /toolMode = 'silent'/.test(GW_SRC));
+check('V9 工具调用首段静默（JSON 不外泄进 content）', /looksLikeToolCallText\(toolBuf, activeTools\) && toolBuf\.length < 400/.test(GW_SRC) && /toolMode = 'silent'/.test(GW_SRC));
 check('V9b gateway 工具首段识别支持已授权 schema 感知', /function looksLikeToolCallText\(t, tools\)/.test(GW_SRC) && /matchToolByParamsStrict\(obj\)/.test(GW_SRC));
 check('V10 终态前缀对齐补尾', /while \(i < n && accContent\.charCodeAt\(i\) === result\.charCodeAt\(i\)\) i\+\+;/.test(GW_SRC));
 check('V11 非流式 JSON 不含 reasoning_content', !/reasoning_content: accThinking \|\| undefined/.test(GW_SRC));

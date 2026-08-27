@@ -119,7 +119,9 @@ check('E6 arguments 为 null', '\u003ctool_call\u003e{"name": "write", "argument
 check('E7 两个连续 ```tool_call 块(取第一个)', '```tool_call\n{"name": "pwsh", "arguments": {"command": "pwd"}}\n```\n```tool_call\n{"name": "write", "arguments": {"file_path": "a.txt", "content": "x"}}\n```', 'pwsh');
 check('E8 ```json 示例块在前 + ```tool_call 块在后(带标记者优先)', '配置示例：\n```json\n{"file_path": "demo.txt", "content": "示例"}\n```\n实际调用：\n```tool_call\n{"name": "pwsh", "arguments": {"command": "pwd"}}\n```', 'pwsh');
 const e9 = parseToolCalls('\u003ctool_call\u003e{"name": "pwsh", "arguments": {"command": "pwd"}}\u003c/tool_call\u003e\n\u003ctool_call\u003e{"name": "write", "arguments": {"file_path": "a.txt", "content": "x"}}\u003c/tool_call\u003e', tools);
-check('E9 多候选结果数组长度恒为 1', e9.length === 1, 'len=' + e9.length);
+/* E9 是直接布尔断言，不能把布尔值误传给用于解析文本的 check()。 */
+if (e9.length === 1) { pass++; }
+else { fail++; failures.push({ desc: 'E9 多候选结果数组长度恒为 1', expected: 'len=1', got: 'len=' + e9.length, detail: JSON.stringify(e9) }); }
 
 /* ============ F. 参数别名（模型可能不用 schema 参数名） ============ */
 check('F1 path 别名', '<tool_call>{"name": "write", "arguments": {"path": "a.txt", "content": "hi"}}</tool_call>', 'write');

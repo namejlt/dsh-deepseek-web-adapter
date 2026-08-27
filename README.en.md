@@ -53,7 +53,7 @@ Edit `~/.dsh/settings.yaml`, inside `llm-pi-ai.providers: { ... }` add:
 dsweb:
   {
     displayName: Beta multisite Web-to-OpenAI (no API key),
-    apiKeyEnv: MOCK_LLM_KEY,
+    apiKeyEnv: DSWEB_GATEWAY_TOKEN,
     api: openai-completions,
     baseURL: http://127.0.0.1:5688/v1/,
     models:
@@ -84,7 +84,7 @@ dsweb:
   }
 ```
 
-Add `MOCK_LLM_KEY: sk-mock-any-value` to `~/.dsh/.credentials.yaml` (any value; the gateway does not check it).
+Add `DSWEB_GATEWAY_TOKEN: <copy the contents of gateway-token in DSWEB_STATE_DIR>` to `~/.dsh/.credentials.yaml` (any value; the gateway does not check it).
 DSH config hot-reloads — the DeepSeek Web models appear in the model picker immediately.
 
 ## Login
@@ -219,8 +219,8 @@ git clone https://github.com/huermi/dsh-deepseek-web-adapter.git
 # 3. Run the gateway locally for debugging
 node resources/dsweb-gateway.js --port 5688 --base resources/runtime
 # 4. Run the regression suites (mandatory after touching driver.js / dsweb-gateway.js)
-node tests/test-parser-all.js      # expect 54/54 pass
-node tests/test-account-pool.js    # expect 61/61 pass
+node tests/test-parser-all.js      # covered by `npm test`
+node tests/test-account-pool.js    # covered by `npm test`
 ```
 
 **This repo now contains a directly usable plugin management frontend** (`/`) and reusable JSON interfaces (`/setup`, `/health`, `/accounts`, `/config`). If you later want a native DSH settings card, build it on top of these interfaces.
@@ -233,3 +233,12 @@ Key maintenance points:
 ## License
 
 MIT — free to use/modify/redistribute with the copyright notice retained. See [LICENSE](LICENSE).
+## Local authentication, state directory, and real-page validation
+
+The gateway now requires a bearer token. On first launch it creates a user-private `gateway-token` in the state directory. Copy its complete value to DSH as `DSWEB_GATEWAY_TOKEN`; never commit it or place it in logs, URLs, or screenshots.
+
+The default state directory is `~/Library/Application Support/dsh-web-adapter` on macOS, `${XDG_STATE_HOME:-~/.local/state}/dsh-web-adapter` on Linux, and `%LOCALAPPDATA%/dsh-web-adapter` on Windows. Override it with `DSWEB_STATE_DIR`. Browser profiles, account state, calibration, and logs live there and are not published in the npm package.
+
+Open `http://127.0.0.1:5688/` first, then use the Provider Console login actions in the same browser. The management API is restricted to that same-origin session.
+
+Run `npm run check`, `npm test`, and `npm run pack:check` before release. See [`tests/live/README.md`](tests/live/README.md) for explicit opt-in authenticated real-page smoke testing.

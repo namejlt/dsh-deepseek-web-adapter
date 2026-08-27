@@ -1,19 +1,29 @@
 {
   "name": "dsh-deepseek-web-adapter",
   "version": "1.0.0",
-  "description": "Use DeepSeek web (chat.deepseek.com) as a free LLM provider in DSH — no API key needed. Plugin auto-launches a local gateway that drives a persistent browser; continuous chat, tool calls, model calibration, sub-agent concurrency.",
+  "description": "Local authenticated Web-to-OpenAI gateway for DeepSeek, ChatGPT, and Qwen in DSH. The plugin launches a persistent browser driver with provider-isolated profiles.",
   "type": "module",
   "main": "lib/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node tests/run-all.js",
+    "check": "node tests/check-package.js && node tests/check-syntax.js",
+    "pack:check": "node tests/check-package.js"
+  },
   "files": [
     "lib/",
-    "resources/",
-    "!resources/runtime/profiles",
-    "!resources/runtime/*.log",
-    "!resources/runtime/accounts.json",
+    "resources/driver.js",
+    "resources/dsweb-gateway.js",
+    "resources/provider-registry.js",
+    "resources/state-store.js",
+    "resources/providers/",
+    "resources/package.json",
     "cordis.patch.yml",
     "README.md",
     "README.en.md",
-    "tests/"
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {
@@ -23,10 +33,11 @@
   "keywords": [
     "dsh-plugin",
     "deepseek",
+    "chatgpt",
+    "qwen",
     "llm",
     "provider",
-    "web",
-    "free"
+    "web"
   ],
   "license": "MIT"
 }

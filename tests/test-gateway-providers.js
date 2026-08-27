@@ -15,6 +15,7 @@ const GATEWAY = path.join(ROOT, 'resources', 'dsweb-gateway.js');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsweb-provider-gateway-'));
 const recordsFile = path.join(temp, 'driver-records.jsonl');
 const fakeDriver = path.join(temp, 'fake-driver.js');
+let defaultHeaders = {};
 
 fs.writeFileSync(fakeDriver, `#!/usr/bin/env node
 // deepseek-web-driver.js fake offline RPC endpoint
@@ -55,10 +56,10 @@ process.stdin.on('data', (chunk) => {
 out({ event: 'ready', version: 'fake' });
 `);
 
-function request(port, method, pathname, body) {
+function request(port, method, pathname, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
-    const req = http.request({ hostname: '127.0.0.1', port, method, path: pathname, headers: payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : undefined }, (res) => {
+    const req = http.request({ hostname: '127.0.0.1', port, method, path: pathname, headers: { ...defaultHeaders, ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}), ...headers } }, (res) => {
       let text = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { text += chunk; });
@@ -113,6 +114,8 @@ function driverRecords() {
   child.stdout.on('data', (chunk) => { output += chunk; });
   child.stderr.on('data', (chunk) => { output += chunk; });
   try {
+    await waitFor(() => fs.existsSync(path.join(temp, 'gateway-token')));
+    defaultHeaders = { Authorization: 'Bearer ' + fs.readFileSync(path.join(temp, 'gateway-token'), 'utf8').trim() };
     await waitFor(async () => (await request(port, 'GET', '/v1/models')).status === 200);
 
     const modelsResponse = await request(port, 'GET', '/v1/models');

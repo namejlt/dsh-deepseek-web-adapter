@@ -30,6 +30,7 @@ function makeGateway(tmpBase) {
   const sandbox = {
     require: (m) => {
       if (m === './provider-registry') return require(path.join(ROOT, 'resources', 'provider-registry'));
+      if (m === './state-store') return require(path.join(ROOT, 'resources', 'state-store'));
       if (!['fs', 'path', 'http', 'crypto', 'child_process'].includes(m)) throw new Error('not allowed: ' + m);
       return require(m);
     },
@@ -51,7 +52,7 @@ function makeGateway(tmpBase) {
   check('1a providerSnippet 含 dsweb provider 名称', /dsweb:/.test(gw.providerSnippet()));
   check('1b providerSnippet 含 8 个模型中的 deepseek-think-search', /deepseek-think-search/.test(gw.providerSnippet()));
   check('1c providerSnippet 指向本地 /v1/', /http:\/\/127\.0\.0\.1:5688\/v1\//.test(gw.providerSnippet()), gw.providerSnippet());
-  check('1d credentialsSnippet 为 MOCK_LLM_KEY', gw.credentialsSnippet() === 'MOCK_LLM_KEY: sk-mock-any-value');
+  check('1d credentialsSnippet 指向持久 gateway bearer token', /DSWEB_GATEWAY_TOKEN/.test(gw.credentialsSnippet()) && /gateway-token/.test(gw.credentialsSnippet()), gw.credentialsSnippet());
 
   gw.poolAdd('acc2');
   gw.pool.accounts.get('acc2').state = 'cooling';

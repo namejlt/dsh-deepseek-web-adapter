@@ -70,7 +70,7 @@ dsh plugin --profile web add github:你的用户名/dsh-deepseek-web-adapter
 dsweb:
   {
     displayName: Beta 多站点 Web-to-OpenAI (免 API),
-    apiKeyEnv: MOCK_LLM_KEY,
+    apiKeyEnv: DSWEB_GATEWAY_TOKEN,
     api: openai-completions,
     baseURL: http://127.0.0.1:5688/v1/,
     models:
@@ -104,7 +104,7 @@ dsweb:
 再在 `~/.dsh/.credentials.yaml` 加一行（任意值即可，网关不校验）：
 
 ```yaml
-MOCK_LLM_KEY: sk-mock-any-value
+DSWEB_GATEWAY_TOKEN: <copy the contents of gateway-token in DSWEB_STATE_DIR>
 ```
 
 DSH 配置热加载，模型选择器会立即出现 DeepSeek 既有模型与 ChatGPT/Qwen Beta 模型。
@@ -290,7 +290,7 @@ dsh plugin --profile web remove dsh-deepseek-web-adapter && dsh plugin --profile
 ## 7. 故障排查 FAQ
 
 **Q: 模型选择器里没有 DeepSeek 网页版？**
-检查 `settings.yaml` 缩进与 `providers` 层级；确认 `.credentials.yaml` 已加 `MOCK_LLM_KEY`；DSH 配置热加载，不行就重启 DSH。
+检查 `settings.yaml` 缩进与 `providers` 层级；确认 `.credentials.yaml` 已加 `DSWEB_GATEWAY_TOKEN`；DSH 配置热加载，不行就重启 DSH。
 
 **Q: 请求报错「login required / 请打开 /login」？**
 DeepSeek 令牌过期。正常情况网关会自动弹登录窗口（`autoRelogin` 开启时），登录后原请求自动重试。若自动登录超时（5 分钟），手动打开 `http://127.0.0.1:5688/login` 登录即可。
@@ -327,4 +327,9 @@ dsh plugin --profile web remove dsh-deepseek-web-adapter
 | `resources/runtime/accounts.json` | 账号池状态 |
 | `resources/runtime/calibration.json` | 校准数据 |
 | `~/.dsh/settings.yaml` | `dsweb` provider 配置（手动删除） |
-| `~/.dsh/.credentials.yaml` | `MOCK_LLM_KEY`（手动删除） |
+| `~/.dsh/.credentials.yaml` | `DSWEB_GATEWAY_TOKEN`（手动删除） |
+## 9. 本地鉴权与隔离 live-smoke
+
+从本版本起，`/v1/*` 需要 bearer token。首次启动后，从 `DSWEB_STATE_DIR/gateway-token` 读取 token 内容，并将其配置为 DSH credential `DSWEB_GATEWAY_TOKEN`。默认 state 目录：macOS `~/Library/Application Support/dsh-web-adapter`，Linux `${XDG_STATE_HOME:-~/.local/state}/dsh-web-adapter`，Windows `%LOCALAPPDATA%/dsh-web-adapter`。不要提交、截图或在 URL 中传递该 token。
+
+控制台必须先从 `http://127.0.0.1:5688/` 同源打开；随后通过控制台中的 provider 登录操作完成网页登录。发布前运行 `npm run check && npm test && npm run pack:check`，再按 [`tests/live/README.md`](../tests/live/README.md) 在隔离 profile 中执行显式授权的三端 live-smoke。
