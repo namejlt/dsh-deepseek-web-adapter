@@ -3220,7 +3220,7 @@ async function streamAdapterAsk(params, adapter, profile) {
 function looksLikeToolCall(text, tools) {
   const t = String(text || '').slice(0, 2000);
   if (/tool_call|<tool_call>|<tool_calls>|<invoke\b/i.test(t)) return true;
-  if (/^[\s\S]{0,120}```(?:tool_call|json)?/i.test(t)) return true;
+  if (/^[\s\S]{0,120}```tool_call/i.test(t)) return true;
   if (/["'](?:name|tool|function)["']\s*:\s*["'][\w_]+["']/.test(t)) return true;
   if (/```\w*\s*[\w_]+\s*\(/.test(t)) return true;
   if (/(?:write_file|read_file|run_command|list_directory|pwsh|subagent|web_search)\b/.test(t)) return true;

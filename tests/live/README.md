@@ -21,4 +21,4 @@ node tests/live/run-live-smoke.js \
   --providers deepseek,chatgpt,qwen
 ```
 
-The runner reads the bearer token only from `<base>/gateway-token`, calls authenticated `/health`, `/v1/models`, `/login-status`, and one basic SSE completion for each selected provider. It writes a sanitized report under `output/live-smoke/`; that path is ignored by Git. The report contains hashes and protocol metadata, not credentials, profile paths, prompts, or response text.
+The runner reads the bearer token only from `<base>/gateway-token`, probes authenticated `/health` and `/v1/models`, verifies generic error contracts (`401 invalid_api_key`, `404 model_not_found`), and then runs a provider matrix: basic SSE text, non-stream JSON, one exact code-block response, and one thinking-or-mode-switch request when that model is advertised. It writes a sanitized report under `output/live-smoke/`; that path is ignored by Git. The report contains hashes and protocol metadata, not credentials, profile paths, prompts, or response text.
