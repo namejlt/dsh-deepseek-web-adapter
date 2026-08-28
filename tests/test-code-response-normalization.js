@@ -8,3 +8,8 @@ assert.strictEqual(normalizeCodeResponse('1LIVE_SMOKE_QWEN_CODE_OK'), 'LIVE_SMOK
 assert.strictEqual(normalizeCodeResponse('LIVE_SMOKE_CHATGPT_CODE_OK'), 'LIVE_SMOKE_CHATGPT_CODE_OK');
 
 console.log('PASS code-response normalization strips widget chrome and line numbers');
+assert.strictEqual(
+  normalizeCodeResponse('检索中...\n1LIVE_SMOKE_QWEN_CODE_OK\n1LIVE_SMOKE_QWEN_CODE_OK'),
+  'LIVE_SMOKE_QWEN_CODE_OK',
+);
+console.log('PASS normalization strips qwen search placeholder and duplicate marker chunks');

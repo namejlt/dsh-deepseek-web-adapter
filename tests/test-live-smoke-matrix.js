@@ -137,7 +137,8 @@ function makeServer(options = {}) {
       const exactMarker = /Reply with exactly this marker and no other text(?: after completing the thinking-or-mode-switch request)?:\s*([^\n]+)/.exec(prompt);
       if (exactMarker) content = exactMarker[1].trim();
       else {
-        const exactBlock = /must be exactly:\n([\s\S]+)$/.exec(prompt);
+        const exactBlock = /must be exactly:\n([\s\S]+)$/.exec(prompt)
+          || /请只输出下面这一个 Markdown 代码块，不要解释，不要添加任何前后文字：\n([\s\S]+)$/.exec(prompt);
         if (exactBlock) content = '\n' + exactBlock[1].trim() + '\n';
       }
       if (!content) content = 'UNMATCHED_PROMPT_' + payload.model;

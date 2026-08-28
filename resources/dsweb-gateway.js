@@ -436,6 +436,26 @@ function poolMarkOk(name) {
 }
 
 /** captcha / 登录失效标记。kind='captcha' → disabled（转人工）；'login' → needs_login。 */
+function poolMarkReady(name) {
+  const a = pool.accounts.get(name);
+  if (!a) return;
+  if (a.state === 'needs_login' || a.state === 'probing' || a.state === 'cooling') {
+    log('账号 ' + name + '（' + a.state + '）因已验证登录态恢复 → active');
+    a.state = 'active';
+    a.backoffCount = 0;
+    a.cooldownUntil = 0;
+    a.lastQuotaAt = 0;
+    poolSave();
+  }
+}
+
+function reconcileProviderReadyState(providerId, login) {
+  const snapshot = login && typeof login === 'object' ? login : {};
+  if (snapshot.needsLogin === false && snapshot.challenge !== true && snapshot.hasChatInput === true) {
+    poolMarkReady(providerAccountName(providerId || 'deepseek', 'default'));
+  }
+}
+
 function poolMarkDown(name, kind) {
   const a = pool.accounts.get(name);
   if (!a) return;
@@ -1788,6 +1808,7 @@ async function getLoginSnapshot(providerId, passive) {
   try {
     const insp = await rpc('inspect', { providerId: id, profile: providerProfile(id), headless: state.headless, passive: !!passive }, 8000);
     st = publicLoginSnapshot((insp && insp.login) || { needsLogin: true });
+    reconcileProviderReadyState(id, st);
   } catch (e) { /* driver not ready */ }
   return st;
 }

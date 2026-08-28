@@ -175,6 +175,18 @@ function driverRecords() {
     assert(accountsAfterQwenLogin.accounts.some((account) => account.name === 'qwen-default' && account.providerId === 'qwen'), 'Qwen login must persist a provider-scoped account record');
     assert(accountsAfterQwenLogin.accounts.some((account) => account.name === 'default' && account.providerId === 'deepseek'), 'Qwen login must not replace the legacy DeepSeek default account');
     assert.strictEqual((await request(port, 'GET', '/login-status?provider=chatgpt')).status, 200);
+
+    const disableQwen = await request(port, 'POST', '/accounts/disable', { provider: 'qwen', name: 'default' });
+    assert.strictEqual(disableQwen.status, 200, disableQwen.text);
+    const enableQwen = await request(port, 'POST', '/accounts/enable', { provider: 'qwen', name: 'default' });
+    assert.strictEqual(enableQwen.status, 200, enableQwen.text);
+    const beforeHeal = JSON.parse((await request(port, 'GET', '/accounts')).text);
+    assert(beforeHeal.accounts.some((account) => account.name === 'qwen-default' && account.state === 'needs_login'), 'enabling must place qwen-default into needs_login first');
+    const healedLogin = await request(port, 'GET', '/login-status?provider=qwen');
+    assert.strictEqual(healedLogin.status, 200, healedLogin.text);
+    const afterHeal = JSON.parse((await request(port, 'GET', '/accounts')).text);
+    assert(afterHeal.accounts.some((account) => account.name === 'qwen-default' && account.state === 'active'), 'ready login-status must auto-heal qwen-default back to active');
+
     assert.strictEqual((await request(port, 'GET', '/login?provider=missing')).status, 400);
 
     console.log('PASS gateway provider routing, identities, and login provider selection');

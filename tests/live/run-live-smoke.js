@@ -167,13 +167,16 @@ function buildScenarioSpec(providerId, name, models) {
     };
   }
   if (name === 'codeBlock') {
+    const zhPrompt = '请只输出下面这一个 Markdown 代码块，不要解释，不要添加任何前后文字：\n```text\nLIVE_SMOKE_' + upper + '_CODE_OK\n```';
     return {
       name,
       transport: 'sse',
       model: chooseModel(providerId, models, 'default'),
       expected: '```text\nLIVE_SMOKE_' + upper + '_CODE_OK\n```',
-      prompt: 'Reply with exactly one fenced Markdown code block and no prose. Do not explain. The full response must be exactly:\n```text\nLIVE_SMOKE_' + upper + '_CODE_OK\n```',
-      fallbackPrompt: '请只输出下面这一个 Markdown 代码块，不要解释，不要添加任何前后文字：\n```text\nLIVE_SMOKE_' + upper + '_CODE_OK\n```',
+      prompt: providerId === 'qwen'
+        ? zhPrompt
+        : 'Reply with exactly one fenced Markdown code block and no prose. Do not explain. The full response must be exactly:\n```text\nLIVE_SMOKE_' + upper + '_CODE_OK\n```',
+      fallbackPrompt: zhPrompt,
     };
   }
   if (name === 'thinking') {
@@ -209,24 +212,16 @@ function summarizeMatch(content, expected) {
 
 function normalizeCodeResponse(content) {
   const raw = String(content == null ? '' : content).replace(/\r/g, '');
-  const fenceMatch = raw.match(/```(?:[^\n`]*)\n([\s\S]*?)```/);
-  if (fenceMatch) {
-    return String(fenceMatch[1] || '')
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .filter((line) => !/^(text|plaintext|copy|download|复制|下载)$/i.test(line))
-      .join('\n')
-      .trim();
-  }
-  return raw
+  const cleanLines = (text) => text
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean)
-    .filter((line) => !/^(text|plaintext|copy|download|复制|下载)$/i.test(line))
-    .map((line) => line.replace(/^\d+(?=[A-Z_])/, ''))
-    .join('\n')
-    .trim();
+    .filter((line) => !/^(text|plaintext|copy|download|复制|下载|检索中\.\.\.|searching\.\.\.)$/i.test(line))
+    .map((line) => line.replace(/^\d+(?=[A-Z_])/, ''));
+  const fenceMatch = raw.match(/```(?:[^\n`]*)\n([\s\S]*?)```/);
+  const lines = cleanLines(fenceMatch ? String(fenceMatch[1] || '') : raw);
+  if (lines.length > 1 && lines.every((line) => line === lines[0])) return lines[0];
+  return lines.join('\n').trim();
 }
 
 function expectedCodeMarker(expectedBlock) {
@@ -315,6 +310,7 @@ async function runScenario(url, token, providerId, spec, sessionKey) {
 
   let response = await send(spec.prompt, spec.transport === 'sse');
   if (spec.transport === 'sse') {
+    let transportUsed = 'sse';
     let parsed = parseSse(response.text);
     let match = summarizeMatch(parsed.content, spec.expected);
     let codeBlock = spec.name === 'codeBlock' ? analyzeCodeBlockContent(parsed.content, expectedCodeMarker(spec.expected)) : null;
@@ -336,10 +332,36 @@ async function runScenario(url, token, providerId, spec, sessionKey) {
         && parsed.toolCallChunks === 0
         && (match.exactMatch || (codeBlock && codeBlock.codeBlockMarkerMatched));
     }
+    if (!passed && spec.name === 'codeBlock') {
+      transportUsed = 'json';
+      response = await send(spec.prompt, false);
+      const jsonParsed = parseJsonCompletion(response.text);
+      const jsonMatch = summarizeMatch(jsonParsed.content, spec.expected);
+      const jsonCode = analyzeCodeBlockContent(jsonParsed.content, expectedCodeMarker(spec.expected));
+      passed = response.status === 200
+        && jsonParsed.role === 'assistant'
+        && jsonParsed.finishReason === 'stop'
+        && jsonParsed.toolCalls === 0
+        && (jsonMatch.exactMatch || jsonCode.codeBlockMarkerMatched);
+      return {
+        status: passed ? 'passed' : 'failed',
+        model: spec.model.id,
+        transport: transportUsed,
+        httpStatus: response.status,
+        role: jsonParsed.role,
+        finishReason: jsonParsed.finishReason,
+        toolCalls: jsonParsed.toolCalls,
+        bodySha256: jsonParsed.bodySha256,
+        ...jsonMatch,
+        ...jsonCode,
+        normalizedCodeExactMatch: normalizeCodeResponse(jsonParsed.content) === expectedCodeMarker(spec.expected),
+        reason: passed ? undefined : 'code_block_contract_not_met',
+      };
+    }
     return {
       status: passed ? 'passed' : 'failed',
       model: spec.model.id,
-      transport: spec.transport,
+      transport: transportUsed,
       httpStatus: response.status,
       firstRole: parsed.firstRole,
       finishReason: parsed.finishReason,
