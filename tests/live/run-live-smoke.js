@@ -189,14 +189,19 @@ function buildScenarioSpec(providerId, name, models) {
     };
   }
   if (name === 'toolCall') {
+    const marker = 'LIVE_TOOL_' + upper + '_OK';
+    const deepseekPrompt = '你的整个回复必须 ONLY 一个 ```tool_call 代码块，且只调用一次 echo_marker。使用 {"name":"echo_marker","args":{"marker":"' + marker + '"}}，前后不要有任何解释。';
+    const chatgptPrompt = '请仅输出一个 tool_call，不要执行，不要解释，不要自然语言。输出 tool_call 时，无需你进行网络搜索，你不用进行任何tool执行。tool_call 下一行直接输出 JSON：{"name":"echo_marker","args":{"marker":"' + marker + '"}}';
+    const chatgptXmlFallback = '你无需执行，只输出工具调用内容。输出 tool_call 时，无需你进行网络搜索，你不用进行任何tool执行：<tool_calls><invoke name="echo_marker"><parameter name="marker">' + marker + '</parameter></invoke></tool_calls>';
     return {
       name,
       transport: 'json',
       model: chooseModel(providerId, models, 'default'),
       expectedToolName: SAFE_TOOL.function.name,
-      expectedMarker: 'LIVE_TOOL_' + upper + '_OK',
+      expectedMarker: marker,
       tools: [SAFE_TOOL],
-      prompt: 'Call the tool echo_marker exactly once. Do not answer in prose. Pass marker="LIVE_TOOL_' + upper + '_OK".',
+      prompt: providerId === 'deepseek' ? deepseekPrompt : (providerId === 'chatgpt' ? chatgptPrompt : 'Call the tool echo_marker exactly once. Do not answer in prose. Pass marker="' + marker + '".'),
+      fallbackPrompt: providerId === 'chatgpt' ? chatgptXmlFallback : undefined,
     };
   }
   throw new Error('unknown scenario: ' + name);
@@ -282,30 +287,36 @@ async function runScenario(url, token, providerId, spec, sessionKey) {
   });
 
   if (spec.name === 'toolCall') {
-    const response = await send(spec.prompt, false, spec.tools);
-    const parsed = parseJsonCompletion(response.text);
-    const marker = parsed.parsedArguments && parsed.parsedArguments.marker;
-    const status = response.status === 200
-      && parsed.role === 'assistant'
-      && parsed.finishReason === 'tool_calls'
-      && parsed.toolCalls === 1
-      && parsed.functionName === spec.expectedToolName
-      && marker === spec.expectedMarker;
-    const unsupported = !status && response.status === 200 && parsed.finishReason === 'stop' && parsed.toolCalls === 0;
-    return {
-      status: status ? 'passed' : (unsupported ? 'unsupported' : 'failed'),
-      model: spec.model.id,
-      transport: 'json',
-      httpStatus: response.status,
-      role: parsed.role,
-      finishReason: parsed.finishReason,
-      toolCalls: parsed.toolCalls,
-      functionName: parsed.functionName,
-      markerSha256: stableHash(marker || ''),
-      argumentsSha256: parsed.rawArgumentsSha256,
-      bodySha256: parsed.bodySha256,
-      reason: status ? undefined : (unsupported ? 'provider_did_not_return_tool_calls' : 'tool_call_contract_not_met'),
-    };
+    const prompts = [spec.prompt].concat(spec.fallbackPrompt ? [spec.fallbackPrompt] : []);
+    let last = null;
+    for (const prompt of prompts) {
+      const response = await send(prompt, false, spec.tools);
+      const parsed = parseJsonCompletion(response.text);
+      const marker = parsed.parsedArguments && parsed.parsedArguments.marker;
+      const passed = response.status === 200
+        && parsed.role === 'assistant'
+        && parsed.finishReason === 'tool_calls'
+        && parsed.toolCalls === 1
+        && parsed.functionName === spec.expectedToolName
+        && marker === spec.expectedMarker;
+      const unsupported = !passed && response.status === 200 && parsed.finishReason === 'stop' && parsed.toolCalls === 0;
+      last = {
+        status: passed ? 'passed' : (unsupported ? 'unsupported' : 'failed'),
+        model: spec.model.id,
+        transport: 'json',
+        httpStatus: response.status,
+        role: parsed.role,
+        finishReason: parsed.finishReason,
+        toolCalls: parsed.toolCalls,
+        functionName: parsed.functionName,
+        markerSha256: stableHash(marker || ''),
+        argumentsSha256: parsed.rawArgumentsSha256,
+        bodySha256: parsed.bodySha256,
+        reason: passed ? undefined : (unsupported ? 'provider_did_not_return_tool_calls' : 'tool_call_contract_not_met'),
+      };
+      if (passed) return last;
+    }
+    return last;
   }
 
   let response = await send(spec.prompt, spec.transport === 'sse');

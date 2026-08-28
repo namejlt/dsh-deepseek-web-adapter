@@ -48,5 +48,25 @@ assert.strictEqual(qwenParsed.length, 1, 'Qwen explicit tool block must parse on
 assert.strictEqual(qwenParsed[0].name, 'echo_marker');
 assert.deepStrictEqual(JSON.parse(qwenParsed[0].arguments), { marker: 'LIVE_TOOL_QWEN_OK' });
 assert.match(driverSource, /const adapterToolCalls = parseToolCalls\(lastText, params && params\.tools/);
-
 console.log('PASS adapter finalization parses strict Qwen tool-call blocks');
+
+const deepseekUiWrapped = 'tool_call\n\n复制\n\n下载\n\n```\n{\n  "name": "echo_marker",\n  "args": {\n    "marker": "LIVE_TOOL_DEEPSEEK_OK"\n  }\n}\n```';
+const deepseekParsed = parseToolCalls(deepseekUiWrapped, echoTools, { protocol: 'strict' });
+assert.strictEqual(deepseekParsed.length, 1, 'DeepSeek UI-wrapped tool_call block must parse in strict mode');
+assert.strictEqual(deepseekParsed[0].name, 'echo_marker');
+assert.deepStrictEqual(JSON.parse(deepseekParsed[0].arguments), { marker: 'LIVE_TOOL_DEEPSEEK_OK' });
+console.log('PASS strict parser tolerates DeepSeek UI-wrapped tool_call blocks');
+
+const chatgptXmlInvoke = '<tool_calls><invoke name="echo_marker"><parameter name="marker">LIVE_TOOL_CHATGPT_OK</parameter></invoke></tool_calls>';
+const chatgptParsed = parseToolCalls(chatgptXmlInvoke, echoTools, { protocol: 'strict' });
+assert.strictEqual(chatgptParsed.length, 1, 'strict mode must accept explicit tool_calls invoke XML');
+assert.strictEqual(chatgptParsed[0].name, 'echo_marker');
+assert.deepStrictEqual(JSON.parse(chatgptParsed[0].arguments), { marker: 'LIVE_TOOL_CHATGPT_OK' });
+console.log('PASS strict parser accepts explicit tool_calls invoke XML');
+
+const chatgptBareToolCall = 'tool_call\n{"name":"echo_marker","args":{"marker":"LIVE_TOOL_CHATGPT_BLOCK"}}';
+const chatgptBareParsed = parseToolCalls(chatgptBareToolCall, echoTools, { protocol: 'strict' });
+assert.strictEqual(chatgptBareParsed.length, 1, 'strict mode must accept bare tool_call + JSON output');
+assert.strictEqual(chatgptBareParsed[0].name, 'echo_marker');
+assert.deepStrictEqual(JSON.parse(chatgptBareParsed[0].arguments), { marker: 'LIVE_TOOL_CHATGPT_BLOCK' });
+console.log('PASS strict parser accepts bare tool_call plus JSON');

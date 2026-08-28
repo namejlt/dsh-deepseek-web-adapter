@@ -2922,9 +2922,12 @@ function parseToolCalls(text, tools, options) {
   };
   function parseFromText(sourceText) {
     const patterns = strictProtocol ? [
-      /* Strict mode accepts only the explicit formats injected into the web prompt. */
+      /* Strict mode accepts explicit wrappers; DeepSeek may prepend UI chrome
+       * like 复制/下载 before a plain fenced JSON block. */
       { re: /```tool_call\s*\n([\s\S]*?)```/gi, g: 1 },
       { re: /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi, g: 1 },
+      { re: /^tool_call\s*\n+\s*(\{[\s\S]*\})$/i, g: 1 },
+      { re: /^tool_call\b[\s\S]*?```(?:json)?\s*\n([\s\S]*?)```/i, g: 1 },
     ] : [
       { re: /tool_call\s*\n?\s*(\{[\s\S]*\})/gi, g: 1 },
       /* 显式带 tool_call 标注的代码块优先于普通 json/裸代码块：
@@ -2949,6 +2952,12 @@ function parseToolCalls(text, tools, options) {
             if (!Array.isArray(j) && pushCall(j)) break outer;
           }
         } catch (e) { /* keep scanning */ }
+      }
+    }
+    if (!calls.length) {
+      const xmlCalls = recoverInvokeXmlCalls(sourceText);
+      for (const candidate of xmlCalls) {
+        if (pushCall(candidate)) break;
       }
     }
     if (strictProtocol) return;
