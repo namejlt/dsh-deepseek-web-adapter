@@ -65,16 +65,16 @@ check('preserves all eight DeepSeek models with provider ownership', () => {
     providerId: 'deepseek', name: 'DeepSeek 深度思考+搜索（网页版）', mode: 'quick', deepThink: true, search: true,
   });
   assert.deepStrictEqual(MODELS['deepseek-expert'], {
-    providerId: 'deepseek', name: 'DeepSeek 专家（网页版）', mode: 'expert', deepThink: false, search: false,
+    providerId: 'deepseek', name: 'DeepSeek 专家（深度思考，网页版）', mode: 'quick', deepThink: true, search: false,
   });
   assert.deepStrictEqual(MODELS['deepseek-expert-reasoner'], {
-    providerId: 'deepseek', name: 'DeepSeek 专家+深度思考（网页版）', mode: 'expert', deepThink: true, search: false,
+    providerId: 'deepseek', name: 'DeepSeek 专家+深度思考（网页版）', mode: 'quick', deepThink: true, search: false,
   });
   assert.deepStrictEqual(MODELS['deepseek-vision'], {
-    providerId: 'deepseek', name: 'DeepSeek 识图（网页版）', mode: 'vision', deepThink: false, search: false,
+    providerId: 'deepseek', name: 'DeepSeek 识图（网页版）', mode: 'quick', deepThink: false, search: false,
   });
   assert.deepStrictEqual(MODELS['deepseek-vision-reasoner'], {
-    providerId: 'deepseek', name: 'DeepSeek 识图+深度思考（网页版）', mode: 'vision', deepThink: true, search: false,
+    providerId: 'deepseek', name: 'DeepSeek 识图+深度思考（网页版）', mode: 'quick', deepThink: true, search: false,
   });
 });
 

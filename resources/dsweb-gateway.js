@@ -5,7 +5,7 @@
  *
  * API:
  *   POST /v1/chat/completions    OpenAI 兼容（流式 SSE，支持 tool_calls）
- *   GET  /v1/models              模型列表（chat/reasoner/search/think-search/expert/expert-reasoner/vision/vision-reasoner）
+ *   GET  /v1/models              模型列表（单一 deepseek-chat；深度思考/智能搜索由请求体 deepThink/search 字段控制）
  *   GET  /login                  有头登录（自动检测完成）
  *   GET  /login-status           登录状态
  *   POST /calibrate/record       开始校准（有头窗口 + 录制点击）
@@ -88,26 +88,14 @@ const ASK_WAIT_TIMEOUT_MS = 20 * 60 * 1000;
  * 120s 足以让前方请求释放槽位；若仍拿不到说明确有积压，明确告知优于静默卡死。 */
 const SEM_WAIT_TIMEOUT_MS = 120 * 1000;
 
-/* 模型映射（2026-08 页面重构：三模式入口 + pill 开关组合）：
- *   模式入口三选一（applyConfig 幂等切换）：
- *     quick  快速模式（V3）—— 可选 pill：深度思考、智能搜索（可同开）
- *     expert 专家模式（R1 推理模型，原生输出 thinking）—— 可选 pill：深度思考
- *     vision 识图模式 —— 可选 pill：深度思考
- *   说明（三模式均可选深度思考，与 chat.deepseek.com 当前页面一致）：
- *     - 深度思考 = 开启对应模式的"深度思考"pill：quick 下为 V3 增强 CoT；
- *       expert/vision 下为在 R1 推理模型上开启深度思考。applyConfig 对三模式
- *       均会尝试点击该 pill（pill 不存在时静默跳过，不告警）。
- *     - 智能搜索 pill 仅 quick 入口提供；expert/vision 页面无此开关。
- *   组合即模型（8 种，与官方 API 命名对齐）：
- *     deepseek-chat             快速 V3（无附加开关，默认）
- *     deepseek-reasoner        快速 V3 + 深度思考（quick 的 深度思考 pill，V3 增强 CoT）
- *     deepseek-search           快速 V3 + 智能搜索
- *     deepseek-think-search     快速 V3 + 深度思考 + 智能搜索（仅 quick 有搜索 pill）
- *     deepseek-expert          专家模式（R1，原生思考输出）
- *     deepseek-expert-reasoner 专家模式 + 深度思考（R1 上开启深度思考 pill）
- *     deepseek-vision           识图（纯识图，不带思考）
- *     deepseek-vision-reasoner  识图 + 深度思考（识图模式下开启深度思考 pill）
- * driver 侧 applyConfig 幂等切换模式入口与 pill（先读状态不一致才点击）。 */
+/* 模型映射（DeepSeek 网页版改版：移除"快速/专家/识图"模型选择入口，统一为单一
+ * 对话模型 + 输入框下方两个 pill 开关）：
+ *   页面已无模式入口，所有 DeepSeek 模型都落到同一基础模型；差异仅在两个 pill：
+ *     - 深度思考：开/关（pill 开关；请求体 deepThink 字段控制，默认关）
+ *     - 智能搜索：开/关（pill 开关；请求体 search 字段控制，默认关）
+ *   网页版不再有独立模型选择入口，仅暴露单一基础模型 deepseek-chat；
+ *   旧模型 ID（reasoner / search / expert / vision 等）仍被回退解析到本模型，向后兼容。
+ * driver 侧 applyConfig 仅幂等切换两个 pill（先读状态不一致才点击），不再点击任何模式入口。 */
 /* Public models are defined once in provider-registry.js. */
 
 /** Resolve an OpenAI model id to immutable provider-aware registry metadata. */
@@ -1389,7 +1377,11 @@ async function handleChatCompletion(req, res, payload, resolvedModel) {
       /* 模式联动：driver 每次请求幂等应用 pill 开关（2026-08 页面重构后
        * 无模型选择器）。calibKey=model 保留为 pill 未找到时的校准回放 fallback。 */
       const { streamId } = await rpc('streamAsk', {
-        question: q, providerId: cfg.providerId, model: cfg, mode: cfg.mode, deepThink: cfg.deepThink, search: cfg.search === true,
+        /* 单一 DeepSeek 模型：默认关闭深度思考/智能搜索；若请求体携带可选字段则覆盖，
+         * 从而仍可在不拆分子模型的前提下触发对应 pill。 */
+        question: q, providerId: cfg.providerId, model: cfg, mode: cfg.mode,
+        deepThink: payload.deepThink != null ? !!payload.deepThink : cfg.deepThink,
+        search: payload.search != null ? !!payload.search : (cfg.search === true),
         headless: state.headless, tools: activeTools, toolProtocol,
         /* 会话亲和：driver 侧把 pageKey 固定映射到同一浏览器 tab */
         pageKey: session.pageKey,

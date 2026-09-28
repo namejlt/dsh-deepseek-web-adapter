@@ -1081,46 +1081,28 @@ async function setPill(pageId, labels, want, name) {
   }
 }
 
-/** 应用模型配置到页面（2026-08 页面重构后：三模式入口 + pill 开关组合）。
- * 模式入口三选一（幂等 setMode：读激活态，不一致才点击）：
- *   quick  快速模式 —— 可选 pill：深度思考、智能搜索（可同开）
- *   expert 专家模式 —— 可选 pill：深度思考
- *   vision 识图模式 —— 可选 pill：深度思考
- * 顺序：模式入口 → 深度思考 pill（三模式通用）→ 智能搜索 pill（仅 quick 模式有）。
- * 全程幂等（setPill 先读状态不一致才点击），并回填校准回退 fallback。
+/** 应用模型配置到页面（DeepSeek 网页版改版：移除"快速/专家/识图"模型选择入口，
+ * 统一为单一对话模型 + 输入框下方两个 pill 开关：深度思考 / 智能搜索）。
+ * 因此不再有模式入口可点击——直接幂等切换两个 pill 即可：
+ *   - 深度思考 pill（统一模型通用，可选开/关）
+ *   - 智能搜索 pill（改版后对全部模型开放，可选开/关）
+ * mode 参数保留仅为向后兼容既有模型配置（如 deepseek-expert / deepseek-vision），
+ * 本函数不再据此点击任何模式入口。全程幂等（setPill 先读状态不一致才点击）。
  * @param {string} pageId 页面 ID
- * @param {object} opts { mode: 'quick'|'expert'|'vision', deepThink, search }
+ * @param {object} opts { mode, deepThink, search }
  * @returns {Promise<{toggles: string[], warnings: string[]}>} 应用报告 */
 async function applyConfig(pageId, opts) {
   const report = { toggles: [], warnings: [] };
   try {
-    /* 1) 模式入口（三选一，幂等：已激活则不点击）。
-     * quick 入口找不到时静默——页面默认即快速模式（无显式入口）；
-     * expert/vision 找不到才告警（显式切换失败）。 */
-    const modeLabels = {
-      quick: ['快速', '快速模式', 'Quick', '闪电', '闪电模式', 'Instant'],
-      expert: ['专家', '专家模式', 'Expert', '钻石', '钻石模式', 'Pro'],
-      vision: ['识图', '视图', '识图模式', '图片理解', 'Vision', '眼睛'],
-    };
-    const wantMode = modeLabels[opts.mode] ? opts.mode : 'quick';
-    const m = await setPill(pageId, modeLabels[wantMode], true, 'mode');
-    if (m.ok && m.action === 'clicked') {
-      report.toggles.push('mode:' + wantMode + '(' + m.action + ')');
-      await sleep(600); /* 模式切换后 UI 需要时间挂载对应 pill */
-    } else if (!m.ok && wantMode !== 'quick') {
-      /* 降级：setPill 状态读不到时退回盲点击（expert/vision 入口降级盲点击路径） */
-      const v = await evalJs(pageId, EXPR.clickText(modeLabels[wantMode]));
-      if (v.clicked) { report.toggles.push('mode:' + wantMode + '(clickText:' + v.matched + ')'); await sleep(600); }
-      else report.warnings.push(wantMode + ' mode entry not found');
-    }
-    /* 2) 深度思考 pill（快速/专家/识图模式均可选） */
+    /* 1) 深度思考 pill（统一模型通用开关，可选开/关）。
+     * 改版后"专家(R1)/识图"均并入该开关或模型原生能力，不再有独立模式入口。 */
     const wantThink = opts.deepThink === true;
     const t = await setPill(pageId, ['深度思考', 'DeepThink', 'Deep Think', '深度推理'], wantThink, 'think');
     if (t.ok) report.toggles.push('think:' + (wantThink ? 'on' : 'off') + '(' + t.action + (t.state !== null && t.state !== undefined ? ',state=' + t.state : '') + ')');
     else if (wantThink) report.warnings.push('deep-think pill not found');
     await sleep(300);
-    /* 3) 智能搜索 pill（仅 quick 模式提供；expert/vision 页面无此开关，跳过防误告警） */
-    const wantSearch = opts.search === true && wantMode === 'quick';
+    /* 2) 智能搜索 pill（改版后对全部模型开放，不再限定 quick 入口） */
+    const wantSearch = opts.search === true;
     const s = await setPill(pageId, ['智能搜索', '联网搜索', '联网', 'Search'], wantSearch, 'search');
     if (s.ok) report.toggles.push('search:' + (wantSearch ? 'on' : 'off') + '(' + s.action + ')');
     else if (wantSearch) report.warnings.push('search pill not found');
@@ -3307,8 +3289,8 @@ handlers.streamAsk = async (params) => {
         emitEvent('stream-end', { streamId, ok: false, errorKind: 'login', error: 'login required: 页面已关闭或未登录。请从本地 Provider Console 重新登录（建议勾选保持登录）。' });
         return;
       }
-      /* 模型切换由校准回放（applyCalibration）负责——不调用 applyConfig
-       * （它会对 expert 模式点击两次"深度思考"，与校准冲突产生多余操作） */
+      /* 模型/开关切换由下方 applyConfig（幂等 pill 切换）负责；pill 未找到时
+       * 才回放校准（applyCalibration）兜底（见后文 needFallback 分支）。 */
       /* 问题组装由网关完成（buildContext 已内嵌工具协议块到 [用户] 之前，
        * 位置最优；限长在网关 buildToolsText 智能压缩，不再 driver 端截断） */
       let payload = String(question);
@@ -3335,9 +3317,9 @@ handlers.streamAsk = async (params) => {
           if (digest) payload = '【之前的对话摘要，请基于此继续】\n' + digest + '\n\n' + payload;
         }
       }
-      /* 模式应用（2026-08 页面重构）：旧"专家模式"选择器已下线，改为输入框下方
-       * pill 开关（深度思考/智能搜索）。每次请求都幂等应用——连续对话中上一请求
-       * 可能改变了开关状态（reasoner→chat 需关思考，反向需开）。
+      /* 模式应用（DeepSeek 网页版改版）：模型选择入口已下线，页面统一为单一对话模型 +
+       * 输入框下方两个 pill 开关（深度思考/智能搜索）。每次请求都幂等应用两个 pill——
+       * 连续对话中上一请求可能改变了开关状态（reasoner→chat 需关思考，反向需开）。
        * 校准回放降级为 fallback：pill 未找到时若存在该模型的录制则回放
        * （应对区域差异化改版）。迁移（新会话）后需等待页面就绪。 */
       if (migrated) {

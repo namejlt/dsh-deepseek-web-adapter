@@ -6,7 +6,7 @@
 > 多站点路由、provider 隔离与离线测试已经实现；**尚未完成真实已登录账号的手工验收，不宣称已完成在线/真实环境验证**。
 > 请仅使用你有权使用的账号，并在发布前完成下方的手工登录 smoke test。
 
-网关仍由 DSH 插件自动拉起，提供 `/v1/models` 与 `/v1/chat/completions`（SSE）接口。DeepSeek 保持既有模型；Beta 新增 ChatGPT 与 Qwen provider：
+网关仍由 DSH 插件自动拉起，提供 `/v1/models` 与 `/v1/chat/completions`（SSE）接口。DeepSeek 已收敛为**单一模型** `deepseek-chat`（深度思考/智能搜索改由请求字段控制）；Beta 新增 ChatGPT 与 Qwen provider：
 
 - ChatGPT：`chatgpt-auto`、`chatgpt-thinking`
 - Qwen（`https://www.qianwen.com/`）：`qwen-auto`、`qwen-thinking`、`qwen-fast`（默认 Qwen3.7-千问），另有 `*-max`（Qwen3.8-Max）、`*-max-37`（Qwen3.7-Max）、`*-flash`（Qwen3.6-Flash）共 12 个模型
@@ -24,7 +24,7 @@
 | 多账号并发退化为串行（P0） | 多账号时并发降为 1（切账号需重启单一浏览器）；单账号保持会话亲和并发 |
 | 动态风控不可预知 | 公平使用无公开数值/解冻时间——网关只信页面信号，指数退避+到期探测，**不承诺解冻时刻** |
 | 插件管理前端为内置 HTML 卡片页 | 本包现在自带插件管理前端：打开 `http://127.0.0.1:5688/` 即可看到安装引导、快速登录、状态检查、账户检查、配置管理与诊断卡片。未来如需接入 DSH 原生设置卡片，可直接复用同一组 JSON 接口（`/setup`、`/health`、`/accounts`、`/config`） |
-| 依赖真实浏览器 | 需要本机安装 Chrome；登录态保存在 `runtime/profiles/` 浏览器配置目录，勾选"保持登录"后跨重启有效，DeepSeek 令牌过期后需重新登录 |
+| 依赖真实浏览器 | 需要本机安装 Chrome；登录态保存在状态目录（`%LOCALAPPDATA%/dsh-web-adapter` 等，见「本地鉴权、状态目录」）下的浏览器 profile 中，勾选"保持登录"后跨重启有效，DeepSeek 令牌过期后需重新登录 |
 | Provider profile 隔离 | DeepSeek、ChatGPT、Qwen 具有独立 profile；请使用 `/login?provider=...` 分别登录 |
 | 保守协议边界 | 仅文本、代码块、基础 SSE；无附件/多模态、挑战求解、网页原生 artifact/iframe 语义 |
 | ChatGPT challenge | 返回需手工操作的 provider challenge 错误，不与 DOM 选择器错误混同 |
@@ -62,14 +62,7 @@ dsweb:
     baseURL: http://127.0.0.1:5688/v1/,
     models:
       [
-        { id: deepseek-chat, name: DeepSeek 快速 },
-        { id: deepseek-reasoner, name: DeepSeek 深度思考 },
-        { id: deepseek-search, name: DeepSeek 智能搜索 },
-        { id: deepseek-think-search, name: DeepSeek 深度思考+搜索 },
-        { id: deepseek-expert, name: DeepSeek 专家 },
-        { id: deepseek-expert-reasoner, name: DeepSeek 专家+深度思考 },
-        { id: deepseek-vision, name: DeepSeek 识图 },
-        { id: deepseek-vision-reasoner, name: DeepSeek 识图+深度思考 },
+        { id: deepseek-chat, name: DeepSeek 对话（网页版） },
         { id: chatgpt-auto, name: ChatGPT 自动（Beta） },
         { id: chatgpt-thinking, name: ChatGPT 思考（Beta） },
         { id: qwen-auto, name: Qwen 自动（Beta） },
@@ -88,8 +81,33 @@ dsweb:
   }
 ```
 
-并在 `~/.dsh/.credentials.yaml` 加：`DSWEB_GATEWAY_TOKEN: <copy the contents of gateway-token in DSWEB_STATE_DIR>`（任意值，网关不校验）。
+并在 `~/.dsh/.credentials.yaml` 加：`DSWEB_GATEWAY_TOKEN: <复制 DSWEB_STATE_DIR 下 gateway-token 文件的完整内容>`。
+
+> **网关会严格校验该 token**（常量时间比较），必须与该文件内容逐字符一致，**不能用任意值**。token 文件位置：
+> - Windows：`%LOCALAPPDATA%\dsh-web-adapter\gateway-token`
+> - macOS：`~/Library/Application Support/dsh-web-adapter/gateway-token`
+> - Linux：`${XDG_STATE_HOME:-~/.local/state}/dsh-web-adapter/gateway-token`
+> （可用 `DSWEB_STATE_DIR` 覆盖；也可用环境变量 `DSWEB_TOKEN` 直接指定。文件不存在时网关首次启动会自动创建。）
+
 DSH 配置热加载——模型选择器立即出现 DeepSeek 网页版。
+
+### 桌面端（图形界面）配置「自定义模型 API」
+
+若使用 DSH 桌面端而非手动编辑 settings.yaml，可在「设置 → 自定义模型 API」中新建一个 provider，字段如下：
+
+| 字段 | 填写内容 |
+|---|---|
+| Provider ID | `dsweb` |
+| 显示名称 | `DeepSeek 网页版（免API）` |
+| API 地址 | `http://127.0.0.1:5688/v1` |
+| API 协议 | `OpenAI Chat Completions` |
+| API 密钥 | 上方 `gateway-token` 文件的**完整内容**（网关会校验，不能随意填） |
+
+模型目录：点「**获取可用模型**」（网关重启后只会拉回 `deepseek-chat` 一个），或手动「添加模型」填 `deepseek-chat`。最后「创建提供商」即可。
+
+> 注意：`http://127.0.0.1:5688/v1` 裸路径返回 `not found` 是正常现象（它不是有效端点）；桌面端会自动拼 `/v1/models` 与 `/v1/chat/completions`，无需手动访问它。验证接口可带 `Authorization: Bearer <token>` 访问 `http://127.0.0.1:5688/v1/models`。
+
+
 
 ## 登录
 
@@ -107,14 +125,17 @@ http://127.0.0.1:5688/login?provider=qwen
 
 ## 使用
 
-DSH 模型选择器选择 **Beta 多站点 Web-to-OpenAI**。DeepSeek 保持既有 8 个模型；ChatGPT/Qwen 仅承诺文本、代码块和基础 SSE 的 Beta 通道。
-模式映射对齐 2026-08 页面改版（三模式入口 + pill 开关，幂等切换）：
+DSH 模型选择器选择 **Beta 多站点 Web-to-OpenAI**。DeepSeek 现已收敛为**单一模型** `deepseek-chat`；ChatGPT/Qwen 仅承诺文本、代码块和基础 SSE 的 Beta 通道。
 
-| 模式入口 | 可选 pill | 对应模型 ID |
-|---|---|---|
-| 快速 | 深度思考、智能搜索（可同开） | `deepseek-chat` / `deepseek-reasoner` / `deepseek-search` / `deepseek-think-search` |
-| 专家 | 深度思考 | `deepseek-expert` / `deepseek-expert-reasoner` |
-| 识图（视图） | 深度思考 | `deepseek-vision` / `deepseek-vision-reasoner` |
+DeepSeek 网页版改版后已无独立模型选择入口，仅剩输入框下方的两个 pill 开关（深度思考 / 智能搜索）。因此所有 DeepSeek 流量都落到同一基础模型，区别仅由开关决定：
+
+- 默认（请求不携带附加字段）：纯对话，两 pill 均关；
+- 若请求体携带可选字段 `deepThink` / `search`（布尔），则覆盖默认，触发对应 pill；
+- 旧模型 ID（`deepseek-reasoner` / `deepseek-search` / `deepseek-expert` / `deepseek-vision` 等）仍被网关**回退解析**到 `deepseek-chat`，向后兼容，但不再出现在 `/v1/models` 列表中。
+
+| 模型 ID | 说明 |
+|---|---|
+| `deepseek-chat` | DeepSeek 对话（网页版）；深度思考/智能搜索由请求字段 `deepThink` / `search` 控制，默认均关 |
 
 | 能力 | 说明 |
 |---|---|
@@ -185,7 +206,9 @@ lib/index.js          # host：加载时自动拉起网关，卸载时回收
 resources/
   dsweb-gateway.js    # 核心网关（OpenAI API + 登录 + 校准 + 会话亲和并发 + 账号池 + 工具解析）
   driver.js           # 浏览器引擎（常驻 Chrome + 通道管理 + 限流检测）
-  runtime/            # 本地运行时数据（校准数据 + accounts.json + profiles/ 账号目录 + 日志）
+  # 本地运行时数据（校准数据 + accounts.json + 浏览器 profile + 日志）落在状态目录：
+  #   Windows %LOCALAPPDATA%/dsh-web-adapter · macOS ~/Library/Application Support/dsh-web-adapter
+  #   Linux ${XDG_STATE_HOME:-~/.local/state}/dsh-web-adapter（可用 DSWEB_STATE_DIR 覆盖）
 spec/
   SPEC.md             # v1 开发规格（现状）
   SPEC-v2.md          # v2 规格（多账号 / 自动登录 / 限流切换——核心已实现）

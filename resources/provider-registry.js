@@ -25,18 +25,16 @@ const PROVIDERS = Object.freeze({
 });
 
 /**
- * Public web model configurations. The DeepSeek entries mirror the existing
- * gateway map so introducing this registry does not change its behavior.
+ * Public web model configurations.
+ * DeepSeek 网页版已无独立模型选择入口（仅剩输入框下方的「深度思考 / 智能搜索」
+ * 两个 pill 开关），因此所有 DeepSeek 模型收敛为单一基础模型 `deepseek-chat`。
+ * 深度思考 / 智能搜索 不再由模型 ID 区分，而是：
+ *   - 默认（deepThink=false, search=false）：纯对话；
+ *   - 请求体可携带可选字段 deepThink / search 覆盖默认，从而仍触发对应 pill；
+ *   - 旧模型 ID（reasoner / search / expert / vision 等）仍被网关回退解析到本模型，向后兼容。
  */
 const MODELS = Object.freeze({
-  'deepseek-chat': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 快速（网页版）', mode: 'quick', deepThink: false, search: false }),
-  'deepseek-reasoner': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 深度思考（网页版）', mode: 'quick', deepThink: true, search: false }),
-  'deepseek-search': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 智能搜索（网页版）', mode: 'quick', deepThink: false, search: true }),
-  'deepseek-think-search': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 深度思考+搜索（网页版）', mode: 'quick', deepThink: true, search: true }),
-  'deepseek-expert': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 专家（网页版）', mode: 'expert', deepThink: false, search: false }),
-  'deepseek-expert-reasoner': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 专家+深度思考（网页版）', mode: 'expert', deepThink: true, search: false }),
-  'deepseek-vision': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 识图（网页版）', mode: 'vision', deepThink: false, search: false }),
-  'deepseek-vision-reasoner': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 识图+深度思考（网页版）', mode: 'vision', deepThink: true, search: false }),
+  'deepseek-chat': Object.freeze({ providerId: 'deepseek', name: 'DeepSeek 对话（网页版）', mode: 'quick', deepThink: false, search: false }),
   'chatgpt-auto': Object.freeze({ providerId: 'chatgpt', name: 'ChatGPT 自动（网页版）', mode: 'auto' }),
   'chatgpt-thinking': Object.freeze({ providerId: 'chatgpt', name: 'ChatGPT 思考（网页版）', mode: 'thinking' }),
   /* qianwen.com 模型选择器中可见的四个页面模型：

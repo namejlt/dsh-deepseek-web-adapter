@@ -6,7 +6,7 @@
 > Provider routing, isolated profiles, and offline coverage are implemented; **real logged-in manual acceptance is still pending. This project does not claim live verification.**
 > Use only accounts you are authorized to use and complete the authenticated smoke tests before release.
 
-The DSH plugin still starts one local gateway exposing `/v1/models` and `/v1/chat/completions` (SSE). Existing DeepSeek models remain available; the Beta adds:
+The DSH plugin still starts one local gateway exposing `/v1/models` and `/v1/chat/completions` (SSE). DeepSeek is now consolidated into a **single model** `deepseek-chat` (deep-think / smart-search are controlled via request fields); the Beta adds:
 
 - ChatGPT: `chatgpt-auto`, `chatgpt-thinking`
 - Qwen (`https://www.qianwen.com/`): `qwen-auto`, `qwen-thinking`, `qwen-fast` (default Qwen3.7-千问), plus `*-max` (Qwen3.8-Max), `*-max-37` (Qwen3.7-Max), and `*-flash` (Qwen3.6-Flash) — 12 models in total
@@ -24,7 +24,7 @@ The DSH plugin still starts one local gateway exposing `/v1/models` and `/v1/cha
 | Multi-account concurrency degrades to serial (P0) | With multiple accounts, concurrency drops to 1 (switching accounts restarts the single browser); single-account keeps full session-affinity concurrency |
 | Dynamic risk control is unpredictable | Fair-use limits have no published numbers or unfreeze times — the gateway only trusts on-page signals, backs off exponentially and probes recovery; it **cannot promise when an account unfreezes** |
 | Built-in plugin management UI | This package now ships its own management frontend at `http://127.0.0.1:5688/`: onboarding, quick login, status checks, account checks, config management, and diagnostics. A future native DSH settings card can reuse the same JSON interfaces (`/setup`, `/health`, `/accounts`, `/config`) |
-| Requires a real browser | Needs Chrome installed locally; login state is kept in the `runtime/profiles/` browser profile directory — persists across restarts when "Keep me signed in" is ticked; re-login needed after DeepSeek tokens expire |
+| Requires a real browser | Needs Chrome installed locally; login state is kept in the state directory (`%LOCALAPPDATA%/dsh-web-adapter`, etc. — see "Local authentication, state directory") browser profile — persists across restarts when "Keep me signed in" is ticked; re-login needed after DeepSeek tokens expire |
 | Provider profile isolation | DeepSeek, ChatGPT, and Qwen use separate profiles; sign in through `/login?provider=...` for each |
 | Conservative protocol boundary | Text, code blocks, and basic SSE only; no attachments/multimodal input, challenge solving, or native artifact/iframe semantics |
 | ChatGPT challenge | Returns a manual-action provider challenge error, distinct from a DOM selector error |
@@ -58,14 +58,7 @@ dsweb:
     baseURL: http://127.0.0.1:5688/v1/,
     models:
       [
-        { id: deepseek-chat, name: DeepSeek Quick },
-        { id: deepseek-reasoner, name: DeepSeek Deep Think },
-        { id: deepseek-search, name: DeepSeek Smart Search },
-        { id: deepseek-think-search, name: DeepSeek Deep Think + Search },
-        { id: deepseek-expert, name: DeepSeek Expert },
-        { id: deepseek-expert-reasoner, name: DeepSeek Expert + Deep Think },
-        { id: deepseek-vision, name: DeepSeek Vision },
-        { id: deepseek-vision-reasoner, name: DeepSeek Vision + Deep Think },
+        { id: deepseek-chat, name: DeepSeek Chat (Web) },
         { id: chatgpt-auto, name: ChatGPT Auto (Beta) },
         { id: chatgpt-thinking, name: ChatGPT Thinking (Beta) },
         { id: qwen-auto, name: Qwen Auto (Beta) },
@@ -84,8 +77,31 @@ dsweb:
   }
 ```
 
-Add `DSWEB_GATEWAY_TOKEN: <copy the contents of gateway-token in DSWEB_STATE_DIR>` to `~/.dsh/.credentials.yaml` (any value; the gateway does not check it).
+Add `DSWEB_GATEWAY_TOKEN: <copy the complete contents of the gateway-token file in DSWEB_STATE_DIR>` to `~/.dsh/.credentials.yaml`.
+
+> **The gateway strictly validates this token** (constant-time comparison); it must match the file content exactly — **you cannot use an arbitrary value**. Token file locations:
+> - Windows: `%LOCALAPPDATA%\dsh-web-adapter\gateway-token`
+> - macOS: `~/Library/Application Support/dsh-web-adapter/gateway-token`
+> - Linux: `${XDG_STATE_HOME:-~/.local/state}/dsh-web-adapter/gateway-token`
+> (Override with `DSWEB_STATE_DIR`, or set `DSWEB_TOKEN` directly. The file is auto-created on first gateway launch if missing.)
+
 DSH config hot-reloads — the DeepSeek Web models appear in the model picker immediately.
+
+### Configure via the desktop GUI ("Custom Model API")
+
+If you use the DSH desktop app instead of editing settings.yaml, create a provider under **Settings → Custom Model API** with these fields:
+
+| Field | Value |
+|---|---|
+| Provider ID | `dsweb` |
+| Display name | `DeepSeek Web (no API key)` |
+| API base URL | `http://127.0.0.1:5688/v1` |
+| API protocol | `OpenAI Chat Completions` |
+| API key | The **complete contents** of the `gateway-token` file above (the gateway validates it; do not use an arbitrary value) |
+
+Model catalog: click **Fetch available models** (after restarting the gateway, only `deepseek-chat` is returned), or manually **Add model** with id `deepseek-chat`. Then **Create provider**.
+
+> Note: `http://127.0.0.1:5688/v1` with nothing after it returns `not found` — that is expected (it is not a valid endpoint). The desktop app appends `/v1/models` and `/v1/chat/completions` automatically. To verify, request `http://127.0.0.1:5688/v1/models` with `Authorization: Bearer <token>`.
 
 ## Login
 
@@ -103,13 +119,17 @@ If ChatGPT exposes a Cloudflare, Turnstile, or other challenge, the gateway retu
 
 ## Usage
 
-Pick **Beta multisite Web-to-OpenAI** in the DSH model picker. DeepSeek keeps its eight existing models; ChatGPT and Qwen are Beta text/code/basic-SSE channels only.
+Pick **Beta multisite Web-to-OpenAI** in the DSH model picker. DeepSeek is now consolidated into a **single model** `deepseek-chat`; ChatGPT and Qwen are Beta text/code/basic-SSE channels only.
 
-| Page mode | Optional pills | Model IDs |
-|---|---|---|
-| Quick | Deep Think, Smart Search (can both be on) | `deepseek-chat` / `deepseek-reasoner` / `deepseek-search` / `deepseek-think-search` |
-| Expert | Deep Think | `deepseek-expert` / `deepseek-expert-reasoner` |
-| Vision | Deep Think | `deepseek-vision` / `deepseek-vision-reasoner` |
+The DeepSeek web app dropped its model selector after its redesign; only the two pill toggles (Deep Think / Smart Search) remain below the input box. All DeepSeek traffic therefore lands on one base model, distinguished only by the toggles:
+
+- Default (request carries no extra fields): plain chat, both pills off;
+- If the request body carries the optional boolean fields `deepThink` / `search`, they override the default and toggle the corresponding pill;
+- Old model IDs (`deepseek-reasoner` / `deepseek-search` / `deepseek-expert` / `deepseek-vision`, etc.) are still **fallback-resolved** to `deepseek-chat` for backward compatibility, but no longer appear in the `/v1/models` list.
+
+| Model ID | Notes |
+|---|---|
+| `deepseek-chat` | DeepSeek Chat (Web); deep-think / smart-search controlled by request fields `deepThink` / `search`, both off by default |
 
 | Capability | Notes |
 |---|---|
@@ -179,7 +199,9 @@ lib/index.js          # host: auto-launches the gateway on load, recycles it on 
 resources/
   dsweb-gateway.js    # core gateway (OpenAI API + login + calibration + session affinity + account pool + tool parsing)
   driver.js           # browser engine (persistent Chrome + channel management + limit detection)
-  runtime/            # runtime (driver copy + calibration data + accounts.json + profiles/ per-account dirs)
+  # runtime data (calibration + accounts.json + browser profiles + logs) lives in the state directory:
+  #   Windows %LOCALAPPDATA%/dsh-web-adapter · macOS ~/Library/Application Support/dsh-web-adapter
+  #   Linux ${XDG_STATE_HOME:-~/.local/state}/dsh-web-adapter (override with DSWEB_STATE_DIR)
 spec/
   SPEC.md             # v1 dev spec (current behavior baseline)
   SPEC-v2.md          # v2 spec (multi-account / auto login / quota switching — core implemented)

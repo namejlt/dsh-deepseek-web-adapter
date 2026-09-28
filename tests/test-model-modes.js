@@ -1,6 +1,7 @@
 /* 单元测试：最新页面模式映射 + pill 幂等切换（2026-08 页面重构适配）
- * 背景：chat.deepseek.com 改版——模型选择器（专家模式）已下线，统一为
- * 输入框下方 pill 开关：快速模式（可选 深度思考/智能搜索）、专家模式（可选 深度思考）、识图模式（可选 深度思考）。
+ * 背景：chat.deepseek.com 改版——"快速/专家/识图"模型选择入口已下线，统一为
+ * 单一对话模型 + 输入框下方两个 pill 开关：深度思考、智能搜索（两者对所有模型开放）。
+ * 因此 DeepSeek 全部 8 个模型都落到同一基础模型，仅由 deepThink / search 开关区分。
  * 旧实现两类缺陷：
  *   1. reasoner 依赖"专家模式"选择器/校准回放 → 已下线 → 静默退化快速模式
  *   2. pill 是开关，旧代码"点击了事"不读状态 → 连续请求会把已开启的思考再点关
@@ -164,12 +165,12 @@ if (mMatch) {
   check('3c deepseek-reasoner = 快速 + 深度思考（quick 的 深度思考 pill）', MODELS['deepseek-reasoner'].mode === 'quick' && MODELS['deepseek-reasoner'].deepThink === true && MODELS['deepseek-reasoner'].search === false, JSON.stringify(MODELS['deepseek-reasoner']));
   check('3d deepseek-search = 快速+智能搜索', MODELS['deepseek-search'] && MODELS['deepseek-search'].search === true, JSON.stringify(MODELS['deepseek-search']));
   check('3d2 deepseek-think-search = 快速+深度思考+智能搜索', MODELS['deepseek-think-search'] && MODELS['deepseek-think-search'].mode === 'quick' && MODELS['deepseek-think-search'].deepThink === true && MODELS['deepseek-think-search'].search === true, JSON.stringify(MODELS['deepseek-think-search']));
-  check('3e deepseek-vision = 识图（纯识图，不带思考）', MODELS['deepseek-vision'].mode === 'vision' && MODELS['deepseek-vision'].deepThink === false, JSON.stringify(MODELS['deepseek-vision']));
-  check('3e2 deepseek-vision-reasoner = 识图+深度思考', MODELS['deepseek-vision-reasoner'] && MODELS['deepseek-vision-reasoner'].mode === 'vision' && MODELS['deepseek-vision-reasoner'].deepThink === true, JSON.stringify(MODELS['deepseek-vision-reasoner']));
-  check('3f deepseek-expert = 专家模式', MODELS['deepseek-expert'] && MODELS['deepseek-expert'].mode === 'expert' && MODELS['deepseek-expert'].deepThink === false, JSON.stringify(MODELS['deepseek-expert']));
-  /* 专家模式可选深度思考：expert-reasoner = 专家入口 + 开启 深度思考 pill；
-   * 与模型名"专家+深度思考"及用户描述一致。 */
-  check('3f2 deepseek-expert-reasoner = 专家 + 深度思考（expert 入口，deepThink=true）', MODELS['deepseek-expert-reasoner'] && MODELS['deepseek-expert-reasoner'].mode === 'expert' && MODELS['deepseek-expert-reasoner'].deepThink === true, JSON.stringify(MODELS['deepseek-expert-reasoner']));
+  check('3e deepseek-vision = 对话（统一模型原生识图，无独立入口，不带思考）', MODELS['deepseek-vision'].mode === 'quick' && MODELS['deepseek-vision'].deepThink === false, JSON.stringify(MODELS['deepseek-vision']));
+  check('3e2 deepseek-vision-reasoner = 识图+深度思考', MODELS['deepseek-vision-reasoner'] && MODELS['deepseek-vision-reasoner'].mode === 'quick' && MODELS['deepseek-vision-reasoner'].deepThink === true, JSON.stringify(MODELS['deepseek-vision-reasoner']));
+  /* 改版后"专家(R1)"并入深度思考开关：expert = 开启深度思考（与原 reasoner 等价，
+   * 但保留 ID 兼容既有 DSH 配置）；不再有独立 expert 模式入口。 */
+  check('3f deepseek-expert = 对话 + 深度思考（专家并入深度思考 pill）', MODELS['deepseek-expert'] && MODELS['deepseek-expert'].mode === 'quick' && MODELS['deepseek-expert'].deepThink === true, JSON.stringify(MODELS['deepseek-expert']));
+  check('3f2 deepseek-expert-reasoner = 对话 + 深度思考（expert 入口已废弃，deepThink=true）', MODELS['deepseek-expert-reasoner'] && MODELS['deepseek-expert-reasoner'].mode === 'quick' && MODELS['deepseek-expert-reasoner'].deepThink === true, JSON.stringify(MODELS['deepseek-expert-reasoner']));
   check('3g registry 保留 8 个 DeepSeek 模型（总公开模型 22 个）', Object.keys(MODELS).filter((id) => id.startsWith('deepseek-')).length === 8 && Object.keys(MODELS).length === 22, 'count=' + Object.keys(MODELS).length);
   check('3h DeepSeek expert/vision 模型均不带 search（页面无此 pill）', Object.values(MODELS).filter((m) => m.providerId === 'deepseek').every((m) => m.mode === 'quick' || m.search === false));
 }
@@ -181,9 +182,9 @@ check('4c 校准降级为 fallback（pill 未找到才回放）', /needFallback[
 check('4d applyConfig 幂等 setPill think', /setPill\(pageId, \['深度思考'/.test(DRV_SRC));
 check('4e applyConfig 幂等 setPill search', /setPill\(pageId, \['智能搜索'/.test(DRV_SRC));
 check('4f 旧"专家模式"盲点击已移除', !/clickText\(\['专家模式', 'DeepSeek-R1'/.test(DRV_SRC));
-check('4g applyConfig 三模式入口含图标标签（闪电/钻石/眼睛）', /quick: \['快速'/.test(DRV_SRC) && /expert: \['专家'/.test(DRV_SRC) && /vision: \['识图'/.test(DRV_SRC) && /闪电/.test(DRV_SRC) && /钻石/.test(DRV_SRC) && /眼睛/.test(DRV_SRC));
-check('4h search 仅 quick 模式应用', /wantSearch = opts\.search === true && wantMode === 'quick'/.test(DRV_SRC));
-check('4i expert 模式入口找不到时降级盲点击', /!m\.ok && wantMode !== 'quick'/.test(DRV_SRC));
+check('4g applyConfig 不再点击模式入口（无 专家/识图/闪电/钻石/眼睛），只切 pill', !/expert:\s*\['专家'/.test(DRV_SRC) && !/vision:\s*\['识图'/.test(DRV_SRC) && !/闪电/.test(DRV_SRC) && !/钻石/.test(DRV_SRC) && !/眼睛/.test(DRV_SRC));
+check('4h 智能搜索 pill 对所有模型开放（不再限定 quick）', /const wantSearch = opts\.search === true;/.test(DRV_SRC));
+check('4i 模式入口降级盲点击已移除', !/wantMode !== 'quick'/.test(DRV_SRC) && !/clickText\(modeLabels/.test(DRV_SRC));
 
 /* ---------- 5. aria-label / title 匹配（图标按钮定位修复） ---------- */
 const EXPERT = ['专家', '专家模式', 'Expert', '钻石', '钻石模式', 'Pro'];
